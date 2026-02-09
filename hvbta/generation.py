@@ -222,5 +222,5 @@ def generate_random_task_description_strict(task_id: str, grid: List[List[int]],
         assigned_robot=None,
         time_to_complete=float(p.get("duration", 10.0)),
         assigned=False,
-        strict_profile_name=p.get("task_type", "")
+        strict_profile_name=p.get("nl_description", p.get("task_type", ""))
     )

@@ -6,7 +6,7 @@ import time
 from hvbta.models import CapabilityProfile, TaskDescription
 from .assignments import generate_random_assignments
 from hvbta.suitability import calculate_suitability_matrix, calculate_total_suitability
-from .misc_assignment import build_submatrix_from_scorer
+from .misc_assignment import build_submatrix_from_scorer, extract_submatrix
 
 def suitability_all_zero(suitability_matrix):
     return all(value == 0 for row in suitability_matrix for value in row)
@@ -215,7 +215,10 @@ def assign_tasks_with_method(
     #**print(f"Total Suitability Score: {total_score:.2f}")
     #**print(f"Time taken for allocation: {allocation_time:.2f} microseconds")
     
-    return (assignment, unassigned_robots, unassigned_tasks), total_score, allocation_time
+    # Extract per-agent scores for fairness calculation (only assigned agents)
+    per_agent_scores = [float(suitability_matrix[r][t]) for r, t in assignment]
+    
+    return (assignment, unassigned_robots, unassigned_tasks), total_score, allocation_time, per_agent_scores
 
 def assign_tasks_with_method_randomly(
     allocation_method: Callable[[List[List[float]]], List[Tuple[int, int]]],
@@ -280,14 +283,17 @@ def assign_tasks_with_method_randomly(
 
     print(f"Best assignment in optimization: {filtered_best_assignments}")
     
-    return filtered_best_assignments, total_score, allocation_time
+    # Per-agent scores are all 0.0 for random assignment (all-zero suitability case)
+    per_agent_scores = [0.0] * len(assigned_pairs)
+    
+    return filtered_best_assignments, total_score, allocation_time, per_agent_scores
 
 def reassign_robots_to_tasks_with_method(
         robots: List[CapabilityProfile], 
         tasks: List[TaskDescription], 
         num_candidates: int, 
         voting_method: str, 
-        suitability_scorer: Callable, 
+        suitability_source,  # Can be Callable (scorer) OR tuple (matrix, r_idx, t_idx) for LLM
         unassigned_robots: List[str], 
         unassigned_tasks: List[str], 
         allocation_method: Callable[[List[List[float]]], List[Tuple[int, int]]], 
@@ -301,7 +307,8 @@ def reassign_robots_to_tasks_with_method(
         tasks: List of all task descriptions.
         num_candidates: Number of candidate assignments to generate.
         voting_method: The name of the voting function to use for ranking assignments.
-        suitability_method: The name of the suitability evaluation function.
+        suitability_source: Either a callable scorer(robot, task)->float, OR a tuple of
+                           (full_matrix, robot_id_to_idx, task_id_to_idx) for direct matrix lookup.
         unassigned_robots: List of unassigned robot IDs.
         unassigned_tasks: List of unassigned task IDs.
         allocation_method: The function used for task allocation (e.g., `cbba_task_allocation`, `ssia_task_allocation`, `ilp_task_allocation`).
@@ -321,15 +328,24 @@ def reassign_robots_to_tasks_with_method(
 
     # Early outs
     if not urobots or not utasks:
-        return {}, unassigned_robots, unassigned_tasks, 0.0, 0.0
+        return {}, unassigned_robots, unassigned_tasks, 0.0, 0.0, []
 
-    suitability_matrix = build_submatrix_from_scorer(urobots, utasks, suitability_scorer)
+    # Check if suitability_source is a matrix tuple or a callable scorer
+    if isinstance(suitability_source, tuple) and len(suitability_source) == 3:
+        # Direct matrix lookup path (fast - for LLM)
+        full_matrix, robot_id_to_idx, task_id_to_idx = suitability_source
+        suitability_matrix = extract_submatrix(full_matrix, urobots, utasks, robot_id_to_idx, task_id_to_idx)
+        use_matrix_lookup = True
+    else:
+        # Callable scorer path (for non-LLM methods)
+        suitability_matrix = build_submatrix_from_scorer(urobots, utasks, suitability_source)
+        use_matrix_lookup = False
 
     if suitability_all_zero(suitability_matrix):
         print("All suitability scores are zero, randomly assigning tasks to robots.")
-        output, score, length = reassign_robots_to_tasks_randomly_with_method(robots, tasks, num_candidates, unassigned_robots, unassigned_tasks)
+        output, score, length, per_agent_scores = reassign_robots_to_tasks_randomly_with_method(robots, tasks, num_candidates, unassigned_robots, unassigned_tasks)
     else:
-        output, score, length = assign_tasks_with_method(allocation_method, suitability_matrix)
+        output, score, length, per_agent_scores = assign_tasks_with_method(allocation_method, suitability_matrix)
 
     assigned_pairs = output[0]
     return_assignments = {}
@@ -361,11 +377,18 @@ def reassign_robots_to_tasks_with_method(
             if current is None:
                 continue
 
-            current_suitability = suitability_scorer(current, task)
+            # Use direct matrix lookup if available (LLM path), otherwise use scorer
+            if use_matrix_lookup:
+                current_suitability = full_matrix[robot_id_to_idx[current.robot_id], task_id_to_idx[task.task_id]]
+            else:
+                current_suitability = suitability_source(current, task)
             # find the best free robot for this task
             best, best_suit = None, current_suitability
             for r in free_robots:
-                s = suitability_scorer(r, task)
+                if use_matrix_lookup:
+                    s = full_matrix[robot_id_to_idx[r.robot_id], task_id_to_idx[task.task_id]]
+                else:
+                    s = suitability_source(r, task)
                 if s > best_suit:
                     best, best_suit = r, s
 
@@ -374,6 +397,7 @@ def reassign_robots_to_tasks_with_method(
                 # unassign the current robot from the task
                 current.current_task = None
                 current.assigned = False
+                current.current_task_suitability = None
                 if current.robot_id not in unassigned_robots:
                     unassigned_robots.append(current.robot_id)
 
@@ -381,7 +405,9 @@ def reassign_robots_to_tasks_with_method(
                 best.current_task = task
                 best.assigned = True
                 best.tasks_attempted += 1
+                best.current_task_suitability = best_suit
                 task.assigned_robot = best
+                task.current_suitability = best_suit
 
                 start_positions[best.robot_id] = best.location
                 goal_positions[best.robot_id] = task.location
@@ -393,7 +419,13 @@ def reassign_robots_to_tasks_with_method(
 
     print(f"Reassign Score: {score}, Reassign Length: {length}")
 
-    return return_assignments, unassigned_robots, unassigned_tasks, score, length
+    # Recalculate per_agent_scores after potential stealing - get scores for all assigned robots
+    final_per_agent_scores = []
+    for r in robots:
+        if r.assigned and r.current_task is not None:
+            final_per_agent_scores.append(float(r.current_task_suitability))
+
+    return return_assignments, unassigned_robots, unassigned_tasks, score, length, final_per_agent_scores
 
 def reassign_robots_to_tasks_randomly_with_method(
         robots: List[CapabilityProfile],
@@ -468,4 +500,7 @@ def reassign_robots_to_tasks_randomly_with_method(
 
     # best_score = calculate_total_suitability(filtered_best_assignments[0], suitability_matrix)
 
-    return filtered_best_assignments, total_scores, length
+    # Per-agent scores are all 0.0 for random assignment (all-zero suitability case)
+    per_agent_scores = [0.0] * len(assigned_pairs)
+
+    return filtered_best_assignments, total_scores, length, per_agent_scores

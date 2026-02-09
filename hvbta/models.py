@@ -60,6 +60,7 @@ class CapabilityProfile:
         self.current_path = current_path
         self.assigned = assigned # says if the robot is assigned to a task to replace the index lists below
         self.strict_profile_name = strict_profile_name # if the robot was generated from a strict profile, store the name here for reference
+        self.current_task_suitability = current_task_suitability # store the suitability score for the current task assignment
 
     def __repr__(self):
         return (f"CapabilityProfile(robot_id={self.robot_id}, mobility_type={self.mobility_type}, "

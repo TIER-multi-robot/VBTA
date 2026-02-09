@@ -12,6 +12,26 @@ def build_submatrix_from_scorer(robots, tasks, scorer):
     return M
 
 
+def extract_submatrix(full_matrix, robots_subset, tasks_subset, robot_id_to_idx, task_id_to_idx):
+    """
+    Extract a submatrix from the full suitability matrix for given robot/task subsets.
+    Uses pre-computed index mappings for O(1) lookups instead of scorer function calls.
+    
+    Parameters:
+        full_matrix: The full NxM suitability matrix
+        robots_subset: List of robot objects to include
+        tasks_subset: List of task objects to include
+        robot_id_to_idx: Dict mapping robot_id -> row index in full_matrix
+        task_id_to_idx: Dict mapping task_id -> column index in full_matrix
+    
+    Returns:
+        Submatrix of shape (len(robots_subset), len(tasks_subset))
+    """
+    sub_r_indices = [robot_id_to_idx[r.robot_id] for r in robots_subset]
+    sub_t_indices = [task_id_to_idx[t.task_id] for t in tasks_subset]
+    return full_matrix[np.ix_(sub_r_indices, sub_t_indices)]
+
+
 def unassign_task_from_robot(robot: CapabilityProfile, task: TaskDescription, unassigned_robots: List[str], unassigned_tasks: List[str]):
     # task_id = robot.current_task.task_id
     # t_index = [task.task_id for task in tasks].index(task_id)

@@ -11,3 +11,9 @@ cbs_test.ipynb
 git-filter-repo
 hvbta/io/results/
 .env
+*.ipynb
+ingest_data_full_metrics.py
+data.py
+hvbta/io/*
+*.prof
+unused/*
