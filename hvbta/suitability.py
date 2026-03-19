@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 import numpy as np
 from numpy.typing import NDArray
 from typing import List, Tuple, Callable, Union
-from openai import OpenAI
+from huggingface_hub import InferenceClient
 # from prompt_toolkit import prompt
 from .models import CapabilityProfile, TaskDescription
 # from inspect import signature, Parameter
@@ -1462,19 +1462,21 @@ def _task_name_view(t):
         d["nl_description"] = desc
     return d
 
-def evaluate_suitability_from_names_with_llm(robots, tasks, model="gpt-4.1-nano") -> np.ndarray:
+def evaluate_suitability_from_names_with_llm(robots, tasks, model="meta-llama/Llama-4-Scout-17B-16E-Instruct:groq") -> np.ndarray:
     """
     Evaluate suitability of robots for tasks using an LLM based on names and minimal info.
     Returns an (R, T) float array with scores in [0,1].
     Parameters:
         robots: List of CapabilityProfile objects.
         tasks: List of TaskDescription objects.
-        model: The LLM model to use (default "gpt-4.1-nano").
+        model: The LLM model to use (updated to  "meta-llama/Llama-4-Scout-17B-16E-Instruct:groq").
     Returns:
         M: An (R, T) numpy array of float suitability scores in [0,1].
     """
     evaluate_suitability_from_names_with_llm._is_llm_batch = True
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    client = InferenceClient(api_key=os.environ["HF_TOKEN"],
+)
+
 
     R = [_to_jsonable(_robot_min_view(r)) for r in robots]
     T = [_to_jsonable(_task_name_view(t)) for t in tasks]
