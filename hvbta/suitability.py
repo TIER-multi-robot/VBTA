@@ -1462,20 +1462,19 @@ def _task_name_view(t):
         d["nl_description"] = desc
     return d
 
-def evaluate_suitability_from_names_with_llm(robots, tasks, model="meta-llama/Llama-4-Scout-17B-16E-Instruct:groq") -> np.ndarray:
+def evaluate_suitability_from_names_with_llm(robots, tasks, model="meta-llama/Llama-4-Scout-17B-16E-Instruct") -> np.ndarray:
     """
     Evaluate suitability of robots for tasks using an LLM based on names and minimal info.
     Returns an (R, T) float array with scores in [0,1].
     Parameters:
         robots: List of CapabilityProfile objects.
         tasks: List of TaskDescription objects.
-        model: The LLM model to use (updated to  "meta-llama/Llama-4-Scout-17B-16E-Instruct:groq").
+        model: The LLM model to use (updated to  "meta-llama/Llama-4-Scout-17B-16E-Instruct").
     Returns:
         M: An (R, T) numpy array of float suitability scores in [0,1].
     """
     evaluate_suitability_from_names_with_llm._is_llm_batch = True
-    client = InferenceClient(api_key=os.environ["HF_TOKEN"],
-)
+    client = InferenceClient(api_key=os.environ["HF_TOKEN"],)
 
 
     R = [_to_jsonable(_robot_min_view(r)) for r in robots]
@@ -1489,11 +1488,73 @@ def evaluate_suitability_from_names_with_llm(robots, tasks, model="meta-llama/Ll
 
     # Chat API (fill in your SDK call)
     # Example OpenAI Chat Completions:
-    resp = client.chat.completions.create(
+   
+    resp =  client.chat_completion(
         model=model,
         messages=[
             {"role": "system", "content":  "You are a careful assistant that outputs only the requested format."},
             {"role": "user", "content": text_prompt}],
+        # respect model limitations (e.g., do NOT set temperature for 5-nano if disallowed)
+    )
+    content = resp.choices[0].message.content
+
+    # after you get the model's raw text in variable `text`
+    M = _parse_output_matrix(content, nR=len(robots), nT=len(tasks))
+    if M is None:
+        # fallback: tiny random noise to break ties, or zeros
+        M = np.full((len(robots), len(tasks)), 0.0, dtype=float)
+    return M
+
+def bypass_suitability_from_names_with_llm(robots, tasks, model="meta-llama/Llama-4-Scout-17B-16E-Instruct") -> np.ndarray:
+    """
+    Evaluate suitability of robots for tasks using an LLM based on names and minimal info.
+    Returns an (R, T) float array with scores in [0,1].
+    Parameters:
+        robots: List of CapabilityProfile objects.
+        tasks: List of TaskDescription objects.
+        model: The LLM model to use (updated to  "meta-llama/Llama-4-Scout-17B-16E-Instruct").
+    Returns:
+        M: An (R, T) numpy array of float suitability scores in [0,1].
+    """
+    evaluate_suitability_from_names_with_llm._is_llm_batch = True
+    client = InferenceClient(api_key=os.environ["HF_TOKEN"],
+)
+
+
+    R = [_to_jsonable(_robot_min_view(r)) for r in robots]
+    T = [_to_jsonable(_task_name_view(t)) for t in tasks]
+
+    # --- example prompt & answer ---
+    example_prompt = (
+        "Assign each task to the single most suitable robot.\n"
+        "Reply with ONLY a JSON object, no explanation:\n"
+        '{"assignments": [{"task_id": "<id>", "robot_id": "<id>"}, ...]}\n\n'
+        "Robots:\n[{\"id\": \"r0\", \"name\": \"HeavyLifter\"}, {\"id\": \"r1\", \"name\": \"SwiftDrone\"}]\n\n"
+        "Tasks:\n[{\"id\": \"t0\", \"name\": \"lift_crate\"}, {\"id\": \"t1\", \"name\": \"aerial_survey\"}]"
+    )
+    example_answer = '{"assignments": [{"task_id": "t0", "robot_id": "r0"}, {"task_id": "t1", "robot_id": "r1"}]}'
+
+    # --- real prompt ---
+    real_prompt = (
+        "Assign each task to the single most suitable robot.\n"
+        "Reply with ONLY a JSON object, no explanation:\n"
+        '{"assignments": [{"task_id": "<id>", "robot_id": "<id>"}, ...]}\n\n'
+        f"Robots:\n{json.dumps(R, ensure_ascii=False)}\n\n"
+        f"Tasks:\n{json.dumps(T, ensure_ascii=False)}"
+    )
+    # Chat API (fill in your SDK call)
+    # Example OpenAI Chat Completions:
+   
+    resp =  client.chat_completion(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are a robot task scheduler. Reply with a single JSON object and nothing else."},
+            # one-shot example
+            {"role": "user",      "content": example_prompt},
+            {"role": "assistant", "content": example_answer},
+            # real question
+            {"role": "user",      "content": real_prompt},
+        ]
         # respect model limitations (e.g., do NOT set temperature for 5-nano if disallowed)
     )
     content = resp.choices[0].message.content
