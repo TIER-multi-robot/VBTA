@@ -48,7 +48,9 @@ def unassign_task_from_robot(robot: CapabilityProfile, task: TaskDescription, un
         unassigned_tasks.append(tid)
     # unassign robot
     robot.current_task = None
-    # move it to unassigned robots list with check
+    robot.current_path = []
+    robot.remaining_distance = 0
+# move it to unassigned robots list with check
     rid = robot.robot_id
     if rid not in unassigned_robots:
         unassigned_robots.append(rid)
