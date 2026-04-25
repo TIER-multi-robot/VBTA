@@ -1,7 +1,7 @@
 import numpy as np
 import random
 from typing import List
-from CBS import get_random_free_position
+from hvbta.pathfinding.CBS import get_random_free_position
 from . import config as C
 from .models import (CapabilityProfile, TaskDescription, AutonomyLevel, TaskTypes, 
                      Priorities, PerformanceMetrics)

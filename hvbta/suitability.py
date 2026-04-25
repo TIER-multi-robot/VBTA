@@ -1,16 +1,51 @@
-import os, json, re, ast
+import json, re, ast
+from pathlib import Path
 from dotenv import load_dotenv
 import numpy as np
 from numpy.typing import NDArray
 from typing import List, Tuple, Callable, Union
-from huggingface_hub import InferenceClient
+from transformers import pipeline
+from llama_cpp import Llama
+
+_LLAMA_MODEL = None
+_LLAMA_REPO_ID = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+_LLAMA_FILENAME = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+
+def _get_llama():
+    """
+    Lazy-initialize a llama.cpp Llama instance with full GPU offload.
+    On an RTX 4080 Super (16 GB), a Q4_K_M 8B model (~4.9 GB) fits entirely
+    in VRAM with n_gpu_layers=-1, which gives the fastest per-call latency
+    without HTTP or process overhead. The singleton pattern avoids reloading
+    the weights on every suitability evaluation.
+
+    For context window, 4k-8k takes about 5-6 GB of VRAM, every +8k context
+    after that adds about 1-2GB more VRAM.
+
+    on a 4080 super
+    40k = 12.7GB
+    32k = 11.7GB
+    16k = 9.6GB
+    """
+    global _LLAMA_MODEL
+    if _LLAMA_MODEL is None:
+        _LLAMA_MODEL = Llama.from_pretrained(
+            repo_id=_LLAMA_REPO_ID,
+            filename=_LLAMA_FILENAME,
+            n_gpu_layers=-1,
+            n_ctx=16384,
+            n_batch=512,
+            flash_attn=True,
+            verbose=False,
+        )
+    return _LLAMA_MODEL
 # from prompt_toolkit import prompt
 from .models import CapabilityProfile, TaskDescription
 # from inspect import signature, Parameter
 from enum import Enum
 from dataclasses import is_dataclass, asdict
 
-load_dotenv()
+load_dotenv(dotenv_path=Path("C:\\Users\\owner\\Documents\\PhD\\TierLab\\VBTA - Original Commented\\.env"))
 
 ScoreFn = Callable[[CapabilityProfile, TaskDescription], float]
 
@@ -1392,6 +1427,16 @@ def _parse_output_matrix(raw_text: str, nR: int, nT: int) -> np.ndarray | None:
         return None
     return arr
 
+def _parse_output_matrix_bypass(raw_text: str) -> np.ndarray | None:
+    """Parse LLM output to get tuple of 3 lists to represent assignments
+    Tuple[List[Tuple[int, int]], List[int], List[int]]
+    Each list represents:
+        - assigned pairs of robots and tasks
+        - unassigned robots
+        - unassigned tasks
+    all represented with their robot and task IDs"""
+    pass
+
 
 def build_name_only_prompt(robots_json: str, tasks_json: str) -> str:
     return f"""
@@ -1462,69 +1507,61 @@ def _task_name_view(t):
         d["nl_description"] = desc
     return d
 
-def evaluate_suitability_from_names_with_llm(robots, tasks, model="meta-llama/Llama-4-Scout-17B-16E-Instruct") -> np.ndarray:
+def evaluate_suitability_from_names_with_llm(robots, tasks, model=_LLAMA_FILENAME) -> np.ndarray:
     """
-    Evaluate suitability of robots for tasks using an LLM based on names and minimal info.
-    Returns an (R, T) float array with scores in [0,1].
+    Evaluate suitability of robots for tasks using a local GGUF-quantized Llama model
+    via llama.cpp with full GPU offload. Returns an (R, T) float array in [0,1].
     Parameters:
         robots: List of CapabilityProfile objects.
         tasks: List of TaskDescription objects.
-        model: The LLM model to use (updated to  "meta-llama/Llama-4-Scout-17B-16E-Instruct").
+        model: The GGUF filename to load (unused at call time; model is held in the
+               module-level singleton initialized by _get_llama()).
     Returns:
         M: An (R, T) numpy array of float suitability scores in [0,1].
     """
     evaluate_suitability_from_names_with_llm._is_llm_batch = True
-    client = InferenceClient(api_key=os.environ["HF_TOKEN"],)
-
+    llm = _get_llama()
 
     R = [_to_jsonable(_robot_min_view(r)) for r in robots]
     T = [_to_jsonable(_task_name_view(t)) for t in tasks]
-
 
     text_prompt = build_name_only_prompt(
         robots_json=json.dumps(R, ensure_ascii=False),
         tasks_json=json.dumps(T, ensure_ascii=False)
     )
 
-    # Chat API (fill in your SDK call)
-    # Example OpenAI Chat Completions:
-   
-    resp =  client.chat_completion(
-        model=model,
+    resp = llm.create_chat_completion(
         messages=[
-            {"role": "system", "content":  "You are a careful assistant that outputs only the requested format."},
-            {"role": "user", "content": text_prompt}],
-        # respect model limitations (e.g., do NOT set temperature for 5-nano if disallowed)
+            {"role": "system", "content": "You are a careful assistant that outputs only the requested format."},
+            {"role": "user", "content": text_prompt},
+        ],
+        temperature=0.1,
+        max_tokens=2048,
     )
-    content = resp.choices[0].message.content
+    content = resp["choices"][0]["message"]["content"]
 
-    # after you get the model's raw text in variable `text`
     M = _parse_output_matrix(content, nR=len(robots), nT=len(tasks))
     if M is None:
-        # fallback: tiny random noise to break ties, or zeros
         M = np.full((len(robots), len(tasks)), 0.0, dtype=float)
     return M
 
-def bypass_suitability_from_names_with_llm(robots, tasks, model="meta-llama/Llama-4-Scout-17B-16E-Instruct") -> np.ndarray:
+def bypass_suitability_from_names_with_llm(robots, tasks, model=_LLAMA_FILENAME) -> np.ndarray:
     """
-    Evaluate suitability of robots for tasks using an LLM based on names and minimal info.
-    Returns an (R, T) float array with scores in [0,1].
+    One-shot assignment variant using the local GGUF-quantized Llama model via
+    llama.cpp with full GPU offload. Returns an (R, T) float array in [0,1].
     Parameters:
         robots: List of CapabilityProfile objects.
         tasks: List of TaskDescription objects.
-        model: The LLM model to use (updated to  "meta-llama/Llama-4-Scout-17B-16E-Instruct").
+        model: The GGUF filename (held in the module-level singleton).
     Returns:
         M: An (R, T) numpy array of float suitability scores in [0,1].
     """
     evaluate_suitability_from_names_with_llm._is_llm_batch = True
-    client = InferenceClient(api_key=os.environ["HF_TOKEN"],
-)
-
+    llm = _get_llama()
 
     R = [_to_jsonable(_robot_min_view(r)) for r in robots]
     T = [_to_jsonable(_task_name_view(t)) for t in tasks]
 
-    # --- example prompt & answer ---
     example_prompt = (
         "Assign each task to the single most suitable robot.\n"
         "Reply with ONLY a JSON object, no explanation:\n"
@@ -1534,7 +1571,6 @@ def bypass_suitability_from_names_with_llm(robots, tasks, model="meta-llama/Llam
     )
     example_answer = '{"assignments": [{"task_id": "t0", "robot_id": "r0"}, {"task_id": "t1", "robot_id": "r1"}]}'
 
-    # --- real prompt ---
     real_prompt = (
         "Assign each task to the single most suitable robot.\n"
         "Reply with ONLY a JSON object, no explanation:\n"
@@ -1542,27 +1578,21 @@ def bypass_suitability_from_names_with_llm(robots, tasks, model="meta-llama/Llam
         f"Robots:\n{json.dumps(R, ensure_ascii=False)}\n\n"
         f"Tasks:\n{json.dumps(T, ensure_ascii=False)}"
     )
-    # Chat API (fill in your SDK call)
-    # Example OpenAI Chat Completions:
-   
-    resp =  client.chat_completion(
-        model=model,
+
+    resp = llm.create_chat_completion(
         messages=[
             {"role": "system", "content": "You are a robot task scheduler. Reply with a single JSON object and nothing else."},
-            # one-shot example
             {"role": "user",      "content": example_prompt},
             {"role": "assistant", "content": example_answer},
-            # real question
             {"role": "user",      "content": real_prompt},
-        ]
-        # respect model limitations (e.g., do NOT set temperature for 5-nano if disallowed)
+        ],
+        temperature=0.1,
+        max_tokens=2048,
     )
-    content = resp.choices[0].message.content
+    content = resp["choices"][0]["message"]["content"]
 
-    # after you get the model's raw text in variable `text`
     M = _parse_output_matrix(content, nR=len(robots), nT=len(tasks))
     if M is None:
-        # fallback: tiny random noise to break ties, or zeros
         M = np.full((len(robots), len(tasks)), 0.0, dtype=float)
     return M
 

@@ -618,9 +618,9 @@ if __name__ == "__main__":
             r"ost002d.map", # 145 x 181
         ]
         map_paths = (
-        random.sample(small_maps, 7) +
-        random.sample(medium_maps, 7) +
-        random.sample(large_maps, 7)
+        random.sample(small_maps, 1) +
+        random.sample(medium_maps, 1) +
+        random.sample(large_maps, 1)
         )
 
         # randomly chosen maps from strict run
@@ -643,10 +643,8 @@ if __name__ == "__main__":
         # ]
         
         # max_time_steps = 500
-        robot_sizes = [5, 20, 50, 100]
-        task_sizes = [5, 20, 50, 100]
-        # robot_sizes = [10]
-        # task_sizes = [100]
+        robot_sizes = [20]
+        task_sizes = [20]
         Run_ID = 1
         num_repetitions = 1
         add_tasks = False
