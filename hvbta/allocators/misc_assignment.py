@@ -240,10 +240,12 @@ def remove_random_robots(robots: List[CapabilityProfile], tasks: List[TaskDescri
         
     Returns:
         None
-    """
-    for _ in range(min(count, (len(robots) - 1))): # Make sure theres always at least one robot so CBS doesnt break
-        robot_to_remove = random.choice(robots)
+    """    
+    robots_to_remove = random.sample(robots, min(count, len(robots) - 1))  # Make sure theres always at least one robot so CBS doesnt break
+
+    for robot_to_remove in robots_to_remove:
         occupied_locations.discard(robot_to_remove.location)
+
         if not robot_to_remove.assigned and robot_to_remove.current_task == None:
             if robot_to_remove.robot_id in unassigned_robots:
                 # If the robot is unassigned, just remove it from the list
@@ -257,8 +259,8 @@ def remove_random_robots(robots: List[CapabilityProfile], tasks: List[TaskDescri
             # If the task is not already in the unassigned tasks list, add it
                 unassigned_tasks.append(task_id)
             # in the case an assigned robot is removed we must update the start_positions and goal_positions lists to remove both locations so they are no longer used in the CBS pathfinding
-            del start_positions[robot_to_remove.robot_id]
-            del goal_positions[robot_to_remove.robot_id]
+            start_positions.pop(robot_to_remove.robot_id, None) #originalcode: del start_positions[robot_to_remove.robot_id]
+            goal_positions.pop(robot_to_remove.robot_id, None) #originalcode: del goal_positions[robot_to_remove.robot_id]
             # check if the robot is in the unassigned robots list and remove it
             if robot_to_remove.robot_id in unassigned_robots:
                 # If the robot is unassigned, just remove it from the list
