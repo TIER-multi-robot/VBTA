@@ -257,7 +257,13 @@ def rank_assignments_condorcet_method(assignments: List[List[Tuple[int, int]]], 
 
     return pairwise_wins, ranked_assignments
 
-def assign_tasks_with_voting(robots: List[CapabilityProfile], tasks: List[TaskDescription], suitability_matrix: np.ndarray, num_candidates: int, voting_method: Callable) -> Tuple[Tuple[List[Tuple[int, int]], List[int], List[int]], float, float]:
+def assign_tasks_with_voting(
+        robots: List[CapabilityProfile], 
+        tasks: List[TaskDescription], 
+        suitability_matrix: np.ndarray, 
+        num_candidates: int, 
+        voting_method: Callable
+        ) -> Tuple[Tuple[List[Tuple[int, int]], List[int], List[int]], float, float, List[float]]:
     """
     Assigns tasks to robots using random assignment and ranks the assignments using the specified voting method.
     
@@ -269,7 +275,7 @@ def assign_tasks_with_voting(robots: List[CapabilityProfile], tasks: List[TaskDe
         voting_method: The name of the voting function.
     
     Returns:
-        (best_assignment, best_score, length): The best assignment, its suitability score, and the time taken for the voting process.
+        (best_assignment, best_score, length, per_agent_scores): The best assignment, its suitability score, and the time taken for the voting process.
     """
     num_robots = len(robots)
     num_tasks = len(tasks)
@@ -352,7 +358,7 @@ def assign_tasks_randomly(
         robots: List[CapabilityProfile], 
         tasks: List[TaskDescription], 
         suitability_matrix: np.ndarray, num_candidates: int
-    ) -> Tuple[Tuple[List[Tuple[int, int]], List[int], List[int]], float, float]:
+    ) -> Tuple[Tuple[List[Tuple[int, int]], List[int], List[int]], float, float, List[float]]:
     """
     Assigns tasks to robots using random assignment and random assignments.
     for use with the all-zero suitability matrix case.
@@ -364,7 +370,7 @@ def assign_tasks_randomly(
         num_candidates: Number of candidate assignments to generate.
     
     Returns:
-        (best_assignment, best_score, length): The best assignment, its suitability score, and the time taken for the voting process.
+        (best_assignment, best_score, length, per_agent_scores): The best assignment, its suitability score, and the time taken for the voting process.
     """
     num_robots = len(robots)
     num_tasks = len(tasks)
