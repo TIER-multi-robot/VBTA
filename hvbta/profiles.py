@@ -13,6 +13,7 @@ def _sample(items: List[str], k_min: int = 0, k_max: int = None) -> List[str]:
     return random.sample(items, k)
 
 # STRICT ROBOT PROFILES FOR ROBOT GENERATION
+# 16 items per profile
 STRICT_ROBOT_PROFILES = [
     {
         "name": "delivery",
@@ -125,12 +126,32 @@ STRICT_ROBOT_PROFILES = [
 ]
 
 # STRICT TASK PROFILES FOR TASK GENERATION
+# 15 items per profile counting payload and reach instead of required_capabilities dict
+"""
+robot                       -> task
+name                        -> task_type
+mobility_type               -> navigation_constraints (specifically the agents that can make it up stairs, navigate slippery, loose debris, no fly zone, windy, dense obstructions, smooth surfaces, TOO MUCH)
+environmental_resistances   -> environmental_conditions
+sensors                     -> sensors_needed
+manipulators                -> manipulators_needed
+communication_protocols     -> communication_requirements
+special_functions           -> mapped to task_type hard coded, potential remove
+saftey_features             -> safety_protocols
+sensor_range                -> check suitability function (path length?)
+processing_power            -> difficulty
+autonomy_level              -> priority level. check suitability function
+payload_capacity            -> payload
+reach                       -> reach
+battery_life                -> duration and path length (maybe others?)
+size                        -> navigation_constraints (width -> narrow spaces, height -> low ceilings)
+adaptability                -> flat boost to score, useless, get rid
+"""
 STRICT_TASK_PROFILES = [
     {
         "task_type": "utilities", #gripper
         "priority_level": "medium",
-        "reward": 6,
-        "difficulty": 6,
+        "reward": 6.0,
+        "difficulty": 6.0,
         "navigation_constraints": ["uneven floors", "loose debris"],
         "required_capabilities": {
             "payload": 0.0,
@@ -141,7 +162,7 @@ STRICT_TASK_PROFILES = [
         "manipulators_needed": ["gripper"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "balance control", "emergency stop"],
-        "duration": 3,
+        "duration": 3.0,
         "performance_metric": "safety compliance",
         "nl_description": "Operate valves, switches, and panels; carry small parts; precise manipulation in plant rooms."
     },
@@ -150,8 +171,8 @@ STRICT_TASK_PROFILES = [
     {
         "task_type": "utilities", #bucket
         "priority_level": "medium",
-        "reward": 6,
-        "difficulty": 6,
+        "reward": 7.0,
+        "difficulty": 6.0,
         "navigation_constraints": ["uneven floors", "loose debris"],
         "required_capabilities": {
             "payload": 10.0,
@@ -162,7 +183,7 @@ STRICT_TASK_PROFILES = [
         "manipulators_needed": ["hydraulic bucket"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "balance control", "emergency stop"],
-        "duration": 3,
+        "duration": 3.0,
         "performance_metric": "safety compliance",
         "nl_description": "Transport construction materials, clear or move small bulk materials near utility corridors; load/unload with a bucket."
     },
@@ -171,8 +192,8 @@ STRICT_TASK_PROFILES = [
     {
         "task_type": "debris", #gripper
         "priority_level": "medium",
-        "reward": 4,
-        "difficulty": 4,
+        "reward": 5.0,
+        "difficulty": 4.0,
         "navigation_constraints": ["loose debris", "crowded"],
         "required_capabilities": {
             "payload": 10.0,
@@ -183,7 +204,7 @@ STRICT_TASK_PROFILES = [
         "manipulators_needed": ["gripper"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "balance control", "emergency stop"],
-        "duration": 2,
+        "duration": 2.0,
         "performance_metric": "safety compliance",
         "nl_description": "Pick and remove scattered debris in cluttered passages; careful grasping and placement."
     },
@@ -192,8 +213,8 @@ STRICT_TASK_PROFILES = [
     {
         "task_type": "debris", #bucket
         "priority_level": "medium",
-        "reward": 4,
-        "difficulty": 4,
+        "reward": 6.0,
+        "difficulty": 4.0,
         "navigation_constraints": ["loose debris", "uneven floors"],
         "required_capabilities": {
             "payload": 10.0,
@@ -204,7 +225,7 @@ STRICT_TASK_PROFILES = [
         "manipulators_needed": ["hydraulic bucket"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "balance control", "emergency stop"],
-        "duration": 2,
+        "duration": 2.0,
         "performance_metric": "safety compliance",
         "nl_description": "Scoop and relocate piles of loose debris; continuous removal in uneven terrain.",
         
@@ -214,8 +235,8 @@ STRICT_TASK_PROFILES = [
     {
         "task_type": "delivery",
         "priority_level": "low",
-        "reward": 2,
-        "difficulty": 2,
+        "reward": 3.0,
+        "difficulty": 2.0,
         "navigation_constraints": ["crowded", "elevator"],
         "required_capabilities": {
             "payload": 1.0,
@@ -226,7 +247,7 @@ STRICT_TASK_PROFILES = [
         "manipulators_needed": ["gripper"],
         "communication_requirements": ["Wi-Fi", "4G"],
         "safety_protocols": ["obstacle detection", "emergency stop"],
-        "duration": 1,
+        "duration": 1.0,
         "performance_metric": "time taken",
         "nl_description": "Fetch-and-carry small payloads point-to-point through indoor/outdoor corridors.",
     },
@@ -235,8 +256,8 @@ STRICT_TASK_PROFILES = [
     {
         "task_type": "assembly",
         "priority_level": "high",
-        "reward": 8,
-        "difficulty": 8,
+        "reward": 10.0,
+        "difficulty": 8.0,
         "navigation_constraints": ["crowded"],
         "required_capabilities": {
             "payload": 5.0,
@@ -247,7 +268,7 @@ STRICT_TASK_PROFILES = [
         "manipulators_needed": ["gripper", "drill", "welding tool"],
         "communication_requirements": ["Wi-Fi", "Radio"],
         "safety_protocols": ["collision avoidance", "emergency stop"],
-        "duration": 4,
+        "duration": 4.0,
         "performance_metric": "accuracy",
         "nl_description": "Fixture placement, fastening, dispensing, or welding with moderate precision in crowded areas.",
     },
@@ -256,8 +277,8 @@ STRICT_TASK_PROFILES = [
     {
         "task_type": "excavate",
         "priority_level": "high",
-        "reward": 8,
-        "difficulty": 8,
+        "reward": 11.0,
+        "difficulty": 8.0,
         "navigation_constraints": ["loose debris", "low visibility"],
         "required_capabilities": {
             "payload": 15.0,
@@ -268,7 +289,7 @@ STRICT_TASK_PROFILES = [
         "manipulators_needed": ["hydraulic bucket"],
         "communication_requirements": ["Radio"],
         "safety_protocols": ["overload protection", "obstacle detection"],
-        "duration": 4,
+        "duration": 4.0,
         "performance_metric": "safety compliance",
         "nl_description": "Dig, trench, or remove soil/rubble; sustained scooping with high payload demands.",
     },
@@ -277,8 +298,8 @@ STRICT_TASK_PROFILES = [
     {
         "task_type": "item elevation",
         "priority_level": "medium",
-        "reward": 5,
-        "difficulty": 5,
+        "reward": 7.0,
+        "difficulty": 5.0,
         "navigation_constraints": ["low visibility", "crowded"],
         "required_capabilities": {
             "payload": 2.0,
@@ -289,7 +310,7 @@ STRICT_TASK_PROFILES = [
         "manipulators_needed": ["cable hoist", "gripper"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "emergency stop"],
-        "duration": 3,
+        "duration": 3.0,
         "performance_metric": "safety compliance",
         "nl_description": "Lift and hold items at height; stable hoisting and precise placement are important.",
     },
@@ -298,8 +319,8 @@ STRICT_TASK_PROFILES = [
     {
         "task_type": "lay bricks",
         "priority_level": "low",
-        "reward": 6,
-        "difficulty": 6,
+        "reward": 8.0,
+        "difficulty": 6.0,
         "navigation_constraints": ["crowded", "windy"],
         "required_capabilities": {
             "payload": 4.0,
@@ -310,7 +331,7 @@ STRICT_TASK_PROFILES = [
         "manipulators_needed": ["gripper", "dispenser"],
         "communication_requirements": ["Wi-Fi"],
         "safety_protocols": ["collision avoidance", "overheat protection"],
-        "duration": 3,
+        "duration": 3.0,
         "performance_metric": "accuracy",
         "nl_description": "Pick, mortar/dispense, and place bricks with consistent accuracy and alignment.",
     },
@@ -319,8 +340,8 @@ STRICT_TASK_PROFILES = [
     {
         "task_type": "scaffold",
         "priority_level": "medium",
-        "reward": 7,
-        "difficulty": 7,
+        "reward": 7.0,
+        "difficulty": 7.0,
         "navigation_constraints": ["narrow spaces", "low ceilings"],
         "required_capabilities": {
             "payload": 4.0,
@@ -331,7 +352,7 @@ STRICT_TASK_PROFILES = [
         "manipulators_needed": ["gripper", "drill"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "balance control", "emergency stop"],
-        "duration": 3,
+        "duration": 3.0,
         "performance_metric": "safety compliance",
         "nl_description": "Work at elevation around narrow or vertical structures; drilling and placement on frames.",
     }

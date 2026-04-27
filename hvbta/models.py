@@ -5,7 +5,6 @@ class CapabilityProfile:
     def __init__(self,
                  robot_id: str,
                  mobility_type: str,
-                #  max_speed: float,
                  max_speed: int, # keep speed a constant integer of 1 for CBS purposes for now
                  payload_capacity: Optional[float],
                  reach: Optional[float],
@@ -82,14 +81,15 @@ class TaskDescription:
                  difficulty: float,
                  location: Tuple[float, float, float],
                  navigation_constraints: Optional[List[str]],
-                 required_capabilities: List[str],
+                 required_capabilities: Optional[dict[str, float]],
                  time_window: Optional[Tuple[str, str]],
                  environmental_conditions: Optional[List[str]],
                  dependencies: Optional[List[str]],
-                 tools_needed: Optional[List[List[str]]],
+                 sensors_needed: Optional[List[str]],
+                 manipulators_needed: Optional[List[str]],
                  communication_requirements: Optional[List[str]],
                  safety_protocols: Optional[List[str]],
-                 performance_metrics: List[str],
+                 performance_metrics: str,
                  success_criteria: str,
                  assigned_robot: Optional["CapabilityProfile"],
                  time_to_complete: float,
@@ -113,7 +113,8 @@ class TaskDescription:
         self.time_window = time_window  # (start_time, end_time) or None
         self.environmental_conditions = environmental_conditions
         self.dependencies = dependencies
-        self.tools_needed = tools_needed
+        self.sensors_needed = sensors_needed,
+        self.manipulators_needed = manipulators_needed,
         self.communication_requirements = communication_requirements
         self.safety_protocols = safety_protocols
         self.performance_metrics = performance_metrics
@@ -130,7 +131,7 @@ class TaskDescription:
                 f"location={self.location}, reward={self.reward}, difficulty={self.difficulty}, navigation_constraints={self.navigation_constraints}, "
                 f"required_capabilities={self.required_capabilities}, time_window={self.time_window}, "
                 f"environmental_conditions={self.environmental_conditions}, "
-                f"dependencies={self.dependencies}, tools_needed={self.tools_needed}, "
+                f"dependencies={self.dependencies}, sensors_needed={self.sensors_needed}, manipulators_needed={self.manipulators_needed}, "
                 f"communication_requirements={self.communication_requirements}, "
                 f"safety_protocols={self.safety_protocols}, performance_metrics={self.performance_metrics}, "
                 f"success_criteria={self.success_criteria}, time_to_complete={self.time_to_complete}), time_left={self.time_left}) ")
