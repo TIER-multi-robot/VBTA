@@ -35,7 +35,7 @@ STRICT_ROBOT_PROFILES = [
     },
     {
         "name": "assembly",
-        "mobility_type": "hovering",
+        "mobility_type": "aerial",
         "environmental_resistance": ["dustproof", "heat-resistant", "shock-resistant"],
         "sensors": ["camera", "proximity sensor", "infrared"],
         "manipulators": ["gripper", "drill", "dispenser", "welding tool"],
@@ -107,7 +107,7 @@ STRICT_ROBOT_PROFILES = [
     },
     {
         "name": "scaffolding",
-        "mobility_type": "climbing",
+        "mobility_type": "legged",
         "environmental_resistance": ["dustproof", "shock-resistant", "wind-resistant"],
         "sensors": ["LiDAR", "camera", "ultrasonic", "proximity sensor"],
         "manipulators": ["gripper", "drill", "welding tool", "cable hoist"],

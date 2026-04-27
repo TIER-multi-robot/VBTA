@@ -113,8 +113,8 @@ class TaskDescription:
         self.time_window = time_window  # (start_time, end_time) or None
         self.environmental_conditions = environmental_conditions
         self.dependencies = dependencies
-        self.sensors_needed = sensors_needed,
-        self.manipulators_needed = manipulators_needed,
+        self.sensors_needed = sensors_needed
+        self.manipulators_needed = manipulators_needed
         self.communication_requirements = communication_requirements
         self.safety_protocols = safety_protocols
         self.performance_metrics = performance_metrics

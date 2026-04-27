@@ -16,6 +16,8 @@ _LLAMA_MODEL = None
 _LLAMA_REPO_ID = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
 _LLAMA_FILENAME = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
 
+MAP_SCALE = 1.0
+
 def _get_llama():
     """
     Lazy-initialize a llama.cpp Llama instance with full GPU offload.
@@ -49,9 +51,6 @@ load_dotenv(dotenv_path=Path("C:\\Users\\owner\\Documents\\PhD\\TierLab\\VBTA - 
 
 ScoreFn = Callable[[CapabilityProfile, TaskDescription], float]
 
-def suitability_all_zero(suitability_matrix):
-    return all(value == 0 for row in suitability_matrix for value in row)
-
 def navigation_suitability(
         robot_mobility_type: str, 
         robot_size: Tuple[float, float, float], 
@@ -72,8 +71,6 @@ def navigation_suitability(
 
     # Initialize the score
     score = 0.0
-    # total possible amount of points for a perfect robot
-    total_score = 10.0
 
     # Define size thresholds for narrow spaces, low ceilings, etc.
     narrow_space_threshold = 2.0  # Width limit for narrow spaces
@@ -105,17 +102,17 @@ def navigation_suitability(
             if robot_size[0] <= 1.0 and robot_size[1] <= 1.0:
                 score += 1.0
             else:
-                score -= 0.5  
+                score += 0.0
 
         # ---- SENSOR ---- #
         # Constraint: Low visibility
         elif constraint == "low visibility":
             if robot_sensor_range >= 20:
                 score += 1.0
-            if robot_sensor_range >= 15:
+            elif robot_sensor_range >= 15:
                 score += 0.5
             else:
-                score -= 0.5
+                score += 0.0
 
         # ---- MOBILITY TYPE ---- #
         # Constraint: Stairs
@@ -127,12 +124,12 @@ def navigation_suitability(
             
         # Constraint: Smooth floors
         elif constraint == "smooth surfaces":
-            if robot_mobility_type == "wheeled":
+            if robot_mobility_type in ["wheeled", "tracked"]:
                 score += 1.0
 
         # Constraint: Uneven floors
         elif constraint == "uneven floors":
-            if robot_mobility_type == "legged":
+            if robot_mobility_type in ["legged", "tracked"]:
                 score += 1.0
 
         # Constraint: Slippery surfaces
@@ -150,12 +147,18 @@ def navigation_suitability(
                 score += 1.0
 
     # Final suitability score between [0, 1] (0 if any constraint returns 0)
-    return score / total_score if score > 0 else 0.0
+    return max(0.0, score / max(len(task_constraints), 1.0))
 
 def evaluate_suitability_new(robot: CapabilityProfile, task: TaskDescription) -> float:
     """
     Evaluates the suitability of a robot for a given task.
     A higher score indicates better suitability.
+    Strict parameters:
+    - Battery
+    - Payload
+    - Reach
+    - Manipulators
+    Everything else is loose based on what gets checked in the simulation!
     
     Parameters:
         robot: The CapabilityProfile of the robot.
@@ -177,103 +180,81 @@ def evaluate_suitability_new(robot: CapabilityProfile, task: TaskDescription) ->
         "reach": 2.0,
         "sensor_range": 1.0,
         "proximity": 1.0,
-        "autonomy_match": 0.5,
         "battery_duration": 2.0,
         "special_functions": 2.0,
         "processing_power": 1.0,
-        "adaptability": 0.5,
         "navigation": 2.0,
     }
 
-    # Payload
+    # ---- Payload ---- #
     total_weight += weights["payload"]
-    if any("payload capacity" in req and robot.payload_capacity < float(req.split(">= ")[-1]) for req in task.required_capabilities):
+    if robot.payload_capacity < task.required_capabilities["payload"]:
         return 0.0
     else:
         score += weights["payload"]
 
-    # Reach 
+    # ---- Reach ---- #
     total_weight += weights["reach"]
-    if any("reach" in req and robot.reach < float(req.split(">= ")[-1]) for req in task.required_capabilities):
-        score += 0.0
+    if robot.reach < task.required_capabilities["reach"]:
+        return 0.0
     else:
         score += weights["reach"]
 
-    sensor_requirements, manipulator_groups = _split_tool_requirements(task.tools_needed)
-
-    # Manipulators – every AND-group must be satisfied by at least one manipulator the robot carries
-    if manipulator_groups:
+    # ---- Manipulators ---- #
+    if task.manipulators_needed:
         total_weight += weights["manipulators"]
-        group_scores = []
-        robot_manips = set(robot.manipulators or [])
-        for required_group in manipulator_groups:
-            if not any(tool in robot_manips for tool in required_group):
-                return 0.0  # hard requirement missing
-            matched = sum(tool in robot_manips for tool in required_group)
-            group_scores.append(matched / len(required_group))
-        if group_scores:
-            score += weights["manipulators"] * (sum(group_scores) / len(group_scores))
-
-    # Sensors – treat legacy flat lists as pure sensor requirements
-    if sensor_requirements:
+        if not any(manip in robot.manipulators for manip in task.manipulators_needed):
+            return 0.0
+        manipulator_matched = sum(manip in robot.manipulators for manip in task.manipulators_needed)
+        manipulator_score = manipulator_matched / len(task.manipulators_needed)
+        score += weights["manipulators"] * manipulator_score
+    
+    # ---- Sensors ---- #
+    if task.sensors_needed:
         total_weight += weights["sensors"]
-        robot_sensors = set(robot.sensors or [])
-        matched = sum(tool in robot_sensors for tool in sensor_requirements)
-        score += weights["sensors"] * (matched / len(sensor_requirements))
+        sensors_matched = sum(sensor in robot.sensors for sensor in task.sensors_needed)
+        sensor_score = sensors_matched / len(task.sensors_needed)
+        score += weights["sensors"] * sensor_score
 
-    # Communication 
-    total_weight += weights["communication"]
+    # ---- Communications ---- #
     if task.communication_requirements:
-        matched_comm = sum(proto in robot.communication_protocols for proto in task.communication_requirements)
-        comm_score = matched_comm / len(task.communication_requirements)
-        score += weights["communication"] * comm_score
+        total_weight += weights["communication"]
+        matched_communications = sum(comm in robot.communication_protocols for comm in task.communication_requirements)
+        communication_score = matched_communications / len(task.communication_requirements)
+        score += weights["communication"] * communication_score
 
-    # Safety 
-    total_weight += weights["safety"]
-    if robot.safety_features and task.safety_protocols:
-        matched_safety = sum(safety in robot.safety_features for safety in task.safety_protocols)
+    # ---- Safety ---- #
+    if task.safety_protocols:
+        total_weight += weights["safety"]
+        matched_safety = sum(safe in robot.safety_features for safe in task.safety_protocols)
         safety_score = matched_safety / len(task.safety_protocols)
         score += weights["safety"] * safety_score
 
-    # Environmental 
-    total_weight += weights["environmental"]
-    if robot.environmental_resistance and task.environmental_conditions:
+    # ---- Environmental ---- #
+    if task.environmental_conditions:
+        total_weight += weights["environmental"]
         matched_environmental = sum(condition in robot.environmental_resistance for condition in task.environmental_conditions)
         environmental_score = matched_environmental / len(task.environmental_conditions)
         score += weights["environmental"] * environmental_score
 
-    # Navigation 
-    total_weight += weights["navigation"]
+    # ---- Navigation ---- #
     if task.navigation_constraints:
+        total_weight += weights["navigation"]
         navigation_score = navigation_suitability(robot.mobility_type, robot.size, robot.sensor_range, task.navigation_constraints)
-        if navigation_score == 0:
-            return 0.0
         score += weights["navigation"] * navigation_score
 
-    # Sensor range 
+    # ---- Sensor range ---- #
     total_weight += weights["sensor_range"]
     distance_to_task = len(robot.current_path) - 1
-    sensor_score = 1.0 if robot.sensor_range >= distance_to_task else \
-                   0.5 if robot.sensor_range >= distance_to_task / 2 else 0.0
-    score += weights["sensor_range"] * sensor_score
+    if robot.sensor_range >= distance_to_task:
+        sensor_range_score = 1.0
+    elif robot.sensor_range >= distance_to_task / 2.0:
+        sensor_range_score = 0.5
+    else:
+        sensor_range_score = 0.0
+    score += weights["sensor_range"] * sensor_range_score
 
-    # Proximity 
-    total_weight += weights["proximity"]
-    if distance_to_task < 20.0:
-        score += weights["proximity"]
-    elif distance_to_task < 50.0:
-        score += weights["proximity"] * 0.5
-
-    # Autonomy 
-    total_weight += weights["autonomy_match"]
-    autonomy_score = 0.0
-    if task.priority_level in ["high", "urgent"] and robot.autonomy_level in ["fully autonomous", "teleoperated"]:
-        autonomy_score = 1.0
-    elif task.priority_level in ["medium", "low"] and robot.autonomy_level in ["semi-autonomous", "fully autonomous"]:
-        autonomy_score = 0.5
-    score += weights["autonomy_match"] * autonomy_score
-
-    # Battery 
+    # ---- Battery ---- #
     total_weight += weights["battery_duration"]
     if ((distance_to_task / robot.max_speed) + task.time_to_complete) > robot.battery_life:
         return 0.0
@@ -283,56 +264,43 @@ def evaluate_suitability_new(robot: CapabilityProfile, task: TaskDescription) ->
     # Special functions 
     total_weight += weights["special_functions"]
     task_function_mapping = {
-        "delivery": ["object recognition", "speech output", "facial recognition"],
-        "assembly": ["object recognition", "object tracking", "precise alignment"],
-        "utilities": ["percise alignment", "balance control"],
-        "excavate": [ "terrain leveling", "object recognition", "precise alignment"],
+        "utilities": ["precise alignment", "balance control"],
         "debris": ["balance control", "object recognition"],
-        "level": ["terrain leveling", "object recognition"],
-        "item elevation": ["precise alignment", "object tracking", "balance control"],
+        "delivery": ["object recognition"],
+        "assembly": ["object recognition", "precise alignment"],
+        "excavate": [ "terrain leveling", "precise alignment"],
+        "item elevation": ["precise alignment", "balance control"],
         "lay bricks": ["object recognition", "precise alignment"],
         "scaffold": ["precise alignment", "balance control"],
-        "remove scaffold": ["object recognition", "object tracking", "precise alignment"],
     }
     required_functions = task_function_mapping[task.task_type]
     matched_special_functions = sum(special in robot.special_functions for special in required_functions)
     special_functions_score = matched_special_functions / len(required_functions)
     score += weights["special_functions"] * special_functions_score
 
-    # Processing power 
+    # ---- Processing power ---- #
     total_weight += weights["processing_power"]
     proc_score = 0.0
     if task.difficulty > 7:
-        if robot.processing_power >= 5.0:
+        if robot.processing_power >= 7.0:
             proc_score = 1.0
-        elif robot.processing_power >= 3.0:
+        elif robot.processing_power >= 5.0:
             proc_score = 0.75
         else:
             proc_score = 0.5
     elif task.difficulty > 4:
-        if robot.processing_power >= 3.0:
+        if robot.processing_power >= 4.0:
             proc_score = 1.0
         else:
-            proc_score = 0.75
-    elif task.difficulty > 2:
-        if robot.processing_power >= 1.5:
-            proc_score = 1.0
-        else:
-            proc_score = 0.75
+            proc_score = 0.5
     score += weights["processing_power"] * proc_score
-
-    # Adaptability 
-    total_weight += weights["adaptability"]
-    score += weights["adaptability"] * (1.0 if robot.adaptability else 0.0)
-
-    # Reward/Difficulty ratio 
-    reward_score = (task.reward / max(task.difficulty, 1.0))
-    priority_multiplier = {"low": 0.5, "medium": 1.0, "high": 1.5, "urgent": 2.0}[task.priority_level]
-    score += priority_multiplier * (reward_score / (reward_score + 10.0))  # squash into (0,1)
 
     # Normalize 
     if total_weight > 0:
         final_score = score / total_weight
+        # ---- Proximity ---- #
+        proximity_factor = weights["proximity"] / (1.0 + distance_to_task / MAP_SCALE)
+        final_score *= proximity_factor
     else:
         final_score = 0.0
 
@@ -363,162 +331,123 @@ def evaluate_suitability_loose(robot: CapabilityProfile, task: TaskDescription) 
         "reach": 2.0,
         "sensor_range": 1.0,
         "proximity": 1.0,
-        "autonomy_match": 0.5,
         "battery_duration": 2.0,
         "special_functions": 2.0,
         "processing_power": 1.0,
-        "adaptability": 0.5,
         "navigation": 2.0,
     }
-
-    # Payload
+    
+    # ---- Payload ---- #
     total_weight += weights["payload"]
-    if any("payload capacity" in req and robot.payload_capacity < float(req.split(">= ")[-1]) for req in task.required_capabilities):
+    if robot.payload_capacity < task.required_capabilities["payload"]:
         score += 0.0
     else:
         score += weights["payload"]
 
-    # Reach
+    # ---- Reach ---- #
     total_weight += weights["reach"]
-    if any("reach" in req and robot.reach < float(req.split(">= ")[-1]) for req in task.required_capabilities):
+    if robot.reach < task.required_capabilities["reach"]:
         score += 0.0
     else:
         score += weights["reach"]
 
-    sensor_requirements, manipulator_groups = _split_tool_requirements(task.tools_needed)
-
-    # Manipulators – every AND-group must be satisfied by at least one manipulator the robot carries
-    if manipulator_groups:
+    # ---- Manipulators ---- #
+    if task.manipulators_needed:
         total_weight += weights["manipulators"]
-        group_scores = []
-        robot_manips = set(robot.manipulators or [])
-        for required_group in manipulator_groups:
-            if not any(tool in robot_manips for tool in required_group):
-                score += 0.0  # hard requirement missing
-            matched = sum(tool in robot_manips for tool in required_group)
-            group_scores.append(matched / len(required_group))
-        if group_scores:
-            score += weights["manipulators"] * (sum(group_scores) / len(group_scores))
+        manipulator_matched = sum(manip in robot.manipulators for manip in task.manipulators_needed)
+        manipulator_score = manipulator_matched / len(task.manipulators_needed)
+        score += weights["manipulators"] * manipulator_score
 
-    # Sensors – treat legacy flat lists as pure sensor requirements
-    if sensor_requirements:
+    # ---- Sensors ---- #
+    if task.sensors_needed:
         total_weight += weights["sensors"]
-        robot_sensors = set(robot.sensors or [])
-        matched = sum(tool in robot_sensors for tool in sensor_requirements)
-        score += weights["sensors"] * (matched / len(sensor_requirements))
+        sensors_matched = sum(sensor in robot.sensors for sensor in task.sensors_needed)
+        sensor_score = sensors_matched / len(task.sensors_needed)
+        score += weights["sensors"] * sensor_score
 
-    # Communication
-    total_weight += weights["communication"]
+    # ---- Communications ---- #
     if task.communication_requirements:
-        matched_comm = sum(proto in robot.communication_protocols for proto in task.communication_requirements)
-        comm_score = matched_comm / len(task.communication_requirements)
-        score += weights["communication"] * comm_score
+        total_weight += weights["communication"]
+        matched_communications = sum(comm in robot.communication_protocols for comm in task.communication_requirements)
+        communication_score = matched_communications / len(task.communication_requirements)
+        score += weights["communication"] * communication_score
 
-    # Safety
-    total_weight += weights["safety"]
-    if robot.safety_features and task.safety_protocols:
-        matched_safety = sum(safety in robot.safety_features for safety in task.safety_protocols)
+    # ---- Safety ---- #
+    if task.safety_protocols:
+        total_weight += weights["safety"]
+        matched_safety = sum(safe in robot.safety_features for safe in task.safety_protocols)
         safety_score = matched_safety / len(task.safety_protocols)
         score += weights["safety"] * safety_score
 
-    # Environmental
-    total_weight += weights["environmental"]
-    if robot.environmental_resistance and task.environmental_conditions:
+    # ---- Environmental ---- #
+    if task.environmental_conditions:
+        total_weight += weights["environmental"]
         matched_environmental = sum(condition in robot.environmental_resistance for condition in task.environmental_conditions)
         environmental_score = matched_environmental / len(task.environmental_conditions)
         score += weights["environmental"] * environmental_score
 
-    # Navigation
-    total_weight += weights["navigation"]
+    # ---- Navigation ---- #
     if task.navigation_constraints:
+        total_weight += weights["navigation"]
         navigation_score = navigation_suitability(robot.mobility_type, robot.size, robot.sensor_range, task.navigation_constraints)
         score += weights["navigation"] * navigation_score
 
-    # Sensor range
+    # ---- Sensor range ---- #
     total_weight += weights["sensor_range"]
     distance_to_task = len(robot.current_path) - 1
-    sensor_score = 1.0 if robot.sensor_range >= distance_to_task else \
-                   0.5 if robot.sensor_range >= distance_to_task / 2 else 0.0
-    score += weights["sensor_range"] * sensor_score
+    if robot.sensor_range >= distance_to_task:
+        sensor_range_score = 1.0
+    elif robot.sensor_range >= distance_to_task / 2.0:
+        sensor_range_score = 0.5
+    else:
+        sensor_range_score = 0.0
+    score += weights["sensor_range"] * sensor_range_score
 
-    # Proximity
-    total_weight += weights["proximity"]
-    if distance_to_task < 20.0:
-        score += weights["proximity"]
-    elif distance_to_task < 50.0:
-        score += weights["proximity"] * 0.5
-
-    # Autonomy
-    total_weight += weights["autonomy_match"]
-    autonomy_score = 0.0
-    if task.priority_level in ["high", "urgent"] and robot.autonomy_level in ["fully autonomous", "teleoperated"]:
-        autonomy_score = 1.0
-    elif task.priority_level in ["medium", "low"] and robot.autonomy_level in ["semi-autonomous", "fully autonomous"]:
-        autonomy_score = 0.5
-    score += weights["autonomy_match"] * autonomy_score
-
-    # Battery
+    # ---- Battery ---- #
     total_weight += weights["battery_duration"]
-    if ((distance_to_task / robot.max_speed) + task.time_to_complete) > robot.battery_life:
-        return 0.0
-    battery_score = (1.0 if robot.battery_life >= 2 * ((distance_to_task / robot.max_speed) + task.time_to_complete)
-                    else 0 if ((distance_to_task / robot.max_speed) + task.time_to_complete) > robot.battery_life
-                    else 0.5)
+    battery_score = 1.0 if robot.battery_life >= 2 * ((distance_to_task / robot.max_speed) + task.time_to_complete) else 0.5
     score += weights["battery_duration"] * battery_score
 
-    # Special functions
+    # Special functions 
     total_weight += weights["special_functions"]
     task_function_mapping = {
-        "delivery": ["object recognition", "speech output", "facial recognition"],
-        "assembly": ["object recognition", "object tracking", "precise alignment"],
-        "utilities": ["percise alignment", "balance control"],
-        "excavate": [ "terrain leveling", "object recognition", "precise alignment"],
+        "utilities": ["precise alignment", "balance control"],
         "debris": ["balance control", "object recognition"],
-        "level": ["terrain leveling", "object recognition"],
-        "item elevation": ["precise alignment", "object tracking", "balance control"],
+        "delivery": ["object recognition"],
+        "assembly": ["object recognition", "precise alignment"],
+        "excavate": [ "terrain leveling", "precise alignment"],
+        "item elevation": ["precise alignment", "balance control"],
         "lay bricks": ["object recognition", "precise alignment"],
         "scaffold": ["precise alignment", "balance control"],
-        "remove scaffold": ["object recognition", "object tracking", "precise alignment"],
     }
     required_functions = task_function_mapping[task.task_type]
     matched_special_functions = sum(special in robot.special_functions for special in required_functions)
     special_functions_score = matched_special_functions / len(required_functions)
     score += weights["special_functions"] * special_functions_score
 
-    # Processing power
+    # ---- Processing power ---- #
     total_weight += weights["processing_power"]
     proc_score = 0.0
     if task.difficulty > 7:
-        if robot.processing_power >= 5.0:
+        if robot.processing_power >= 7.0:
             proc_score = 1.0
-        elif robot.processing_power >= 3.0:
+        elif robot.processing_power >= 5.0:
             proc_score = 0.75
         else:
             proc_score = 0.5
     elif task.difficulty > 4:
-        if robot.processing_power >= 3.0:
+        if robot.processing_power >= 4.0:
             proc_score = 1.0
         else:
-            proc_score = 0.75
-    elif task.difficulty > 2:
-        if robot.processing_power >= 1.5:
-            proc_score = 1.0
-        else:
-            proc_score = 0.75
+            proc_score = 0.5
     score += weights["processing_power"] * proc_score
-
-    # Adaptability
-    total_weight += weights["adaptability"]
-    score += weights["adaptability"] * (1.0 if robot.adaptability else 0.0)
-
-    # Reward/Difficulty ratio
-    reward_score = (task.reward / max(task.difficulty, 1.0))
-    priority_multiplier = {"low": 0.5, "medium": 1.0, "high": 1.5, "urgent": 2.0}[task.priority_level]
-    score += priority_multiplier * (reward_score / (reward_score + 10.0))  # squash into (0,1)
 
     # Normalize
     if total_weight > 0:
         final_score = score / total_weight
+        # ---- Proximity ---- #
+        proximity_factor = weights["proximity"] / (1.0 + distance_to_task / MAP_SCALE)
+        final_score *= proximity_factor
     else:
         final_score = 0.0
 
@@ -537,7 +466,7 @@ def evaluate_suitability_strict(robot: CapabilityProfile, task: TaskDescription)
         score: A float score representing the suitability of the robot for the task. A score of 0 indicates the robot cannot perform the task.
     """
     score = 0.0
-    total_weight = 0.0  # for normalization
+    total_weight = 0.0
 
     weights = {
         "payload": 3.0,
@@ -559,7 +488,7 @@ def evaluate_suitability_strict(robot: CapabilityProfile, task: TaskDescription)
 
     # ---- Payload ---- #
     total_weight += weights["payload"]
-    if robot.payload_capacity < task.required_capabilities["payload_capacity"]:
+    if robot.payload_capacity < task.required_capabilities["payload"]:
         return 0.0
     else:
         score += weights["payload"]
@@ -587,13 +516,13 @@ def evaluate_suitability_strict(robot: CapabilityProfile, task: TaskDescription)
         sensor_score = sensor_matched / len(task.sensors_needed)
         score += weights["sensors"] * sensor_score
 
-    # ---- Communication ---- #
+    # ---- Communications ---- #
     if task.communication_requirements:
         total_weight += weights["communication"]
         if not any(comm in robot.communication_protocols for comm in task.communication_requirements):
             return 0.0
-        matched_communication = sum(comm in robot.communication_protocols for comm in task.communication_requirements)
-        communication_score = matched_communication / len(task.communication_requirements)
+        matched_communications = sum(comm in robot.communication_protocols for comm in task.communication_requirements)
+        communication_score = matched_communications / len(task.communication_requirements)
         score += weights["communication"] * communication_score
 
     # ---- Safety ---- #
@@ -674,364 +603,16 @@ def evaluate_suitability_strict(robot: CapabilityProfile, task: TaskDescription)
             proc_score = 0.5
     score += weights["processing_power"] * proc_score
 
-    # ---- Proximity ---- #
-    # TODO: replace magic numbers with scaling values based on map size after removing batch scoring functions
-    total_weight += weights["proximity"]
-    total_weight /= (distance_to_task + 1E-5)
-    score /= weights["proximity"] * (distance_to_task + 1E-5)
-    # if distance_to_task < 20.0:
-    #     score += weights["proximity"]
-    # elif distance_to_task < 50.0:
-    #     score += weights["proximity"] * 0.5
-
     # Normalize
     if total_weight > 0:
         final_score = score / total_weight
+        # ---- Proximity ---- #
+        proximity_factor = weights["proximity"] / (1.0 + distance_to_task / MAP_SCALE)
+        final_score *= proximity_factor
     else:
         final_score = 0.0
 
     return max(0.0, min(1.0, final_score))
-
-def evaluate_suitability_distance(robot: CapabilityProfile, task: TaskDescription) -> float:
-    """
-    Evaluates the suitability of a robot for a given task.
-    A higher score indicates better suitability.
-    
-    Parameters:
-        robot: The CapabilityProfile of the robot.
-        task: The TaskDescription of the task.
-    
-    Returns:
-        score: A float score representing the suitability of the robot for the task. A score of 0 indicates the robot cannot perform the task.
-    """
-    score = 0.0
-    
-#     print(task.required_capabilities, robot.payload_capacity)
-    # Check if robot meets the minimum requirements
-    if any(req for req in task.required_capabilities if "payload capacity" in req and robot.payload_capacity < float(req.split(">= ")[-1])):
-        score += 0.0  # Suitability is zero if the robot doesn't meet minimum requirements
-    else:
-        score += 1.0  # Add score if payload meets or exceeds requirements
-    
-#     print(task.tools_needed, robot.sensors+robot.manipulators)
-    # Check if the robot has the necessary tools for the task
-    if robot.sensors:
-        if task.tools_needed and not all(item in robot.sensors for item in task.tools_needed):
-            score += 0.0  # Suitability is zero if the robot lacks necessary tools
-        else:
-            score += 1.0  # Add score if robot has necessary tools
-
-    if robot.manipulators:
-        if task.tools_needed and not all(item in robot.manipulators for item in task.tools_needed):
-            score += 0.0  # Suitability is zero if the robot lacks necessary tools
-        else:
-            score += 1.0  # Add score if robot has necessary tools
-    
-#     print(task.communication_requirements, robot.communication_protocols)
-    # Check if the robot can communicate as required by the task
-    if task.communication_requirements and not all(protocol in robot.communication_protocols for protocol in task.communication_requirements):
-        score += 0.0  # Suitability is zero if the robot lacks required communication protocols
-    else:
-        score += 1.0  # Add score if robot has communication requirements
-    
-#     print(task.safety_protocols, robot.safety_features)
-    # Check if the robot can safely perform the task
-    if robot.safety_features and task.safety_protocols:
-        if task.safety_protocols and not all(safety in robot.safety_features for safety in task.safety_protocols):
-            score += 0.0  # Suitability is zero if the robot lacks required safety features
-        else:
-            score += 1.0  # Add score if robot meets safety requirements
-    
-#     print(task.environmental_conditions, robot.environmental_resistance)
-    # Environmental compatibility: Can the robot operate in the task’s conditions?
-    if robot.environmental_resistance and task.environmental_conditions:
-        if task.environmental_conditions and not all(condition in robot.environmental_resistance for condition in task.environmental_conditions):
-            score += 0.0  # Suitability is zero if the robot can't operate in required environmental conditions
-        else:
-            score += 1.0  # Add score if robot has required environmental resistances
-    
-#     print(task.required_capabilities, robot.reach)
-    # Check if the robot meets reach requirements
-    if any(req for req in task.required_capabilities if "reach" in req and robot.reach < float(req.split(">= ")[-1])):
-        score += 0.0  # Suitability is zero if the robot cannot reach the task area as required
-    else:
-        score += 1.0  # Add score if reach meets or exceeds requirements
-    
-#     print(task.navigation_constraints, robot.mobility_type, robot.size)
-    # Check navigation constraints based on mobility type and robot size
-    if task.navigation_constraints:
-        navigation_match = navigation_suitability(robot.mobility_type, robot.size, robot.sensor_range, task.navigation_constraints)
-        if navigation_match == 0:
-            score += 0.0
-        else:
-            score += navigation_match
-
-    # NOTE: CHANGED TO WORK WITH COORDINATES
-    # distance_to_task = ((robot.location[0] - task.location[0]) ** 2 + (robot.location[1] - task.location[1]) ** 2) ** 0.5
-    # stop suitability matrix from going negative
-    distance_to_task = max(0, len(robot.current_path) - 1)
-#     print(robot.sensor_range)
-    # Check sensor capabilities for the task
-    if robot.sensor_range:
-        if robot.sensor_range >= distance_to_task:
-            score += 1.0
-        elif robot.sensor_range >= distance_to_task/2:
-            score += 0.5
-
-    # Battery and distance check: Ensure the robot has sufficient battery to reach and complete the task
-#     print(robot.max_speed, robot.battery_life, task.duration, distance_to_task)
-    if ((distance_to_task / robot.max_speed)+task.time_to_complete) > robot.battery_life:
-        score += 0.0  # Suitability is zero if the robot can't complete the task due to distance, speed, or battery limitations
-
-    # Add to score based on proximity (closer robots get higher scores)
-#     if distance_to_task < 20.0:
-#         score += 1.0
-#     elif distance_to_task < 50.0:
-#         score += 0.5
-
-#     print(task.priority_level, robot.autonomy_level)
-    # Check if the robot's autonomy level matches the task's priority level
-    if task.priority_level in ["high", "urgent"] and robot.autonomy_level in ["fully autonomous", "teleoperated"]:
-        score += 1.0
-    elif task.priority_level in ["medium", "low"] and robot.autonomy_level in ["semi-autonomous", "fully autonomous"]:
-        score += 0.5
-
-#     print(robot.battery_life, task.duration)
-    # Evaluate battery life for task duration
-    if robot.battery_life >= 2*((distance_to_task / robot.max_speed)+task.time_to_complete):
-        score += 1.0
-    else:
-        score += 0.5
-
-#     print(task.task_type, robot.special_functions)
-    task_function_mapping = {
-        "delivery": ["object recognition", "speech output", "facial recognition"],
-        "inspection": ["object recognition", "object tracking", "gesture recognition"],
-        "cleaning": ["object recognition"],
-        "monitoring": ["speech output", "object tracking", "facial recognition"],
-        "maintenance": ["object recognition", "path planning"],
-        "assembly": ["object recognition"],
-        "surveying": ["speech output", "facial recognition", "object recognition", "object tracking"],
-        "data collection": ["object recognition", "object tracking", "facial recognition", "gesture recognition"],
-        "assistance": ["speech output", "facial recognition", "gesture recognition"]
-    }
-
-    # Get the relevant functions for this task type
-    required_functions = task_function_mapping[task.task_type]
-
-    # Calculate the score based on matches between robot's functions and required functions
-    if robot.special_functions:
-        for function in robot.special_functions:
-            if function in required_functions:
-                score += 1.0  # Increase score for each match
-    
-#     # Dependencies
-#     if task.dependencies:
-#         # Assume dependencies are represented as tasks that must be completed first
-#         score += 0.5 if all(dep in completed_tasks for dep in task.dependencies) else 0.0
-    
-#     print(task.difficulty, robot.processing_power)
-    # Processing power: Certain tasks may benefit from higher processing power if they are computationally demanding
-    if task.difficulty > 7 and robot.processing_power >= 5.0:  # Difficulty > 7 indicates a complex task
-        score += 1.0
-    elif task.difficulty > 4 and robot.processing_power >= 3.0:
-        score += 1.0
-    elif task.difficulty > 2 and robot.processing_power >= 1.5:
-        score += 0.5
-
-#     print(robot.adaptability)
-    # Consider robot's adaptability to changing conditions
-    if robot.adaptability:
-        score += 0.5
-    
-#     print(task.task_type, robot.preferred_tasks)
-    # Preference matching
-    #if task.task_type in robot.preferred_tasks:
-    #    score += 1.0
-
-    # Score based on priority, reward, and difficulty
-    priority_multiplier = {"low": 0.5, "medium": 1.0, "high": 1.5, "urgent": 2.0}[task.priority_level]
-    reward_to_difficulty_ratio = task.reward / task.difficulty
-#     print(task.priority_level, task.reward, task.difficulty, priority_multiplier, reward_to_difficulty_ratio)
-    score += priority_multiplier * reward_to_difficulty_ratio
-
-    # Weight score by distance to task
-    # NOTE: IF THE ROBOT IS AT THE TASK THIS CAN CAUSE A DIVIDE BY ZERO ERROR
-    score = score / (distance_to_task + 1E-5)
-    
-    # Return the final suitability score
-#     print(score)
-    return score
-
-def evaluate_suitability_priority(robot: CapabilityProfile, task: TaskDescription) -> float:
-    """
-    Evaluates the suitability of a robot for a given task.
-    A higher score indicates better suitability.
-    
-    Parameters:
-        robot: The CapabilityProfile of the robot.
-        task: The TaskDescription of the task.
-    
-    Returns:
-        score: A float score representing the suitability of the robot for the task. A score of 0 indicates the robot cannot perform the task.
-    """
-    score = 0.0
-    
-#     print(task.required_capabilities, robot.payload_capacity)
-    # Check if robot meets the minimum requirements
-    if any(req for req in task.required_capabilities if "payload capacity" in req and robot.payload_capacity < float(req.split(">= ")[-1])):
-        score += 0.0  # Suitability is zero if the robot doesn't meet minimum requirements
-    else:
-        score += 1.0  # Add score if payload meets or exceeds requirements
-    
-#     print(task.tools_needed, robot.sensors+robot.manipulators)
-    # Check if the robot has the necessary tools for the task
-    if robot.sensors:
-        if task.tools_needed and not all(item in robot.sensors for item in task.tools_needed):
-            score += 0.0  # Suitability is zero if the robot lacks necessary tools
-        else:
-            score += 1.0  # Add score if robot has necessary tools
-    
-    if robot.manipulators:
-        if task.tools_needed and not all(item in robot.manipulators for item in task.tools_needed):
-            score += 0.0  # Suitability is zero if the robot lacks necessary tools
-        else:
-            score += 1.0  # Add score if robot has necessary tools
-    
-#     print(task.communication_requirements, robot.communication_protocols)
-    # Check if the robot can communicate as required by the task
-    if task.communication_requirements and not all(protocol in robot.communication_protocols for protocol in task.communication_requirements):
-        score += 0.0  # Suitability is zero if the robot lacks required communication protocols
-    else:
-        score += 1.0  # Add score if robot has communication requirements
-    
-#     print(task.safety_protocols, r
-# obot.safety_features)
-    # Check if the robot can safely perform the task
-    if robot.safety_features and task.safety_protocols:
-        if task.safety_protocols and not all(safety in robot.safety_features for safety in task.safety_protocols):
-            score += 0.0  # Suitability is zero if the robot lacks required safety features
-        else:
-            score += 1.0  # Add score if robot meets safety requirements
-    
-#     print(task.environmental_conditions, robot.environmental_resistance)
-    # Environmental compatibility: Can the robot operate in the task’s conditions?
-    if robot.environmental_resistance and task.environmental_conditions:
-        if task.environmental_conditions and not all(condition in robot.environmental_resistance for condition in task.environmental_conditions):
-            score += 0.0  # Suitability is zero if the robot can't operate in required environmental conditions
-        else:
-            score += 1.0  # Add score if robot has required environmental resistances
-    
-#     print(task.required_capabilities, robot.reach)
-    # Check if the robot meets reach requirements
-    if any(req for req in task.required_capabilities if "reach" in req and robot.reach < float(req.split(">= ")[-1])):
-        score += 0.0  # Suitability is zero if the robot cannot reach the task area as required
-    else:
-        score += 1.0  # Add score if reach meets or exceeds requirements
-    
-#     print(task.navigation_constraints, robot.mobility_type, robot.size)
-    # Check navigation constraints based on mobility type and robot size
-    if task.navigation_constraints:
-        navigation_match = navigation_suitability(robot.mobility_type, robot.size, robot.sensor_range, task.navigation_constraints)
-        if navigation_match == 0:
-            score += 0.0
-        else:
-            score += navigation_match
-
-    # NOTE: CHANGED TO WORK WITH COORDINATES
-    # distance_to_task = ((robot.location[0] - task.location[0]) ** 2 + (robot.location[1] - task.location[1]) ** 2) ** 0.5
-    distance_to_task = len(robot.current_path) - 1
-#     print(robot.sensor_range)
-    # Check sensor capabilities for the task
-    if robot.sensor_range:
-        if robot.sensor_range >= distance_to_task:
-            score += 1.0
-        elif robot.sensor_range >= distance_to_task/2:
-            score += 0.5
-
-    # Battery and distance check: Ensure the robot has sufficient battery to reach and complete the task
-#     print(robot.max_speed, robot.battery_life, task.duration, distance_to_task)
-    if ((distance_to_task / robot.max_speed)+task.time_to_complete) > robot.battery_life:
-        score += 0.0  # Suitability is zero if the robot can't complete the task due to distance, speed, or battery limitations
-
-    # Add to score based on proximity (closer robots get higher scores)
-    if distance_to_task < 20.0:
-        score += 1.0
-    elif distance_to_task < 50.0:
-        score += 0.5
-
-#     print(task.priority_level, robot.autonomy_level)
-    # Check if the robot's autonomy level matches the task's priority level
-    if task.priority_level in ["high", "urgent"] and robot.autonomy_level in ["fully autonomous", "teleoperated"]:
-        score += 1.0
-    elif task.priority_level in ["medium", "low"] and robot.autonomy_level in ["semi-autonomous", "fully autonomous"]:
-        score += 0.5
-
-#     print(robot.battery_life, task.duration)
-    # Evaluate battery life for task duration
-    if robot.battery_life >= 2*((distance_to_task / robot.max_speed)+task.time_to_complete):
-        score += 1.0
-    else:
-        score += 0.5
-
-#     print(task.task_type, robot.special_functions)
-    task_function_mapping = {
-        "delivery": ["object recognition", "speech output", "facial recognition"],
-        "inspection": ["object recognition", "object tracking", "gesture recognition"],
-        "cleaning": ["object recognition"],
-        "monitoring": ["speech output", "object tracking", "facial recognition"],
-        "maintenance": ["object recognition", "path planning"],
-        "assembly": ["object recognition"],
-        "surveying": ["speech output", "facial recognition", "object recognition", "object tracking"],
-        "data collection": ["object recognition", "object tracking", "facial recognition", "gesture recognition"],
-        "assistance": ["speech output", "facial recognition", "gesture recognition"]
-    }
-
-    # Get the relevant functions for this task type
-    required_functions = task_function_mapping[task.task_type]
-
-    # Calculate the score based on matches between robot's functions and required functions
-    if robot.special_functions:
-        for function in robot.special_functions:
-            if function in required_functions:
-                score += 1.0  # Increase score for each match
-    
-#     # Dependencies
-#     if task.dependencies:
-#         # Assume dependencies are represented as tasks that must be completed first
-#         score += 0.5 if all(dep in completed_tasks for dep in task.dependencies) else 0.0
-    
-#     print(task.difficulty, robot.processing_power)
-    # Processing power: Certain tasks may benefit from higher processing power if they are computationally demanding
-    if task.difficulty > 7 and robot.processing_power >= 5.0:  # Difficulty > 7 indicates a complex task
-        score += 1.0
-    elif task.difficulty > 4 and robot.processing_power >= 3.0:
-        score += 1.0
-    elif task.difficulty > 2 and robot.processing_power >= 1.5:
-        score += 0.5
-
-#     print(robot.adaptability)
-    # Consider robot's adaptability to changing conditions
-    if robot.adaptability:
-        score += 0.5
-    
-#     print(task.task_type, robot.preferred_tasks)
-    # Preference matching
-    #if task.task_type in robot.preferred_tasks:
-    #    score += 1.0
-
-    # Score based on reward and difficulty
-    priority_multiplier = {"low": 0.5, "medium": 1.0, "high": 1.5, "urgent": 2.0}[task.priority_level]
-    reward_to_difficulty_ratio = task.reward / task.difficulty
-#     print(task.priority_level, task.reward, task.difficulty, priority_multiplier, reward_to_difficulty_ratio)
-    score += reward_to_difficulty_ratio
-
-    # Weight based on priority
-    score = score * priority_multiplier
-    
-    # Return the final suitability score
-#     print(score)
-    return score
 
 def _to_jsonable(x):
     """Recursively convert to JSON-safe Python objects."""
