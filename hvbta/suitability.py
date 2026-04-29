@@ -299,7 +299,7 @@ def evaluate_suitability_new(robot: CapabilityProfile, task: TaskDescription) ->
     if total_weight > 0:
         final_score = score / total_weight
         # ---- Proximity ---- #
-        proximity_factor = weights["proximity"] / (1.0 + distance_to_task / MAP_SCALE)
+        proximity_factor = weights["proximity"] / (1E-5 + distance_to_task / MAP_SCALE)
         final_score *= proximity_factor
     else:
         final_score = 0.0
@@ -446,7 +446,7 @@ def evaluate_suitability_loose(robot: CapabilityProfile, task: TaskDescription) 
     if total_weight > 0:
         final_score = score / total_weight
         # ---- Proximity ---- #
-        proximity_factor = weights["proximity"] / (1.0 + distance_to_task / MAP_SCALE)
+        proximity_factor = weights["proximity"] / (1E-5 + distance_to_task / MAP_SCALE)
         final_score *= proximity_factor
     else:
         final_score = 0.0
@@ -607,7 +607,7 @@ def evaluate_suitability_strict(robot: CapabilityProfile, task: TaskDescription)
     if total_weight > 0:
         final_score = score / total_weight
         # ---- Proximity ---- #
-        proximity_factor = weights["proximity"] / (1.0 + distance_to_task / MAP_SCALE)
+        proximity_factor = weights["proximity"] / (1E-5 + distance_to_task / MAP_SCALE)
         final_score *= proximity_factor
     else:
         final_score = 0.0

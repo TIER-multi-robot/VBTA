@@ -175,7 +175,7 @@ def simulate_time_step(
                     )
                     continue
                 
-                nav_score = navigation_suitability(robot.mobility_type, robot.size, task.navigation_constraints or [])
+                nav_score = navigation_suitability(robot.mobility_type, robot.size, robot.sensor_range, task.navigation_constraints or [])
                 if nav_score == 0.0:
                     unassign_task_from_robot(
                         robot, task,
