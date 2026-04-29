@@ -13,6 +13,7 @@ def _sample(items: List[str], k_min: int = 0, k_max: int = None) -> List[str]:
     return random.sample(items, k)
 
 # STRICT ROBOT PROFILES FOR ROBOT GENERATION
+# 16 items per profile
 STRICT_ROBOT_PROFILES = [
     {
         "name": "delivery",
@@ -34,7 +35,7 @@ STRICT_ROBOT_PROFILES = [
     },
     {
         "name": "assembly",
-        "mobility_type": "hovering",
+        "mobility_type": "aerial",
         "environmental_resistance": ["dustproof", "heat-resistant", "shock-resistant"],
         "sensors": ["camera", "proximity sensor", "infrared"],
         "manipulators": ["gripper", "drill", "dispenser", "welding tool"],
@@ -106,7 +107,7 @@ STRICT_ROBOT_PROFILES = [
     },
     {
         "name": "scaffolding",
-        "mobility_type": "climbing",
+        "mobility_type": "legged",
         "environmental_resistance": ["dustproof", "shock-resistant", "wind-resistant"],
         "sensors": ["LiDAR", "camera", "ultrasonic", "proximity sensor"],
         "manipulators": ["gripper", "drill", "welding tool", "cable hoist"],
@@ -125,155 +126,233 @@ STRICT_ROBOT_PROFILES = [
 ]
 
 # STRICT TASK PROFILES FOR TASK GENERATION
+# 15 items per profile counting payload and reach instead of required_capabilities dict
+"""
+robot                       -> task
+name                        -> task_type
+mobility_type               -> navigation_constraints (specifically the agents that can make it up stairs, navigate slippery, loose debris, no fly zone, windy, dense obstructions, smooth surfaces, TOO MUCH)
+environmental_resistances   -> environmental_conditions
+sensors                     -> sensors_needed
+manipulators                -> manipulators_needed
+communication_protocols     -> communication_requirements
+special_functions           -> mapped to task_type hard coded, potential remove
+saftey_features             -> safety_protocols
+sensor_range                -> check suitability function (path length?)
+processing_power            -> difficulty
+autonomy_level              -> priority level. check suitability function
+payload_capacity            -> payload
+reach                       -> reach
+battery_life                -> duration and path length (maybe others?)
+size                        -> navigation_constraints (width -> narrow spaces, height -> low ceilings)
+adaptability                -> flat boost to score, useless, get rid
+"""
 STRICT_TASK_PROFILES = [
     {
         "task_type": "utilities", #gripper
-        "priority_level": random.choice(["medium", "high"]),
-        "reward": random.randint(5, 8),
-        "difficulty": random.randint(5, 8),
-        "navigation_constraints": _sample(["uneven floors", "loose debris", "slippery"], 0, 3),
-        "required_capabilities": _sample(["payload >= 10", "reach >= 3"], 0, 2),
-        "environmental_conditions": _sample(["weatherproof", "dustproof", "shock-resistance"], 0, 3),
-        "tools_needed": [["LiDAR", "camera", "proximity sensor"], ["gripper"]],
+        "priority_level": "medium",
+        "reward": 6.0,
+        "difficulty": 6.0,
+        "navigation_constraints": ["uneven floors", "loose debris"],
+        "required_capabilities": {
+            "payload": 0.0,
+            "reach": 3.0,
+        },
+        "environmental_conditions": ["shock-resistance"],
+        "sensors_needed": ["LiDAR", "camera", "proximity sensor"],
+        "manipulators_needed": ["gripper"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "balance control", "emergency stop"],
-        "duration": random.randint(3, 6),
+        "duration": 3.0,
         "performance_metric": "safety compliance",
         "nl_description": "Operate valves, switches, and panels; carry small parts; precise manipulation in plant rooms."
     },
+
+
     {
         "task_type": "utilities", #bucket
-        "priority_level": random.choice(["medium", "high"]),
-        "reward": random.randint(5, 8),
-        "difficulty": random.randint(5, 8),
-        "navigation_constraints": _sample(["uneven floors", "loose debris", "slippery"], 0, 3),
-        "required_capabilities": _sample(["payload >= 10", "reach >= 3"], 0, 2),
-        "environmental_conditions": _sample(["weatherproof", "dustproof", "shock-resistance"], 0, 3),
-        "tools_needed": [["LiDAR", "camera", "proximity sensor"], ["hydraulic bucket"]],
+        "priority_level": "medium",
+        "reward": 7.0,
+        "difficulty": 6.0,
+        "navigation_constraints": ["uneven floors", "loose debris"],
+        "required_capabilities": {
+            "payload": 10.0,
+            "reach": 0.0,
+        },
+        "environmental_conditions": ["dustproof"],
+        "sensors_needed": ["LiDAR", "camera", "proximity sensor"],
+        "manipulators_needed": ["hydraulic bucket"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "balance control", "emergency stop"],
-        "duration": random.randint(3, 6),
+        "duration": 3.0,
         "performance_metric": "safety compliance",
         "nl_description": "Transport construction materials, clear or move small bulk materials near utility corridors; load/unload with a bucket."
     },
+
+
     {
         "task_type": "debris", #gripper
-        "priority_level": random.choice(["medium", "high"]),
-        "reward": random.randint(4, 7),
-        "difficulty": random.randint(4, 7),
-        "navigation_constraints": _sample(["loose debris", "uneven floors", "crowded"], 0, 2),
-        "required_capabilities": [f"payload >= {random.randint(10,15)}", f"reach >= {random.randint(0,3)}"],
-        "environmental_conditions": _sample(["weatherproof", "wind-resistant"], 0, 2),
-        "tools_needed": [["LiDAR", "camera", "ultrasonic", "proximity sensor"], _sample(["gripper"], 1, 1)],
+        "priority_level": "medium",
+        "reward": 5.0,
+        "difficulty": 4.0,
+        "navigation_constraints": ["loose debris", "crowded"],
+        "required_capabilities": {
+            "payload": 10.0,
+            "reach": 2.0,
+        },
+        "environmental_conditions": ["weatherproof"],
+        "sensors_needed": ["LiDAR", "camera", "ultrasonic", "proximity sensor"],
+        "manipulators_needed": ["gripper"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "balance control", "emergency stop"],
-        "duration": random.randint(3, 6),
+        "duration": 2.0,
         "performance_metric": "safety compliance",
         "nl_description": "Pick and remove scattered debris in cluttered passages; careful grasping and placement."
     },
+
+
     {
         "task_type": "debris", #bucket
-        "priority_level": random.choice(["medium", "high"]),
-        "reward": random.randint(4, 7),
-        "difficulty": random.randint(4, 7),
-        "navigation_constraints": _sample(["loose debris", "uneven floors", "crowded"], 0, 2),
-        "required_capabilities": [f"payload >= {random.randint(10,15)}", f"reach >= {random.randint(0,3)}"],
-        "environmental_conditions": _sample(["weatherproof", "wind-resistant"], 0, 2),
-        "tools_needed": [["LiDAR", "camera", "ultrasonic", "proximity sensor"], ["hydraulic bucket"]],
+        "priority_level": "medium",
+        "reward": 6.0,
+        "difficulty": 4.0,
+        "navigation_constraints": ["loose debris", "uneven floors"],
+        "required_capabilities": {
+            "payload": 10.0,
+            "reach": 2.0,
+        },
+        "environmental_conditions": ["weatherproof"],
+        "sensors_needed": ["LiDAR", "camera", "ultrasonic", "proximity sensor"],
+        "manipulators_needed": ["hydraulic bucket"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "balance control", "emergency stop"],
-        "duration": random.randint(3, 6),
+        "duration": 2.0,
         "performance_metric": "safety compliance",
         "nl_description": "Scoop and relocate piles of loose debris; continuous removal in uneven terrain.",
         
     },
+
+
     {
         "task_type": "delivery",
-        "priority_level": random.choice(["low", "medium"]),
-        "reward": random.randint(2, 5),
-        "difficulty": random.randint(2, 5),
-        "navigation_constraints": _sample(["uneven floors", "crowded", "slippery", "elevator", "stairs"], 0),
-        "required_capabilities": _sample(["payload >= 1.0", "payload >= 5.0", "payload >= 10.0"], 1, 1),
-        "environmental_conditions": _sample(["weatherproof", "dustproof"], 1, 1),
-        "tools_needed": [["camera", "proximity sensor", "GPS"], ["gripper"]],
+        "priority_level": "low",
+        "reward": 3.0,
+        "difficulty": 2.0,
+        "navigation_constraints": ["crowded", "elevator"],
+        "required_capabilities": {
+            "payload": 1.0,
+            "reach": 0.0,
+        },
+        "environmental_conditions": ["weatherproof", "dustproof"],
+        "sensors_needed": ["camera", "proximity sensor", "GPS"],
+        "manipulators_needed": ["gripper"],
         "communication_requirements": ["Wi-Fi", "4G"],
         "safety_protocols": ["obstacle detection", "emergency stop"],
-        "duration": random.randint(2, 5),
+        "duration": 1.0,
         "performance_metric": "time taken",
         "nl_description": "Fetch-and-carry small payloads point-to-point through indoor/outdoor corridors.",
     },
+
+
     {
         "task_type": "assembly",
-        "priority_level": random.choice(["medium", "high"]),
-        "reward": random.randint(5, 7),
-        "difficulty": random.randint(5, 7),
-        "navigation_constraints": _sample(["crowded", "loose debris", "slippery", "low ceilings"], 0, 2),
-        "required_capabilities": _sample(["reach >= 1.5", "reach >= 3.0", "reach >= 5.0", "payload >= 10.0"], 1, 1),
-        "environmental_conditions": _sample(["dustproof", "shock-resistant", "heat-resistant"], 0, 3),
-        "tools_needed": [["camera", "infrared", "dispenser"], ["gripper", "drill", "welding tool"]],
+        "priority_level": "high",
+        "reward": 10.0,
+        "difficulty": 8.0,
+        "navigation_constraints": ["crowded"],
+        "required_capabilities": {
+            "payload": 5.0,
+            "reach": 0.0,
+        },
+        "environmental_conditions": ["heat-resistant"],
+        "sensors_needed": ["camera", "infrared", "dispenser"],
+        "manipulators_needed": ["gripper", "drill", "welding tool"],
         "communication_requirements": ["Wi-Fi", "Radio"],
         "safety_protocols": ["collision avoidance", "emergency stop"],
-        "duration": random.randint(4, 7),
+        "duration": 4.0,
         "performance_metric": "accuracy",
         "nl_description": "Fixture placement, fastening, dispensing, or welding with moderate precision in crowded areas.",
     },
+
+
     {
         "task_type": "excavate",
-        "priority_level": random.choice(["high", "urgent"]),
-        "reward": random.randint(6, 9),
-        "difficulty": random.randint(6, 8),
-        "navigation_constraints": _sample(["uneven floors", "loose debris", "low visibility"], 0, 3),
-        "required_capabilities": [f"payload >= {random.randint(15, 20)}", f"reach >= {random.randint(2,7)}"],
-        "environmental_conditions": _sample(["dustproof", "shock-resistant", "weatherproof"], 0, 3),
-        "tools_needed": [["LiDAR", "camera", "proximity sensor"], ["hydraulic bucket"]],
+        "priority_level": "high",
+        "reward": 11.0,
+        "difficulty": 8.0,
+        "navigation_constraints": ["loose debris", "low visibility"],
+        "required_capabilities": {
+            "payload": 15.0,
+            "reach": 2.0,
+        },
+        "environmental_conditions": ["dustproof", "shock-resistant"],
+        "sensors_needed": ["LiDAR", "camera", "proximity sensor"],
+        "manipulators_needed": ["hydraulic bucket"],
         "communication_requirements": ["Radio"],
         "safety_protocols": ["overload protection", "obstacle detection"],
-        "duration": random.randint(5, 7),
+        "duration": 4.0,
         "performance_metric": "safety compliance",
         "nl_description": "Dig, trench, or remove soil/rubble; sustained scooping with high payload demands.",
     },
+
+
     {
         "task_type": "item elevation",
-        "priority_level": random.choice(["low", "medium"]),
-        "reward": random.randint(4, 8),
-        "difficulty": random.randint(4, 8),
-        "navigation_constraints": _sample(["low visibility", "crowded", "uneven floors"], 0, 3),
-        "required_capabilities": [f"reach >= {random.randint(15, 25)}", "payload >= 15"],
-        "environmental_conditions": _sample(["weatherproof", "wind-resistant"], 0, 2),
-        "tools_needed": [["camera", "GPS", "proximity sensor", "ultrasonic"], ["cable hoist", "gripper"]],
+        "priority_level": "medium",
+        "reward": 7.0,
+        "difficulty": 5.0,
+        "navigation_constraints": ["low visibility", "crowded"],
+        "required_capabilities": {
+            "payload": 2.0,
+            "reach": 10.0,
+        },
+        "environmental_conditions": ["wind-resistant"],
+        "sensors_needed": ["camera", "GPS", "proximity sensor", "ultrasonic"],
+        "manipulators_needed": ["cable hoist", "gripper"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "emergency stop"],
-        "duration": random.randint(3, 5),
+        "duration": 3.0,
         "performance_metric": "safety compliance",
         "nl_description": "Lift and hold items at height; stable hoisting and precise placement are important.",
     },
+
+
     {
         "task_type": "lay bricks",
-        "priority_level": "medium",
-        "reward": random.randint(6, 12),
-        "difficulty": random.randint(6, 12),
-        "navigation_constraints": _sample(["crowded", "low visibility", "windy"], 0, 3),
-        "required_capabilities": [f"reach >= {random.randint(2,4)}", f"payload >= {random.randint(8,10)}"],
-        "environmental_conditions": _sample(["dustproof", "weatherproof"], 0, 2),
-        "tools_needed": [["LiDAR", "camera", "proximity sensor"], ["gripper", "dispenser"]],
+        "priority_level": "low",
+        "reward": 8.0,
+        "difficulty": 6.0,
+        "navigation_constraints": ["crowded", "windy"],
+        "required_capabilities": {
+            "payload": 4.0,
+            "reach": 4.0,
+        },
+        "environmental_conditions": ["dustproof", "weatherproof"],
+        "sensors_needed": ["LiDAR", "camera", "proximity sensor"],
+        "manipulators_needed": ["gripper", "dispenser"],
         "communication_requirements": ["Wi-Fi"],
         "safety_protocols": ["collision avoidance", "overheat protection"],
-        "duration": random.randint(6, 10),
+        "duration": 3.0,
         "performance_metric": "accuracy",
         "nl_description": "Pick, mortar/dispense, and place bricks with consistent accuracy and alignment.",
     },
+
+
     {
         "task_type": "scaffold",
         "priority_level": "medium",
-        "reward": random.randint(5, 8),
-        "difficulty": random.randint(5, 8),
-        "navigation_constraints": _sample(["narrow spaces", "low ceilings", "windy"], 0, 3),
-        "required_capabilities": [f"payload >= {random.randint(8, 10)}", f"reach >= {random.randint(2, 3)}"],
-        "environmental_conditions": _sample(["weatherproof", "wind-resistant"], 0, 2),
-        "tools_needed": [["LiDAR", "camera", "ultrasonic", "proximity sensor"], ["gripper", "drill"]],
+        "reward": 7.0,
+        "difficulty": 7.0,
+        "navigation_constraints": ["narrow spaces", "low ceilings"],
+        "required_capabilities": {
+            "payload": 4.0,
+            "reach": 6.0,
+        },
+        "environmental_conditions": ["weatherproof"],
+        "sensors_needed": ["LiDAR", "camera", "ultrasonic", "proximity sensor"],
+        "manipulators_needed": ["gripper", "drill"],
         "communication_requirements": ["Radio", "Wi-Fi"],
         "safety_protocols": ["overload protection", "balance control", "emergency stop"],
-        "duration": random.randint(3, 6),
+        "duration": 3.0,
         "performance_metric": "safety compliance",
         "nl_description": "Work at elevation around narrow or vertical structures; drilling and placement on frames.",
     }
