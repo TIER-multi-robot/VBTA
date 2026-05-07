@@ -1,22 +1,23 @@
-import json, re, ast
-from pathlib import Path
-from dotenv import load_dotenv
+import os
+import logging
+import datetime
 import numpy as np
-from numpy.typing import NDArray
-from typing import List, Tuple, Callable, Union
-from transformers import pipeline
-from llama_cpp import Llama
-# from prompt_toolkit import prompt
-from .models import CapabilityProfile, TaskDescription
-# from inspect import signature, Parameter
+import json, re, ast
 from enum import Enum
+from pathlib import Path
+from llama_cpp import Llama
+from dotenv import load_dotenv
+from numpy.typing import NDArray
+from transformers import pipeline
 from dataclasses import is_dataclass, asdict
+from typing import List, Tuple, Callable, Union
+from .models import CapabilityProfile, TaskDescription
+# from prompt_toolkit import prompt
+# # from inspect import signature, Parameter
 
 _LLAMA_MODEL = None
 _LLAMA_REPO_ID = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
 _LLAMA_FILENAME = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-
-MAP_SCALE = 1.0
 
 def _get_llama():
     """
@@ -149,7 +150,20 @@ def navigation_suitability(
     # Final suitability score between [0, 1] (0 if any constraint returns 0)
     return max(0.0, score / max(len(task_constraints), 1.0))
 
-def evaluate_suitability_new(robot: CapabilityProfile, task: TaskDescription) -> float:
+def evaluate_suitability_balanced(
+        robots: list[CapabilityProfile], 
+        tasks: list[TaskDescription], 
+        *, map_size: int) -> np.ndarray:
+    """
+    Batch suitability score helper
+    """
+    M = np.zeros((len(robots), len(tasks)))
+    for i, r in enumerate(robots):
+        for j, t in enumerate(tasks):
+            M[i, j] = _balanced_pair(r, t, map_size=map_size)
+    return M
+
+def _balanced_pair(robot: CapabilityProfile, task: TaskDescription, map_size: int) -> float:
     """
     Evaluates the suitability of a robot for a given task.
     A higher score indicates better suitability.
@@ -179,7 +193,6 @@ def evaluate_suitability_new(robot: CapabilityProfile, task: TaskDescription) ->
         "environmental": 1.0,
         "reach": 2.0,
         "sensor_range": 1.0,
-        "proximity": 1.0,
         "battery_duration": 2.0,
         "special_functions": 2.0,
         "processing_power": 1.0,
@@ -245,7 +258,11 @@ def evaluate_suitability_new(robot: CapabilityProfile, task: TaskDescription) ->
 
     # ---- Sensor range ---- #
     total_weight += weights["sensor_range"]
-    distance_to_task = len(robot.current_path) - 1
+    if robot.current_path and len(robot.current_path) > 0:
+        distance_to_task = len(robot.current_path) - 1
+    else:
+        # manhattan distance fallback if path does not exist yet
+        distance_to_task = (task.location[0] - robot.location[0]) + (task.location[1] - robot.location[1])
     if robot.sensor_range >= distance_to_task:
         sensor_range_score = 1.0
     elif robot.sensor_range >= distance_to_task / 2.0:
@@ -299,14 +316,27 @@ def evaluate_suitability_new(robot: CapabilityProfile, task: TaskDescription) ->
     if total_weight > 0:
         final_score = score / total_weight
         # ---- Proximity ---- #
-        proximity_factor = weights["proximity"] / (1E-5 + distance_to_task / MAP_SCALE)
-        final_score *= proximity_factor
+        if map_size and map_size > 0:
+            final_score *= 1.0 / (1.0 + distance_to_task / map_size)   # in (0, 1]
     else:
         final_score = 0.0
 
     return max(0.0, min(1.0, final_score))
 
-def evaluate_suitability_loose(robot: CapabilityProfile, task: TaskDescription) -> float:
+def evaluate_suitability_loose(
+        robots: list[CapabilityProfile],
+        tasks: list[TaskDescription],
+        *, map_size: int) -> np.ndarray:
+    """
+    Batch suitability score helper
+    """
+    M = np.zeros((len(robots), len(tasks)))
+    for i, r in enumerate(robots):
+        for j, t in enumerate(tasks):
+            M[i, j] = _loose_pair(r, t, map_size=map_size)
+    return M
+
+def _loose_pair(robot: CapabilityProfile, task: TaskDescription, map_size: int) -> float:
     """
     Evaluates the suitability of a robot for a given task.
     A higher score indicates better suitability.
@@ -330,7 +360,6 @@ def evaluate_suitability_loose(robot: CapabilityProfile, task: TaskDescription) 
         "environmental": 1.0,
         "reach": 2.0,
         "sensor_range": 1.0,
-        "proximity": 1.0,
         "battery_duration": 2.0,
         "special_functions": 2.0,
         "processing_power": 1.0,
@@ -446,14 +475,27 @@ def evaluate_suitability_loose(robot: CapabilityProfile, task: TaskDescription) 
     if total_weight > 0:
         final_score = score / total_weight
         # ---- Proximity ---- #
-        proximity_factor = weights["proximity"] / (1E-5 + distance_to_task / MAP_SCALE)
-        final_score *= proximity_factor
+        if map_size and map_size > 0:
+            final_score *= 1.0 / (1.0 + distance_to_task / map_size)   # in (0, 1]
     else:
         final_score = 0.0
 
     return max(0.0, min(1.0, final_score))
 
-def evaluate_suitability_strict(robot: CapabilityProfile, task: TaskDescription) -> float:
+def evaluate_suitability_strict(
+        robots: list[CapabilityProfile],
+        tasks: list[TaskDescription],
+        *, map_size: int) -> np.ndarray:
+    """
+    Batch suitability score helper
+    """
+    M = np.zeros((len(robots), len(tasks)))
+    for i, r in enumerate(robots):
+        for j, t in enumerate(tasks):
+            M[i, j] = _strict_pair(r, t, map_size=map_size)
+    return M
+
+def _strict_pair(robot: CapabilityProfile, task: TaskDescription, map_size: int) -> float:
     """
     Evaluates the suitability of a robot for a given task.
     A higher score indicates better suitability.
@@ -477,12 +519,9 @@ def evaluate_suitability_strict(robot: CapabilityProfile, task: TaskDescription)
         "environmental": 1.0,
         "reach": 2.0,
         "sensor_range": 1.0,
-        "proximity": 1.0,
-        # "autonomy_match": 0.5,
         "battery_duration": 2.0,
         "special_functions": 2.0,
         "processing_power": 1.0,
-        # "adaptability": 0.5,
         "navigation": 2.0,
     }
 
@@ -607,12 +646,62 @@ def evaluate_suitability_strict(robot: CapabilityProfile, task: TaskDescription)
     if total_weight > 0:
         final_score = score / total_weight
         # ---- Proximity ---- #
-        proximity_factor = weights["proximity"] / (1E-5 + distance_to_task / MAP_SCALE)
-        final_score *= proximity_factor
+        if map_size and map_size > 0:
+            final_score *= 1.0 / (1.0 + distance_to_task / map_size)   # in (0, 1]
     else:
         final_score = 0.0
 
     return max(0.0, min(1.0, final_score))
+
+def calculate_total_suitability(assignment: List[Tuple[int, int]], suitability_matrix: List[List[float]]) -> float:
+    """
+    Calculates the total suitability score for a given assignment. (lookup table)
+    
+    Parameters:
+        assignment: A list of (robot, task) pairs representing the assignment.
+        suitability_matrix: A 2D list where the element at [i][j] represents the suitability of robot i for task j.
+    
+    Returns:
+        total_suitability: The total suitability score for the assignment.
+    """
+    total_suitability = 0.0
+    
+    # Sum the suitability ratings for each robot-task pair in the assignment
+    for robot, task in assignment:
+        total_suitability += suitability_matrix[robot][task]
+    
+    return total_suitability
+
+def check_zero_suitability(assignment: List[Tuple[int, int]], suitability_matrix: List[List[float]]) -> bool:
+    """
+    Checks if any robot-task pair in the assignment has a suitability rating of 0.
+    
+    Parameters:
+        assignment: A list of (robot, task) pairs representing the assignment.
+        suitability_matrix: A 2D list where the element at [i][j] represents the suitability of robot i for task j.
+    
+    Returns:
+        Bool: True if any robot-task pair in the assignment has a suitability of 0, otherwise False.
+    """
+    for robot, task in assignment:
+        if suitability_matrix[robot][task] == 0:
+            return True  # Found a zero suitability rating
+    
+    return False  # No zero suitability ratings found
+
+def calculate_suitability_matrix(
+    robots: List, 
+    tasks: List, 
+    scorer: Callable[..., object],
+    map_size: int
+) -> NDArray[np.float64]:
+    """
+    Compute suitability matrix using either:
+      • a rules based scorer (Balanced, Loose, Strict)
+      • an LLM based scorer (Llama, Mixtral)
+    """
+    M = scorer(robots, tasks, map_size)
+    return np.clip(M, 0.0, 1.0)
 
 def _to_jsonable(x):
     """Recursively convert to JSON-safe Python objects."""
@@ -688,14 +777,21 @@ def _clean_for_json(s: str) -> str:
 
     return s
 
-def _parse_output_matrix(raw_text: str, nR: int, nT: int) -> np.ndarray | None:
+def _parse_output_matrix(raw_text: str, nR: int, nT: int) -> Tuple[np.ndarray | None, bool]:
     """
     Parse the OUTPUT matrix into an (nR, nT) float array.
     Returns None if impossible to parse.
     """
+    dir_path = os.path.join('hvbta', 'io', 'logging')
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(filename=os.path.join(dir_path, "logging_", datetime.datetime.now().strftime("%Y%m%d-%H%M%S")), encoding='utf-8', level=logging.DEBUG)
+
+    parse_failed = True
     block = _extract_output_matrix_text(raw_text)
     if not block:
-        return None
+        logger.debug("RAW TEXT NOT EXTRACTED TO MATRIX \n\n\n")
+        logger.debug(raw_text)
+        return None, parse_failed
 
     cleaned = _clean_for_json(block)
 
@@ -708,12 +804,16 @@ def _parse_output_matrix(raw_text: str, nR: int, nT: int) -> np.ndarray | None:
         try:
             data = ast.literal_eval(cleaned)
         except Exception:
-            return None
+            logger.debug("JSON AND AST EVAL BOTH FAILED \n\n\n")
+            logger.debug(cleaned)
+            return None, parse_failed
 
     try:
         arr = np.array(data, dtype=float)
     except Exception:
-        return None
+        logger.debug("NP ARRAY FAILED, DATA MAY CONTAIN NON NUMERIC VALUES \n\n\n")
+        logger.debug(data)
+        return None, parse_failed
 
     # Fix common shape slips
     if arr.ndim == 1:
@@ -724,7 +824,7 @@ def _parse_output_matrix(raw_text: str, nR: int, nT: int) -> np.ndarray | None:
         elif nT == 1 and arr.size == nR:
             arr = arr.reshape(nR, 1)
 
-    # If shape is close, pad/truncate (optional; or you can reject)
+    # If shape is close, pad/truncate (optional; or reject)
     if arr.ndim == 2:
         r, c = arr.shape
         # pad rows
@@ -740,13 +840,21 @@ def _parse_output_matrix(raw_text: str, nR: int, nT: int) -> np.ndarray | None:
         # finally enforce exact size
         arr = arr[:nR, :nT]
     else:
-        return None
+        logger.debug("NP ARRAY INCORRECT DIMENSIONS OR UNEXPECTED SIZE\n")
+        logger.debug(f"EXPECTED SHAPE: {nR} by {nT}\n")
+        logger.debug(f"ACTUAL SHAPE: {arr.shape}\n")
+        
+        return None, parse_failed
 
     # clip to [0,1]
     arr = np.clip(arr, 0.0, 1.0)
     if arr.shape != (nR, nT):
-        return None
-    return arr
+        logger.debug("NP ARRAY INCORRECT DIMENSIONS OR UNEXPECTED SIZE\n")
+        logger.debug(f"EXPECTED SHAPE: {nR} by {nT}\n")
+        logger.debug(f"ACTUAL SHAPE: {arr.shape}\n")
+        return None, parse_failed
+    parse_failed = False
+    return arr, parse_failed
 
 def _parse_output_matrix_bypass(raw_text: str) -> np.ndarray | None:
     """Parse LLM output to get tuple of 3 lists to represent assignments
@@ -862,7 +970,7 @@ def evaluate_suitability_from_names_with_llm(robots: List[CapabilityProfile], ta
     )
     content = resp["choices"][0]["message"]["content"]
 
-    M = _parse_output_matrix(content, nR=len(robots), nT=len(tasks))
+    M, M.parse_failed = _parse_output_matrix(content, nR=len(robots), nT=len(tasks))
     if M is None:
         M = np.full((len(robots), len(tasks)), 0.0, dtype=float)
     return M
@@ -913,149 +1021,10 @@ def bypass_suitability_from_names_with_llm(robots, tasks, model=_LLAMA_FILENAME)
     )
     content = resp["choices"][0]["message"]["content"]
 
-    M = _parse_output_matrix(content, nR=len(robots), nT=len(tasks))
+    M, M.parse_failed = _parse_output_matrix(content, nR=len(robots), nT=len(tasks))
     if M is None:
         M = np.full((len(robots), len(tasks)), 0.0, dtype=float)
     return M
-
-
-    # # Parse the OUTPUT matrix
-    # m = re.search(r"OUTPUT\s*\[\s*(.*)\s*\]\s*$", content, re.S)
-    # if not m:
-    #     raise ValueError("LLM did not return a valid OUTPUT matrix.")
-    # body = "[" + m.group(1).strip() + "]"
-    # M = np.array(json.loads(body), dtype=float)
-
-    # # Safety shape check
-    # if M.shape != (len(R), len(T)):
-    #     raise ValueError(f"Matrix shape {M.shape} does not match robots={len(R)} tasks={len(T)}.")
-
-    # return M
-
-
-def make_pairwise_from_batch(batch_fn, robots_all, tasks_all):
-    """
-    Wrap a batch scorer f(robots, tasks)->matrix into a pairwise scorer g(robot, task)->float.
-    Caches the matrix so we only call the LLM once per run.
-    Pre-computes the matrix immediately to avoid repeated checks.
-    """
-    # Pre-compute the matrix immediately instead of lazy evaluation
-    M = batch_fn(robots_all, tasks_all)
-    if not isinstance(M, np.ndarray):
-        M = np.array(M, dtype=float)
-    else:
-        M = M.astype(float)
-    
-    # Pre-build index dictionaries
-    r_index = {r.robot_id: i for i, r in enumerate(robots_all)}
-    t_index = {t.task_id: j for j, t in enumerate(tasks_all)}
-
-    def g(robot, task):
-        return M[r_index[robot.robot_id], t_index[task.task_id]]
-    
-    # Attach the matrix for direct access if needed
-    g._matrix = M
-    g._r_index = r_index
-    g._t_index = t_index
-    
-    return g
-
-
-def calculate_total_suitability(assignment: List[Tuple[int, int]], suitability_matrix: List[List[float]]) -> float:
-    """
-    Calculates the total suitability score for a given assignment.
-    
-    Parameters:
-        assignment: A list of (robot, task) pairs representing the assignment.
-        suitability_matrix: A 2D list where the element at [i][j] represents the suitability of robot i for task j.
-    
-    Returns:
-        total_suitability: The total suitability score for the assignment.
-    """
-    total_suitability = 0.0
-    
-    # Sum the suitability ratings for each robot-task pair in the assignment
-    for robot, task in assignment:
-        total_suitability += suitability_matrix[robot][task]
-    
-    return total_suitability
-
-def check_zero_suitability(assignment: List[Tuple[int, int]], suitability_matrix: List[List[float]]) -> bool:
-    """
-    Checks if any robot-task pair in the assignment has a suitability rating of 0.
-    
-    Parameters:
-        assignment: A list of (robot, task) pairs representing the assignment.
-        suitability_matrix: A 2D list where the element at [i][j] represents the suitability of robot i for task j.
-    
-    Returns:
-        Bool: True if any robot-task pair in the assignment has a suitability of 0, otherwise False.
-    """
-    for robot, task in assignment:
-        if suitability_matrix[robot][task] == 0:
-            return True  # Found a zero suitability rating
-    
-    return False  # No zero suitability ratings found
-
-# def calculate_suitability_matrix(robots: List[CapabilityProfile], tasks: List[TaskDescription], scorer: ScoreFn) -> np.ndarray:
-#     """
-#     Calculates the suitability matrix for the given robots and tasks.
-    
-#     Parameters:
-#         robots: List of robot profiles.
-#         tasks: List of task descriptions.
-#         suitability_method: The name of the suitability evaluation function.
-    
-#     Returns:
-#         suitability_matrix: A 2D numpy array representing the suitability scores of each robot-task pair.
-#     """
-#     suitability_matrix = np.zeros((len(robots), len(tasks)), dtype=float)
-
-#     # Evaluate suitability of each robot for each task
-#     for i, robot in enumerate(robots):
-#         for j, task in enumerate(tasks):
-#             # suitability_score = globals()[suitability_method](robot, task)
-#             # suitability_matrix[i][j] = suitability_score
-#             suitability_matrix[i, j] = scorer(robot, task)
-            
-#     return suitability_matrix
-
-def calculate_suitability_matrix(
-    robots: List, 
-    tasks: List, 
-    scorer: Callable[..., object]
-) -> NDArray[np.float64]:
-    """
-    Compute suitability matrix using either:
-      • a batch scorer: scorer(robots, tasks) -> ndarray[float] (R x T)
-      • a pairwise scorer: scorer(robot, task) -> float
-
-    The function auto-detects which kind you passed by first attempting a batch call.
-    If that fails or doesn't return the right shape, it falls back to pairwise.
-    """
-    R, T = len(robots), len(tasks)
-    expected_shape = (R, T)
-
-    # --- Try batch mode first (this is ideal for LLM-based scoring) ---
-    try:
-        maybe_matrix = scorer(robots, tasks)  # if scorer is batch, this should work
-        if isinstance(maybe_matrix, np.ndarray) and maybe_matrix.shape == expected_shape:
-            M = maybe_matrix.astype(float, copy=False)
-            return np.clip(M, 0.0, 1.0)
-    except Exception:
-        # Not a batch scorer (or it failed) → fall back to pairwise
-        pass
-
-    # --- Pairwise fallback ---
-    M = np.zeros(expected_shape, dtype=float)
-    for i, r in enumerate(robots):
-        for j, t in enumerate(tasks):
-            try:
-                M[i, j] = float(scorer(r, t))
-            except Exception:
-                M[i, j] = 0.0
-    return np.clip(M, 0.0, 1.0)
-
 
 def calculate_jains_index(scores: List[float]) -> float:
     """

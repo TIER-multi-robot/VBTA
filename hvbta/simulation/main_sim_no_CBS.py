@@ -571,7 +571,7 @@ if __name__ == "__main__":
         allocation_names = [func_name(f) for f in allocation_methods]
         all_methods = voting_methods + allocation_methods
         suitability_methods = [
-            S.evaluate_suitability_new, 
+            S.evaluate_suitability_balanced, 
             S.evaluate_suitability_loose, 
             S.evaluate_suitability_strict,
             # S.evaluate_suitability_from_names_with_llm
