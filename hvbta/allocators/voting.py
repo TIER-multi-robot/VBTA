@@ -3,7 +3,7 @@ from typing import List, Tuple, Callable
 from .assignments import generate_random_assignments
 from hvbta.models import CapabilityProfile, TaskDescription
 from hvbta.suitability import calculate_total_suitability, check_zero_suitability, calculate_suitability_matrix
-from .misc_assignment import build_submatrix_from_scorer, extract_submatrix
+from .misc_assignment import extract_submatrix
 
 def suitability_all_zero(suitability_matrix):
     return all(value == 0 for row in suitability_matrix for value in row)
@@ -432,6 +432,7 @@ def reassign_robots_to_tasks(
         unassigned_tasks: List[str], 
         start_positions: dict, 
         goal_positions: dict,
+        map_size: int,
         inertia_threshold: float = 0.1):
     """
     Reassigns unassigned robots to unassigned tasks using a voting method.
@@ -470,7 +471,8 @@ def reassign_robots_to_tasks(
         use_matrix_lookup = True
     else:
         # Callable scorer path (for non-LLM methods)
-        suitability_matrix = build_submatrix_from_scorer(urobots, utasks, suitability_source)
+        suitability_matrix = suitability_source(urobots, utasks, map_size=map_size)
+        suitability_matrix = np.clip(suitability_matrix, 0.0, 1.0)
         use_matrix_lookup = False
 
     if suitability_all_zero(suitability_matrix):
@@ -516,7 +518,7 @@ def reassign_robots_to_tasks(
             if use_matrix_lookup:
                 current_suitability = full_matrix[robot_id_to_idx[current.robot_id], task_id_to_idx[task.task_id]]
             else:
-                current_suitability = suitability_source(current, task)
+                current_suitability = float(suitability_source([current], [task], map_size=map_size)[0, 0])
             # print(f"Better suitability in reassigning: {current_suitability}")
             # find the best free robot for this task
             best, best_suit = None, current_suitability
@@ -524,7 +526,7 @@ def reassign_robots_to_tasks(
                 if use_matrix_lookup:
                     s = full_matrix[robot_id_to_idx[r.robot_id], task_id_to_idx[task.task_id]]
                 else:
-                    s = suitability_source(r, task)
+                    s = float(suitability_source([r], [task], map_size=map_size)[0, 0])
                 if s > best_suit:
                     # print(f"Better suitability in reassigning: {s}")
                     best, best_suit = r, s
