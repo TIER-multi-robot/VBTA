@@ -4,13 +4,6 @@ from hvbta.models import CapabilityProfile, TaskDescription
 import hvbta.generation as G
 import numpy as np
 
-def build_submatrix_from_scorer(robots, tasks, scorer):
-    M = np.zeros((len(robots), len(tasks)), dtype=float)
-    for i, r in enumerate(robots):
-        for j, t in enumerate(tasks):
-            M[i, j] = scorer(r, t)
-    return M
-
 def extract_submatrix(full_matrix, robots_subset, tasks_subset, robot_id_to_idx, task_id_to_idx):
     """
     Extract a submatrix from the full suitability matrix for given robot/task subsets.

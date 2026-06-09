@@ -13,7 +13,7 @@ from hvbta.pathfinding.Final_CBS import CBS, Environment
 from hvbta.simulation.timestep_no_CBS import simulate_time_step
 import hvbta.allocators.voting as V
 import hvbta.suitability as S
-from hvbta.suitability import (
+from hvbta.metrics import (
     calculate_jains_index,
     calculate_threshold_metrics,
     calculate_inequality_metrics,
@@ -256,7 +256,9 @@ def main_simulation(
     agents = build_cbs_agents(robots, start_positions, goal_positions)
 
     # Build obstacle set and dims
-    dims = map_dict['dimension']
+    # dims = map_dict['dimension']
+    HYPOTENUSE = (len(grid)**2 + len(grid[0])**2) ** 0.5
+    # dims = (len(grid), len(grid[0])) # dimensions of the map grid
     obstacle_array = np.array(grid, dtype=np.bool_)
 
     # Compute A* path for each assigned agent independently (parallelized)
@@ -424,7 +426,7 @@ def main_simulation(
                 total_reassignments += 1
                 _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = V.reassign_robots_to_tasks(
                     robots, tasks, num_candidates, voting_method, suitability_source,
-                    unassigned_robots, unassigned_tasks, start_positions, goal_positions
+                    unassigned_robots, unassigned_tasks, start_positions, goal_positions, HYPOTENUSE
                 )
                 # Track all fairness metrics for this reassignment
                 if reassign_per_agent_scores:
@@ -435,7 +437,7 @@ def main_simulation(
                 total_reassignments += 1
                 _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = O.reassign_robots_to_tasks_with_method(
                     robots, tasks, num_candidates, voting_method, suitability_source,
-                    unassigned_robots, unassigned_tasks, voting_method, start_positions, goal_positions
+                    unassigned_robots, unassigned_tasks, voting_method, start_positions, goal_positions, HYPOTENUSE
                 )
                 # Track all fairness metrics for this reassignment
                 if reassign_per_agent_scores:
@@ -762,7 +764,7 @@ if __name__ == "__main__":
                                         pairwise_scorer = S.make_pairwise_from_batch(lambda *_: suitability_matrix, robots, tasks)
                                     else:
                                         pairwise_scorer = sm
-                                        suitability_matrix = S.calculate_suitability_matrix(robots, tasks, pairwise_scorer)
+                                        suitability_matrix = S.calculate_suitability_matrix(robots, tasks, pairwise_scorer, HYPOTENUSE)
 
                                     # if both generations are strict we log them to be able to compare later, if one is not theres no point
                                     if robot_generation_strict and task_generation_strict:

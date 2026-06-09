@@ -700,7 +700,7 @@ def calculate_suitability_matrix(
       • a rules based scorer (Balanced, Loose, Strict)
       • an LLM based scorer (Llama, Mixtral)
     """
-    M = scorer(robots, tasks, map_size)
+    M = scorer(robots, tasks, map_size=map_size)
     return np.clip(M, 0.0, 1.0)
 
 def _to_jsonable(x):
