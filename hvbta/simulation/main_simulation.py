@@ -255,8 +255,11 @@ def main_simulation(
         if remove_robots and time_step + 1 <= 4 and random.random() < 0.5: # remove robots only in the first 4 time steps, and randomly
             if len(assigned_robots) > 1: # Otherwise will break CBS, we need at least one agent for things to run smoothly
                 print(f"REMOVING RANDOM ROBOTS AT TIME STEP {time_step + 1}")
-                remove_random_robots(robots, tasks, unassigned_robots, unassigned_tasks, random.randint(0, robots_to_remove), occupied_positions, start_positions, goal_positions)
-
+                # Keeps track of which robots were removed so their idle state can be cleaned up
+                removed_robots = remove_random_robots(robots, tasks, unassigned_robots, unassigned_tasks, random.randint(0, robots_to_remove), occupied_positions, start_positions, goal_positions)
+                # Remove stale idle_steps entries for robots that are no longer in the simulation
+                for removed_robot in removed_robots: 
+                    idle_steps.pop(removed_robot.robot_id, None) 
         # print(f"DEBUG STATEMENT 11")
 
         for r in robots:

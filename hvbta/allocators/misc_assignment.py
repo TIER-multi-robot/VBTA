@@ -237,9 +237,11 @@ def remove_random_robots(robots: List[CapabilityProfile], tasks: List[TaskDescri
         goal_positions: A dictionary mapping robot IDs to their goal positions.
         
     Returns:
-        None
+        List of robots that were removed.
     """    
     robots_to_remove = random.sample(robots, min(count, len(robots) - 1))  # Make sure theres always at least one robot so CBS doesnt break
+    removed_robots = [] #stores and keeps track of every robot that gets removed during the function
+
 
     for robot_to_remove in robots_to_remove:
         occupied_locations.discard(robot_to_remove.location)
@@ -265,3 +267,5 @@ def remove_random_robots(robots: List[CapabilityProfile], tasks: List[TaskDescri
                 unassigned_robots.remove(robot_to_remove.robot_id)
         robots.remove(robot_to_remove)
 #         print(f"Robot {robot_to_remove.robot_id} left the system. It attempted {robot_to_remove.tasks_attempted} tasks and successfully completed {robot_to_remove.tasks_successful} of them.")
+        removed_robots.append(robot_to_remove)  #Track removed robot so caller can clean up idle_steps
+    return removed_robots #Return removed robots so callers can clean up related state
