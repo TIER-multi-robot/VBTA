@@ -285,7 +285,8 @@ def main_simulation(
 
         # decide to reassign and replan
         should_replan = False
-        if unassigned_robots and unassigned_tasks:
+        # Allow replanning when either side changes, including dynamic task or robot arrivals
+        if unassigned_robots or unassigned_tasks or events["new_tasks"] or events["new_robots"]:
             if events["new_tasks"] or events["new_robots"] or events["completed_tasks"]:
                 should_replan = True
             elif (current_active != previous_active) or (current_goals != previous_goals):
