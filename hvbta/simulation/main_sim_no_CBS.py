@@ -350,7 +350,7 @@ def main_simulation(
 
         # Periodically remove robots
         if remove_robots and time_step + 1 <= 4 and random.random() < 0.5: # remove robots only in the first 4 time steps, and randomly
-            if len(assigned_robots) > 1: # Otherwise will break CBS, we need at least one agent for things to run smoothly
+            if len(robots) > 1: # Ensure at least one robot remains in the simulation
                 print(f"REMOVING RANDOM ROBOTS AT TIME STEP {time_step + 1}")
                 # Keeps track of which robots were removed so their idle state can be cleaned up
                 removed_robots = remove_random_robots(robots, tasks, unassigned_robots, unassigned_tasks, random.randint(0, robots_to_remove), occupied_positions, start_positions, goal_positions) # Keep track of which robots were removed so their idle state can be cleaned up
