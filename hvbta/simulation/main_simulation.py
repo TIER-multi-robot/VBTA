@@ -374,6 +374,7 @@ def main_simulation(
                     # could possibly fall back on the simple method here if we get a lot of issues
                     # but for now, we will just skip CBS and continue with the simulation
                     print("Skipping CBS...")
+                    events = {k: 0 for k in events}  # reset counters even when CBS fails
                     time_steps_unchanged += 1
                     # print(f"DEBUG STATEMENT 17 - TIME STEPS UNCHANGED {time_steps_unchanged}")
                     if time_steps_unchanged >= 3:
