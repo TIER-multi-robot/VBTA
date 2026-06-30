@@ -1140,6 +1140,8 @@ def bypass_suitability_from_names_with_llm(robots, tasks, map_size=None, model=N
     content = resp["choices"][0]["message"]["content"]
 
     assigned_pairs, unassigned_robots, unassigned_tasks, parse_failed = _parse_output_matrix_bypass(content, robots, tasks)
+    print(f"ASSIGNED PAIRS: {assigned_pairs} \n UNASSIGNED ROBOTS: {unassigned_robots} \n UNASSIGNED TASKS: {unassigned_tasks}")
+
     return (assigned_pairs, unassigned_robots, unassigned_tasks), parse_failed
 
 

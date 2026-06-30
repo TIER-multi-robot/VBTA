@@ -397,7 +397,7 @@ def assign_tasks_randomly(
     unassigned_robots = []
     unassigned_tasks = []
 
-    print(f"\n\n\n\nPAIRS: {final_pairs} \n\n\n\n UNR: {final_unr_idx} \n\n\n\n UNT: {final_unt_idx}\n\n\n\n")
+    print(f"ASSIGNED PAIRS: {final_pairs} \n UNASSIGNED ROBOTS: {final_unr_idx} \n UNASSIGNED TASKS: {final_unt_idx}")
 
     for robot_id, task_id in final_pairs:
         assigned_pairs.append((robot_id, task_id))
@@ -556,7 +556,7 @@ def reassign_robots_to_tasks(
                 if best.robot_id in unassigned_robots:
                     unassigned_robots.remove(best.robot_id)
     
-    # print(f"Reassign Score: {score}, Reassign Length: {length}")
+    print(f"Reassign Score: {score}, Reassign Length: {length}")
 
     # Recalculate per_agent_scores after potential stealing - get scores for all assigned robots
     final_per_agent_scores = []
@@ -619,7 +619,7 @@ def reassign_robots_to_tasks_randomly(
     unassigned_robots = []
     unassigned_tasks = []
 
-    print(f"\n\n\n\nPAIRS: {final_pairs} \n\n\n\n UNR: {final_unr_idx} \n\n\n\n UNT: {final_unt_idx}\n\n\n\n")
+    print(f"ASSIGNED PAIRS: {final_pairs} \n UNASSIGNED ROBOTS: {final_unr_idx} \n UNASSIGNED TASKS: {final_unt_idx}")
 
     for robot_id, task_id in final_pairs:
         assigned_pairs.append((robot_id, task_id))

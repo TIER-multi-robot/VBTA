@@ -121,6 +121,75 @@ def run_cbs(robots, start_positions, goal_positions, map_dict):
     return float(np.mean(valid_lengths)) if valid_lengths else 0.0
 
 
+def reassign_robots_to_tasks_direct(
+        robots: List[CapabilityProfile],
+        tasks: List[TaskDescription],
+        bypass_fn,
+        unassigned_robots: List[str],
+        unassigned_tasks: List[str],
+        start_positions: dict,
+        goal_positions: dict,
+        llm_cache: dict = None):
+    """
+    Replan via a direct-assignment LLM (e.g. bypass_suitability_from_names_with_llm).
+    Mirrors the return shape of V.reassign_robots_to_tasks /
+    O.reassign_robots_to_tasks_with_method so the main loop can dispatch uniformly:
+        return_assignments, unassigned_robots, unassigned_tasks, score, length, per_agent_scores
+    The bypass operates only on the unassigned subset, so it never steals tasks from
+    busy robots. If a matrix cache is supplied, per-pair scores are read out of it for
+    the fairness metrics; otherwise per-pair scores default to 0.5 sentinel.
+    """
+    urobots = [r for r in robots if not r.assigned]
+    utasks = [t for t in tasks if not t.assigned]
+    if not urobots or not utasks:
+        return {}, unassigned_robots, unassigned_tasks, 0.0, 0.0, []
+
+    t0 = time.perf_counter_ns()
+    (sub_pairs, _unr_sub, _unt_sub), parse_failed = bypass_fn(urobots, utasks)
+    length = (time.perf_counter_ns() - t0) / 1000.0
+
+    if parse_failed:
+        print("[direct LLM replan] parse failed - leaving unassigned this tick")
+        return {}, unassigned_robots, unassigned_tasks, 0.0, length, []
+
+    cache_matrix = llm_cache.get("matrix") if llm_cache else None
+    r_to_idx = llm_cache.get("robot_id_to_idx") if llm_cache else None
+    t_to_idx = llm_cache.get("task_id_to_idx") if llm_cache else None
+
+    print(type(llm_cache["matrix"]))
+
+    return_assignments = {}
+    score = 0.0
+    for ri, ti in sub_pairs:
+        r = urobots[ri]
+        t = utasks[ti]
+        pair_score = 0.5
+        if (cache_matrix is not None and r_to_idx and t_to_idx
+                and r.robot_id in r_to_idx and t.task_id in t_to_idx):
+            pair_score = float(cache_matrix[r_to_idx[r.robot_id], t_to_idx[t.task_id]])
+
+        r.current_task = t
+        r.tasks_attempted += 1
+        r.assigned = True
+        t.assigned_robot = r
+        t.assigned = True
+        r.current_task_suitability = pair_score
+        t.current_suitability = pair_score
+        start_positions[r.robot_id] = r.location
+        goal_positions[r.robot_id] = t.location
+        return_assignments[r.robot_id] = t.task_id
+        score += pair_score
+
+    new_unassigned_robots = [r.robot_id for r in robots if not r.assigned]
+    new_unassigned_tasks = [t.task_id for t in tasks if not t.assigned]
+    per_agent_scores = [
+        float(r.current_task_suitability)
+        for r in robots
+        if r.assigned and r.current_task is not None and r.current_task_suitability is not None
+    ]
+    return return_assignments, new_unassigned_robots, new_unassigned_tasks, score, length, per_agent_scores
+
+
 def main_simulation(
         output: tuple,
         robots: List[CapabilityProfile],
@@ -315,7 +384,9 @@ def main_simulation(
                 # update it if not
                 if not cache_valid:
                     print(f"LLM cache miss - rebuilding matrix for {len(robots)} robots, {len(tasks)} tasks")
-                    suitability_matrix = suitability_method(robots, tasks)
+                    result = suitability_method(robots, tasks)
+                    # Unwrap (matrix, parse_failed) tuples so the cache stores a bare ndarray.
+                    suitability_matrix = result[0] if isinstance(result, tuple) else result
                     llm_cache["matrix"] = suitability_matrix
                     llm_cache["robot_id_to_idx"] = {r.robot_id: i for i, r in enumerate(robots)}
                     llm_cache["task_id_to_idx"] = {t.task_id: j for j, t in enumerate(tasks)}
@@ -343,6 +414,20 @@ def main_simulation(
                 _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = O.reassign_robots_to_tasks_with_method(
                     robots, tasks, num_candidates, voting_method, suitability_source,
                     unassigned_robots, unassigned_tasks, voting_method, start_positions, goal_positions, HYPOTENUSE,
+                )
+                if reassign_per_agent_scores:
+                    reassignment_jains_indices.append(calculate_jains_index(reassign_per_agent_scores))
+                    reassignment_fairness_metrics.append(compute_all_fairness_metrics(reassign_per_agent_scores))
+
+            # assign with direct LLM (bypass the matrix)
+            elif getattr(voting_method, "_is_llm_direct", False):
+                print("REASSIGNING WITH DIRECT LLM ASSIGNMENT")
+                total_reassignments += 1
+                _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = reassign_robots_to_tasks_direct(
+                    robots, tasks, voting_method,
+                    unassigned_robots, unassigned_tasks,
+                    start_positions, goal_positions,
+                    llm_cache=llm_cache,
                 )
                 if reassign_per_agent_scores:
                     reassignment_jains_indices.append(calculate_jains_index(reassign_per_agent_scores))
@@ -471,10 +556,10 @@ if __name__ == "__main__":
     direct_names = [func_name(f) for f in direct_methods]
     all_methods = voting_methods + optimization_methods + direct_methods
     suitability_methods = [
-        S.evaluate_suitability_balanced,
+        # S.evaluate_suitability_balanced,
         # S.evaluate_suitability_loose,
         # S.evaluate_suitability_strict,
-        # S.evaluate_suitability_from_names_with_llm,
+        S.evaluate_suitability_from_names_with_llm,
     ]
 
     small_maps = [
@@ -499,8 +584,8 @@ if __name__ == "__main__":
         # + random.sample(large_maps, 1)
     )
 
-    robot_sizes = [5]
-    task_sizes = [5]
+    robot_sizes = [2]
+    task_sizes = [2]
     Run_ID = 1
     num_repetitions = 1
     add_tasks = False
@@ -597,7 +682,11 @@ if __name__ == "__main__":
                                 task_profiles = [t.strict_profile_name for t in tasks] if task_generation_strict else []
 
                                 if getattr(sm, "_is_llm_batch", False):
-                                    suitability_matrix = sm(robots, tasks)
+                                    result = sm(robots, tasks)
+                                    # LLM scorers return (matrix, parse_failed); unwrap so the
+                                    # matrix is what flows through to llm_cache and downstream
+                                    # indexing in reassign_robots_to_tasks_direct.
+                                    suitability_matrix = result[0] if isinstance(result, tuple) else result
                                 else:
                                     suitability_matrix = S.calculate_suitability_matrix(robots, tasks, sm, HYPOTENUSE)
 
