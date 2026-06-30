@@ -19,6 +19,30 @@ _LLAMA_MODEL = None
 _LLAMA_REPO_ID = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
 _LLAMA_FILENAME = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
 
+# Preset configs for quick swapping; pass repo_id + filename to set_llm_model() to use a custom one.
+LLM_PRESETS = {
+    "llama-3.1-8b": ("bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+                     "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"),
+    "qwen2.5-14b":  ("bartowski/Qwen2.5-14B-Instruct-GGUF",
+                     "Qwen2.5-14B-Instruct-Q4_K_M.gguf"),
+}
+
+def set_llm_model(preset: str = "qwen2.5-14b", repo_id: str = None, filename: str = None):
+    """
+    Swap the active LLM. Pass a preset name (see LLM_PRESETS) or repo_id+filename directly.
+    Forces the singleton to reload on next _get_llama() call.
+    """
+    global _LLAMA_MODEL, _LLAMA_REPO_ID, _LLAMA_FILENAME
+    if preset is not None:
+        if preset not in LLM_PRESETS:
+            raise ValueError(f"Unknown preset {preset!r}. Available: {list(LLM_PRESETS)}")
+        _LLAMA_REPO_ID, _LLAMA_FILENAME = LLM_PRESETS[preset]
+    elif repo_id is not None and filename is not None:
+        _LLAMA_REPO_ID, _LLAMA_FILENAME = repo_id, filename
+    else:
+        raise ValueError("Provide either preset= or both repo_id= and filename=.")
+    _LLAMA_MODEL = None  # force reload
+
 def _get_llama():
     """
     Lazy-initialize a llama.cpp Llama instance with full GPU offload.
@@ -690,17 +714,22 @@ def check_zero_suitability(assignment: List[Tuple[int, int]], suitability_matrix
     return False  # No zero suitability ratings found
 
 def calculate_suitability_matrix(
-    robots: List, 
-    tasks: List, 
+    robots: List,
+    tasks: List,
     scorer: Callable[..., object],
-    map_size: int
+    map_size: int,
 ) -> NDArray[np.float64]:
     """
     Compute suitability matrix using either:
-      • a rules based scorer (Balanced, Loose, Strict)
-      • an LLM based scorer (Llama, Mixtral)
+      - a rules based scorer (Balanced, Loose, Strict) -> returns ndarray
+      - an LLM based scorer (Llama, Qwen, ...) -> returns (ndarray, parse_failed)
+
+    The LLM scorers carry a parse-failure flag; this helper drops it so callers
+    that only want the matrix can stay shape-agnostic. Use the scorer directly
+    if you need the flag.
     """
-    M = scorer(robots, tasks, map_size=map_size)
+    result = scorer(robots, tasks, map_size=map_size)
+    M = result[0] if isinstance(result, tuple) else result
     return np.clip(M, 0.0, 1.0)
 
 def _to_jsonable(x):
@@ -777,14 +806,32 @@ def _clean_for_json(s: str) -> str:
 
     return s
 
+_LLM_LOGGER = None
+
+def _get_llm_logger():
+    """One-shot logger init; subsequent calls reuse the same handler."""
+    global _LLM_LOGGER
+    if _LLM_LOGGER is None:
+        dir_path = os.path.join('hvbta', 'io', 'logging')
+        os.makedirs(dir_path, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_path = os.path.join(dir_path, f"logging_{stamp}.log")
+        logger = logging.getLogger("hvbta.suitability.llm")
+        logger.setLevel(logging.DEBUG)
+        if not logger.handlers:
+            handler = logging.FileHandler(log_path, encoding='utf-8')
+            handler.setLevel(logging.DEBUG)
+            logger.addHandler(handler)
+        _LLM_LOGGER = logger
+    return _LLM_LOGGER
+
+
 def _parse_output_matrix(raw_text: str, nR: int, nT: int) -> Tuple[np.ndarray | None, bool]:
     """
     Parse the OUTPUT matrix into an (nR, nT) float array.
-    Returns None if impossible to parse.
+    Returns (matrix or None, parse_failed flag).
     """
-    dir_path = os.path.join('hvbta', 'io', 'logging')
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(filename=os.path.join(dir_path, "logging_", datetime.datetime.now().strftime("%Y%m%d-%H%M%S")), encoding='utf-8', level=logging.DEBUG)
+    logger = _get_llm_logger()
 
     parse_failed = True
     block = _extract_output_matrix_text(raw_text)
@@ -856,16 +903,88 @@ def _parse_output_matrix(raw_text: str, nR: int, nT: int) -> Tuple[np.ndarray | 
     parse_failed = False
     return arr, parse_failed
 
-def _parse_output_matrix_bypass(raw_text: str) -> np.ndarray | None:
-    """Parse LLM output to get tuple of 3 lists to represent assignments
-    Tuple[List[Tuple[int, int]], List[int], List[int]]
-    Each list represents:
-        - assigned pairs of robots and tasks
-        - unassigned robots
-        - unassigned tasks
-    all represented with their robot and task IDs"""
-    # TODO: FINISH THIS FUNCTION, DIRECT ASSIGNMENT WITH LLM
-    pass
+def _parse_output_matrix_bypass(
+    raw_text: str,
+    robots: List[CapabilityProfile],
+    tasks: List[TaskDescription],
+) -> Tuple[List[Tuple[int, int]], List[int], List[int], bool]:
+    """
+    Parse a direct-assignment LLM response of the form:
+        {"assignments": [{"task_id": "<id>", "robot_id": "<id>"}, ...]}
+    into index-space assignment tuples relative to the supplied robot/task lists.
+
+    Returns:
+        (assigned_pairs, unassigned_robot_indices, unassigned_task_indices, parse_failed)
+        - assigned_pairs: list of (robot_idx, task_idx)
+        - unassigned_robot_indices / unassigned_task_indices: indices not present in any pair
+        - parse_failed: True if no usable JSON was extracted (caller should fall back)
+    """
+    logger = _get_llm_logger()
+    parse_failed = True
+
+    if not isinstance(raw_text, str):
+        return [], list(range(len(robots))), list(range(len(tasks))), parse_failed
+
+    # Pull out the first {...} block (LLM may wrap with stray text)
+    start = raw_text.find('{')
+    if start == -1:
+        logger.debug("BYPASS: no '{' in response\n%s", raw_text)
+        return [], list(range(len(robots))), list(range(len(tasks))), parse_failed
+
+    depth = 0
+    end = -1
+    for i in range(start, len(raw_text)):
+        ch = raw_text[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end == -1:
+        logger.debug("BYPASS: unbalanced braces\n%s", raw_text)
+        return [], list(range(len(robots))), list(range(len(tasks))), parse_failed
+
+    block = _clean_for_json(raw_text[start:end])
+    try:
+        data = json.loads(block)
+    except Exception:
+        try:
+            data = ast.literal_eval(block)
+        except Exception:
+            logger.debug("BYPASS: JSON+ast eval failed\n%s", block)
+            return [], list(range(len(robots))), list(range(len(tasks))), parse_failed
+
+    assignments = data.get("assignments", []) if isinstance(data, dict) else []
+    if not isinstance(assignments, list):
+        logger.debug("BYPASS: 'assignments' is not a list: %r", assignments)
+        return [], list(range(len(robots))), list(range(len(tasks))), parse_failed
+
+    r_idx = {r.robot_id: i for i, r in enumerate(robots)}
+    t_idx = {t.task_id: j for j, t in enumerate(tasks)}
+
+    assigned_pairs: List[Tuple[int, int]] = []
+    used_robots, used_tasks = set(), set()
+    for entry in assignments:
+        if not isinstance(entry, dict):
+            continue
+        rid = entry.get("robot_id")
+        tid = entry.get("task_id")
+        if rid not in r_idx or tid not in t_idx:
+            continue
+        ri, ti = r_idx[rid], t_idx[tid]
+        # one robot per task, one task per robot - first valid pair wins
+        if ri in used_robots or ti in used_tasks:
+            continue
+        assigned_pairs.append((ri, ti))
+        used_robots.add(ri)
+        used_tasks.add(ti)
+
+    unassigned_robots = [i for i in range(len(robots)) if i not in used_robots]
+    unassigned_tasks = [j for j in range(len(tasks)) if j not in used_tasks]
+    parse_failed = False
+    return assigned_pairs, unassigned_robots, unassigned_tasks, parse_failed
 
 
 def build_name_only_prompt(robots_json: str, tasks_json: str) -> str:
@@ -937,7 +1056,7 @@ def _task_name_view(t: TaskDescription) -> dict:
         d["nl_description"] = desc
     return d
 
-def evaluate_suitability_from_names_with_llm(robots: List[CapabilityProfile], tasks: List[TaskDescription], model=_LLAMA_FILENAME) -> np.ndarray:
+def evaluate_suitability_from_names_with_llm(robots: List[CapabilityProfile], tasks: List[TaskDescription], map_size=None, model=None) -> np.ndarray:
     """
     Evaluate suitability of robots for tasks using a local GGUF-quantized Llama model
     via llama.cpp with full GPU offload. Returns an (R, T) float array in [0,1].
@@ -949,7 +1068,6 @@ def evaluate_suitability_from_names_with_llm(robots: List[CapabilityProfile], ta
     Returns:
         M: An (R, T) numpy array of float suitability scores in [0,1].
     """
-    evaluate_suitability_from_names_with_llm._is_llm_batch = True
     llm = _get_llama()
 
     R = [_to_jsonable(_robot_min_view(r)) for r in robots]
@@ -970,23 +1088,23 @@ def evaluate_suitability_from_names_with_llm(robots: List[CapabilityProfile], ta
     )
     content = resp["choices"][0]["message"]["content"]
 
-    M, M.parse_failed = _parse_output_matrix(content, nR=len(robots), nT=len(tasks))
+    M, parse_failed = _parse_output_matrix(content, nR=len(robots), nT=len(tasks))
     if M is None:
-        M = np.full((len(robots), len(tasks)), 0.0, dtype=float)
-    return M
+        M = np.zeros((len(robots), len(tasks)), dtype=float)
+    return M, parse_failed
 
-def bypass_suitability_from_names_with_llm(robots, tasks, model=_LLAMA_FILENAME) -> np.ndarray:
+def bypass_suitability_from_names_with_llm(robots, tasks, map_size=None, model=None):
     """
-    One-shot assignment variant using the local GGUF-quantized Llama model via
-    llama.cpp with full GPU offload. Returns an (R, T) float array in [0,1].
-    Parameters:
-        robots: List of CapabilityProfile objects.
-        tasks: List of TaskDescription objects.
-        model: The GGUF filename (held in the module-level singleton).
+    One-shot direct-assignment variant: the LLM returns (robot_id, task_id) pairs
+    instead of a suitability matrix. Skips the scoring/voting layer entirely.
+
     Returns:
-        M: An (R, T) numpy array of float suitability scores in [0,1].
+        ((assigned_pairs, unassigned_robot_idx, unassigned_task_idx), parse_failed)
+        - assigned_pairs:           list[(robot_idx, task_idx)]
+        - unassigned_robot_idx:     list[int]
+        - unassigned_task_idx:      list[int]
+        - parse_failed:             bool, True if the LLM response wasn't parseable
     """
-    evaluate_suitability_from_names_with_llm._is_llm_batch = True
     llm = _get_llama()
 
     R = [_to_jsonable(_robot_min_view(r)) for r in robots]
@@ -1021,7 +1139,13 @@ def bypass_suitability_from_names_with_llm(robots, tasks, model=_LLAMA_FILENAME)
     )
     content = resp["choices"][0]["message"]["content"]
 
-    M, M.parse_failed = _parse_output_matrix(content, nR=len(robots), nT=len(tasks))
-    if M is None:
-        M = np.full((len(robots), len(tasks)), 0.0, dtype=float)
-    return M
+    assigned_pairs, unassigned_robots, unassigned_tasks, parse_failed = _parse_output_matrix_bypass(content, robots, tasks)
+    return (assigned_pairs, unassigned_robots, unassigned_tasks), parse_failed
+
+
+# Mark LLM scorers at module scope so callers can detect them via getattr(fn, "_is_llm_batch", False)
+# before the first call (used by the LLM cache + the matrix/tuple dispatch in calculate_suitability_matrix).
+evaluate_suitability_from_names_with_llm._is_llm_batch = True
+bypass_suitability_from_names_with_llm._is_llm_batch = True
+# Direct-assignment LLM bypasses the suitability-matrix layer entirely.
+bypass_suitability_from_names_with_llm._is_llm_direct = True
