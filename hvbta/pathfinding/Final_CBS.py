@@ -316,8 +316,6 @@ class Environment(object):
         """
         return EdgeConstraint(state_1.time, state_1.location, state_2.location) not in self.constraints.edge_constraints
 
-    def is_solution(self, agent_name):
-        pass
 
     def admissible_heuristic(self, state: State, agent_name: str) -> float:
         """
