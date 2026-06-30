@@ -19,21 +19,24 @@ import hvbta.allocators.optimizers as O
 def suitability_all_zero(suitability_matrix):
     return all(value == 0 for row in suitability_matrix for value in row)
 
-def state_check(robots: List[CapabilityProfile]):
+def state_check(robots: List[CapabilityProfile], unassigned_robots: List[str], unassigned_tasks: List[str]):
     """
-    Returns a state of the robots for deciding whether to re-plan
-    Ignores anything that will cause constant replanning
-    Includes who is planned and to which goals
+    Returns a state signature for deciding whether to re-plan.
+    Includes assigned robot goals plus unassigned robot/task pools.
     """
     active = []
     goals = []
+
     for r in robots:
         if r.assigned and r.current_task:
             active.append(r.robot_id)
             goals.append((r.robot_id, tuple(r.current_task.location), r.current_task.task_id))
     active_signature = tuple(sorted(active))
     goals_signature = tuple(sorted(goals))
-    return active_signature, goals_signature
+    unassigned_robot_signature = tuple(sorted(unassigned_robots))
+    unassigned_task_signature = tuple(sorted(unassigned_tasks))
+
+    return active_signature, goals_signature, unassigned_robot_signature, unassigned_task_signature
 
 def main_simulation(
         output: tuple[list[tuple[int, int]],list[int],list[int]], 
@@ -176,8 +179,8 @@ def main_simulation(
             print(f"Robot {robot_id} path: {robots[ridx].current_path}")
 
     # Keep track of previous state to not run CBS when there are no changes
-    previous_active, previous_goals = state_check(robots)
-    current_active, current_goals = state_check(robots)
+    previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
+    current_active, current_goals, current_unassigned_robots, current_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
  
     # End the simulation if nothing changes for 3 timesteps and CBS stalling (hopefully the tasks are done and the robots arent moving)
     time_steps_unchanged = 0
@@ -279,7 +282,7 @@ def main_simulation(
                 goal_positions.pop(robot.robot_id, None)
 
         # update planning signatures
-        current_active, current_goals = state_check(robots)
+        current_active, current_goals, current_unassigned_robots, current_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
 
         # print(f"DEBUG STATEMENT 12")
 
@@ -292,7 +295,12 @@ def main_simulation(
         if unassigned_robots or unassigned_tasks or events["new_tasks"] or events["new_robots"]:
             if events["new_tasks"] or events["new_robots"] or events["completed_tasks"]:
                 should_replan = True
-            elif (current_active != previous_active) or (current_goals != previous_goals):
+            elif (
+                current_active != previous_active
+                or current_goals != previous_goals
+                or current_unassigned_robots != previous_unassigned_robots
+                or current_unassigned_tasks != previous_unassigned_tasks
+            ):
                 should_replan = True
             # elif stalling_robot:
             #     should_replan = True
@@ -369,7 +377,7 @@ def main_simulation(
                         r.current_path = [(p['x'], p['y']) for p in schedule]
                         r.remaining_distance = max(0, len(schedule) - 1)
 
-                    previous_active, previous_goals = state_check(robots)  # update to the post-replan state
+                    previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)  # update to the post-replan state
                     events = {k: 0 for k in events}  # reset counters we just consumed
 
                     # print(f"DEBUG STATEMENT 16")

@@ -132,11 +132,10 @@ def _compute_agent_path(args):
         path = None
     return (rid, path)
 
-def state_check(robots: List[CapabilityProfile]):
+def state_check(robots: List[CapabilityProfile], unassigned_robots: List[str], unassigned_tasks: List[str]):
     """
-    Returns a state of the robots for deciding whether to re-plan
-    Ignores anything that will cause constant replanning
-    Includes who is planned and to which goals
+    Returns a state signature for deciding whether to re-plan.
+    Includes assigned robot goals plus unassigned robot/task pools.
     """
     active = []
     goals = []
@@ -144,9 +143,13 @@ def state_check(robots: List[CapabilityProfile]):
         if r.assigned and r.current_task:
             active.append(r.robot_id)
             goals.append((r.robot_id, tuple(r.current_task.location), r.current_task.task_id))
+
     active_signature = tuple(sorted(active))
     goals_signature = tuple(sorted(goals))
-    return active_signature, goals_signature
+    unassigned_robot_signature = tuple(sorted(unassigned_robots))
+    unassigned_task_signature = tuple(sorted(unassigned_tasks))
+
+    return active_signature, goals_signature, unassigned_robot_signature, unassigned_task_signature
 
 def manhattan_distance(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -298,8 +301,8 @@ def main_simulation(
 
 
     # Initialize planner state variables used later
-    previous_active, previous_goals = state_check(robots)
-    current_active, current_goals = state_check(robots)
+    previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
+    current_active, current_goals, current_unassigned_robots, current_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
     time_steps_unchanged = 0
     events = {"new_tasks": 0, "new_robots": 0, "completed_tasks": 0}
     idle_steps = {r.robot_id: 0 for r in robots}
@@ -374,7 +377,7 @@ def main_simulation(
                 goal_positions.pop(robot.robot_id, None)
 
         # update planning signatures
-        current_active, current_goals = state_check(robots)
+        current_active, current_goals, current_unassigned_robots, current_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
 
         # Update assigned robots
         assigned_robots = {r.robot_id: r.current_task.task_id for r in robots if r.assigned and r.current_task}
@@ -384,7 +387,12 @@ def main_simulation(
         if unassigned_robots and unassigned_tasks:
             if events["new_tasks"] or events["new_robots"] or events["completed_tasks"]:
                 should_replan = True
-            elif (current_active != previous_active) or (current_goals != previous_goals):
+            elif (
+                current_active != previous_active
+                or current_goals != previous_goals
+                or current_unassigned_robots != previous_unassigned_robots
+                or current_unassigned_tasks != previous_unassigned_tasks
+            ):
                 should_replan = True
 
         if should_replan:
@@ -493,7 +501,7 @@ def main_simulation(
                     r.current_path = path
                     r.remaining_distance = max(0, len(path) - 1)
 
-            previous_active, previous_goals = state_check(robots)  # update to the post-replan state
+            previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)  # update to the post-replan state
             events = {k: 0 for k in events}  # reset counters we just consumed
 
     overall_success_rate = total_success / total_tasks
