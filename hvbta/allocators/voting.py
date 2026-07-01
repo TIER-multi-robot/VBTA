@@ -1,6 +1,6 @@
 import time, numpy as np
 from typing import List, Tuple, Callable
-from .assignments import generate_random_assignments
+from .assignments import generate_random_assignments, generate_high_suitability_assignments
 from hvbta.models import CapabilityProfile, TaskDescription
 from hvbta.suitability import calculate_total_suitability, check_zero_suitability, calculate_suitability_matrix
 from .misc_assignment import extract_submatrix
@@ -265,6 +265,7 @@ def assign_tasks_with_voting(
         voting_method: Callable,
         score_threshold: float = None,
         time_budget_ms: float = None,
+        generator: Callable = None,
         ) -> Tuple[Tuple[List[Tuple[int, int]], List[int], List[int]], float, float, List[float]]:
     """
     Assigns tasks to robots using random assignment and ranks the assignments using the specified voting method.
@@ -282,7 +283,13 @@ def assign_tasks_with_voting(
             tunable across runs regardless of num_pairs.
         time_budget_ms: If not None, stop generating candidates once wall-clock
             elapsed (from function entry) reaches this many milliseconds.
-        When both are None, behavior matches the previous full-pool version.
+        generator: Optional candidate generator with signature
+            (num_robots, num_tasks, num_assignments) -> List[candidate]. If
+            None, the biased generate_high_suitability_assignments is used
+            when the matrix has any positive entry, otherwise
+            generate_random_assignments. Callers can pass a specific
+            generator to override the auto-selection.
+        When budgets are both None, behavior matches the previous full-pool version.
 
     Returns:
         (best_assignment, best_score, length, per_agent_scores): The best assignment, its suitability score, and the time taken for the voting process.
@@ -292,12 +299,27 @@ def assign_tasks_with_voting(
 
     start = time.perf_counter_ns()
 
-    # Anytime candidate accumulation. Generate one at a time so we can bail on
-    # either budget. If neither is provided, this loops num_candidates times
-    # identically to the old batch-generate behavior.
+    # Choose a generator. Default to the biased generator when the matrix has
+    # any positive score (which is the case when this function is reached at
+    # all - suitability_all_zero() is routed elsewhere upstream). Fall back to
+    # random when we truly have nothing to bias toward.
+    if generator is None:
+        matrix_has_positive = np.any(np.asarray(suitability_matrix) > 0)
+        if matrix_has_positive:
+            def generator(nr, nt, k):
+                return generate_high_suitability_assignments(nr, nt, suitability_matrix, k)
+        else:
+            generator = generate_random_assignments
+
+    # Pre-materialize the full biased/random pool. Both generators are cheap
+    # (rank + sample or uniform sample), so building all K upfront is fine and
+    # keeps the anytime loop below to pure scoring + budget checks.
+    full_pool = generator(num_robots, num_tasks, num_candidates)
+
+    # Anytime accumulation over the pre-generated pool. When neither budget is
+    # set the loop consumes the whole pool identically to the old flow.
     random_assignments = []
-    for _ in range(num_candidates):
-        one = generate_random_assignments(num_robots, num_tasks, 1)[0]
+    for one in full_pool:
         random_assignments.append(one)
 
         if score_threshold is not None:
@@ -458,7 +480,8 @@ def reassign_robots_to_tasks(
         map_size: int,
         inertia_threshold: float = 0.1,
         score_threshold: float = None,
-        time_budget_ms: float = None):
+        time_budget_ms: float = None,
+        generator: Callable = None):
     """
     Reassigns unassigned robots to unassigned tasks using a voting method.
     Parameters:
@@ -506,7 +529,8 @@ def reassign_robots_to_tasks(
     else:
         output, score, length, per_agent_scores = assign_tasks_with_voting(
             urobots, utasks, suitability_matrix, num_candidates, voting_method,
-            score_threshold=score_threshold, time_budget_ms=time_budget_ms)
+            score_threshold=score_threshold, time_budget_ms=time_budget_ms,
+            generator=generator)
 
     # this assigned_pairs only contains the unassigned robots and tasks, I may have to pass in the actual assigned_pairs to update it
     assigned_pairs = output[0] # list of tuples
