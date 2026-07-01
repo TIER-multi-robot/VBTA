@@ -105,6 +105,49 @@ def add_new_robots(robots: List[CapabilityProfile], unassigned_robots: List[str]
         # NOTE: may need to make robot.current_path an empty list when unassigned to prevent unintentional movement
     return robot_max_id
 
+def remove_random_tasks(
+        tasks: List[TaskDescription],
+        unassigned_tasks: List[str],
+        count: int,
+        robots: List[CapabilityProfile],
+        unassigned_robots: List[str]) -> List[TaskDescription]:
+    """
+    Cancels up to `count` random tasks. If a task is currently assigned, the
+    responsible robot is freed via unassign_task_from_robot (clearing its path)
+    so CBS re-routes it on the next replan.
+
+    Parameters:
+        tasks: full task list (mutated - removed tasks are dropped).
+        unassigned_tasks: list of pending task IDs (mutated).
+        count: upper bound on the number of tasks to cancel. Actual count is
+               clamped to len(tasks).
+        robots: full robot list (used only for consistency; task's assigned_robot
+                pointer is authoritative for the unassign path).
+        unassigned_robots: list of robot IDs currently free (mutated when a
+                           robot is freed by cancelling its task).
+
+    Returns:
+        List of tasks that were removed (for caller cleanup / logging).
+    """
+    if not tasks or count <= 0:
+        return []
+    n = min(count, len(tasks))
+    tasks_to_remove = random.sample(tasks, n)
+    removed = []
+    for task in tasks_to_remove:
+        assigned_robot = task.assigned_robot
+        if assigned_robot is not None:
+            unassign_task_from_robot(assigned_robot, task, unassigned_robots, unassigned_tasks)
+        if task.task_id in unassigned_tasks:
+            unassigned_tasks.remove(task.task_id)
+        try:
+            tasks.remove(task)
+        except ValueError:
+            pass
+        removed.append(task)
+    return removed
+
+
 def remove_random_robots(robots: List[CapabilityProfile], tasks: List[TaskDescription], unassigned_robots: List[str], unassigned_tasks: List[str], count: int, occupied_locations: set, start_positions: dict, goal_positions: dict):
     """
     This function selects a specified number of robots to remove from the robots list.

@@ -6,6 +6,7 @@ import csv
 import os
 import json
 import copy
+import datetime
 from typing import List
 
 from hvbta.pathfinding.Final_CBS import CBS, Environment
@@ -21,7 +22,7 @@ from hvbta.metrics import (
     calculate_robustness_metrics,
 )
 from hvbta.pathfinding.CBS import load_map, create_obstacle_list, build_cbs_agents
-from hvbta.allocators.misc_assignment import add_new_tasks, add_new_robots, remove_random_robots
+from hvbta.allocators.misc_assignment import add_new_tasks, add_new_robots, remove_random_robots, remove_random_tasks
 from hvbta.models import CapabilityProfile, TaskDescription
 
 
@@ -80,14 +81,35 @@ def state_check(robots: List[CapabilityProfile], unassigned_robots: List[str], u
 
 def run_cbs(robots, start_positions, goal_positions, map_dict):
     """
-    Plan all assigned-robot paths jointly with CBS. Writes resulting paths back
-    onto each robot's `current_path` and `remaining_distance`. Returns the average
-    path length over successful agents, or 0.0 if CBS fails / no agents.
+    Plan all assigned-robot paths jointly with CBS.
+
+    Unassigned robots are added as stationary CBS agents (start == goal == current
+    location). This lets CBS route the moving robots around them; otherwise CBS
+    would happily plan paths straight through an idle robot's cell, causing
+    undetected physical collisions.
+
+    Writes resulting paths back onto each robot's `current_path` and
+    `remaining_distance`. Returns the average moving-agent path length over
+    successful agents, or 0.0 if CBS fails / no agents.
     """
     if not start_positions or not goal_positions:
+        # Even with no assigned agents, unassigned robots are trivially stationary; nothing to plan.
         return 0.0
 
-    agents = build_cbs_agents(robots, start_positions, goal_positions)
+    # Augment with stationary agents for unassigned robots so CBS sees them as blockers.
+    aug_starts = dict(start_positions)
+    aug_goals = dict(goal_positions)
+    stationary_ids = set()
+    for r in robots:
+        if r.robot_id in aug_starts:
+            continue  # already planned as a mover
+        if getattr(r, "location", None) is None:
+            continue
+        aug_starts[r.robot_id] = r.location
+        aug_goals[r.robot_id] = r.location
+        stationary_ids.add(r.robot_id)
+
+    agents = build_cbs_agents(robots, aug_starts, aug_goals)
     if not agents:
         return 0.0
 
@@ -114,6 +136,9 @@ def run_cbs(robots, start_positions, goal_positions, map_dict):
         if robot_id not in id_to_index:
             continue
         r = robots[id_to_index[robot_id]]
+        # Skip stationary blockers - do not overwrite their (empty) current_path with the trivial wait schedule.
+        if robot_id in stationary_ids:
+            continue
         r.current_path = [(p['x'], p['y']) for p in schedule]
         r.remaining_distance = max(0, len(schedule) - 1)
         if len(schedule) > 1:
@@ -155,8 +180,6 @@ def reassign_robots_to_tasks_direct(
     cache_matrix = llm_cache.get("matrix") if llm_cache else None
     r_to_idx = llm_cache.get("robot_id_to_idx") if llm_cache else None
     t_to_idx = llm_cache.get("task_id_to_idx") if llm_cache else None
-
-    print(type(llm_cache["matrix"]))
 
     return_assignments = {}
     score = 0.0
@@ -209,7 +232,15 @@ def main_simulation(
         robots_to_remove: int = 1,
         robot_generation_strict: bool = True,
         task_generation_strict: bool = True,
-        initial_jains_index: float = 0.0):
+        initial_jains_index: float = 0.0,
+        # Lifelong event rates: per-timestep probability of an arrival/removal check firing.
+        # Old <=2 / <=4 hard-caps are gone; set 0.0 to disable a channel.
+        task_arrival_rate: float = 0.05,
+        robot_arrival_rate: float = 0.02,
+        robot_departure_rate: float = 0.02,
+        task_cancellation_rate: float = 0.02,
+        remove_tasks: bool = False,
+        tasks_to_remove: int = 1):
     print(f"SUITABILITY METHOD: {suitability_method}")
 
     voting_methods = {
@@ -232,7 +263,11 @@ def main_simulation(
     HYPOTENUSE = (len(grid) ** 2 + len(grid[0]) ** 2) ** 0.5
     total_reward = 0.0
     total_success = 0.0
-    total_tasks = len(tasks)
+    total_tasks = len(tasks)  # tasks_spawned - grows with dynamic additions
+    # Set of every task_id that was ever assigned to a robot. Denominator for
+    # attempted_completion_rate, which excludes late-arriving tasks that never
+    # got a chance to be attempted before max_time_steps.
+    tasks_ever_assigned = set()
     total_reassignment_time = 0.0
     total_reassignment_score = 0.0
     total_reassignments = 0
@@ -261,6 +296,7 @@ def main_simulation(
         r.tasks_attempted = 1
         t.assigned_robot = r
         t.assigned = True
+        tasks_ever_assigned.add(t.task_id)
 
     unassigned_tasks = [t.task_id for t in tasks if not t.assigned]
     unassigned_robots = [r.robot_id for r in robots if not r.assigned]
@@ -299,10 +335,11 @@ def main_simulation(
         # set the replan_cbs flag
         should_replan_cbs = completed_this_step > 0
 
+        # Lifelong dynamic events: each channel fires with per-timestep probability.
         # add tasks
-        if add_tasks and time_step + 1 <= 2 and random.random() < 0.5:
+        if add_tasks and random.random() < task_arrival_rate:
             print(f"ADDING NEW TASKS AT TIME STEP {time_step + 1}")
-            n = random.randint(0, tasks_to_add)
+            n = random.randint(1, max(1, tasks_to_add))
             task_max_id, total_tasks = add_new_tasks(
                 tasks, unassigned_tasks, task_max_id, n, total_tasks,
                 grid, occupied_positions, task_generation_strict,
@@ -310,9 +347,9 @@ def main_simulation(
             events["new_tasks"] += n
 
         # add robots
-        if add_robots and time_step + 1 <= 4 and random.random() < 0.5:
+        if add_robots and random.random() < robot_arrival_rate:
             print(f"ADDING NEW ROBOTS AT TIME STEP {time_step + 1}")
-            n = random.randint(0, robots_to_add)
+            n = random.randint(1, max(1, robots_to_add))
             robot_max_id = add_new_robots(
                 robots, unassigned_robots, robot_max_id, n,
                 grid, occupied_positions, robot_generation_strict,
@@ -322,16 +359,29 @@ def main_simulation(
                 idle_steps.setdefault(r.robot_id, 0)
 
         # remove robots
-        if remove_robots and time_step + 1 <= 4 and random.random() < 0.5:
+        if remove_robots and random.random() < robot_departure_rate:
             if len(robots) > 1:
                 print(f"REMOVING RANDOM ROBOTS AT TIME STEP {time_step + 1}")
                 removed = remove_random_robots(
                     robots, tasks, unassigned_robots, unassigned_tasks,
-                    random.randint(0, robots_to_remove),
+                    random.randint(1, max(1, robots_to_remove)),
                     occupied_positions, start_positions, goal_positions,
                 )
                 for removed_robot in removed:
                     idle_steps.pop(removed_robot.robot_id, None)
+
+        # cancel tasks
+        if remove_tasks and random.random() < task_cancellation_rate:
+            if len(tasks) > 0:
+                print(f"CANCELLING RANDOM TASKS AT TIME STEP {time_step + 1}")
+                removed_t = remove_random_tasks(
+                    tasks, unassigned_tasks,
+                    random.randint(1, max(1, tasks_to_remove)),
+                    robots, unassigned_robots,
+                )
+                # Cancellations free their robots via unassign_task_from_robot, so a
+                # replan is warranted; treat it as a completion-shaped event.
+                events["completed_tasks"] += len(removed_t)
 
         # increment or reset idle steps for idle robots
         for r in robots:
@@ -444,13 +494,22 @@ def main_simulation(
                     start_positions.pop(robot.robot_id, None)
                     goal_positions.pop(robot.robot_id, None)
 
+        # Record any task that is currently assigned - this is the "attempted" set.
+        # We do this every timestep (cheap) so cancellations of never-attempted tasks
+        # do not incorrectly count them.
+        for t in tasks:
+            if t.assigned:
+                tasks_ever_assigned.add(t.task_id)
+
         # rerun cbs if needed, update state, and clear events
         if should_replan_cbs and start_positions and goal_positions:
+            print("\nRERUNNING CBS\n")
             avg_path_length = run_cbs(robots, start_positions, goal_positions, map_dict) or avg_path_length
             previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
             events = {k: 0 for k in events}
 
     overall_success_rate = total_success / total_tasks if total_tasks else 0.0
+    attempted_completion_rate = total_success / len(tasks_ever_assigned) if tasks_ever_assigned else 0.0
     avg_reassignment_score = (total_reassignment_score / total_reassignments) if total_reassignments > 0 else 0.0
     avg_reassignment_jains_index = (sum(reassignment_jains_indices) / len(reassignment_jains_indices)) if reassignment_jains_indices else 0.0
 
@@ -463,16 +522,19 @@ def main_simulation(
     else:
         avg_reassign_metrics = tuple(0.0 for _ in FAIRNESS_METRIC_NAMES)
 
-    print(f"Voting: Total reward: {total_reward}, Overall success rate: {overall_success_rate:.2%}, "
-          f"Tasks completed: {total_success}, Reassignment Time: {total_reassignment_time}, "
+    print(f"Voting: Total reward: {total_reward}, "
+          f"Overall success rate: {overall_success_rate:.2%} ({total_success}/{total_tasks} spawned), "
+          f"Attempted completion rate: {attempted_completion_rate:.2%} ({total_success}/{len(tasks_ever_assigned)} attempted), "
+          f"Reassignment Time: {total_reassignment_time}, "
           f"Reassignment Score: {total_reassignment_score}, total reassignments: {total_reassignments}, "
-          f"total tasks: {total_tasks}, Total robots: {len(robots)}")
+          f"Total robots: {len(robots)}")
 
     return (
         total_reward, overall_success_rate, total_success,
         total_reassignment_time, total_reassignment_score, total_reassignments,
         min(total_time_steps, max_time_steps), avg_reassignment_score, avg_path_length,
         initial_jains_index, avg_reassignment_jains_index,
+        attempted_completion_rate, len(tasks_ever_assigned), total_tasks,
     ) + avg_reassign_metrics[1:]  # skip first (Jains) - already exposed above
 
 
@@ -495,7 +557,13 @@ def benchmark_simulation(
         robots_to_remove: int = 1,
         robot_generation_strict: bool = True,
         task_generation_strict: bool = True,
-        initial_jains_index: float = 0.0):
+        initial_jains_index: float = 0.0,
+        task_arrival_rate: float = 0.05,
+        robot_arrival_rate: float = 0.02,
+        robot_departure_rate: float = 0.02,
+        task_cancellation_rate: float = 0.02,
+        remove_tasks: bool = False,
+        tasks_to_remove: int = 1):
     start_time = time.perf_counter_ns()
     output_tuple = main_simulation(
         output, robots, tasks, num_candidates, voting_method,
@@ -504,6 +572,12 @@ def benchmark_simulation(
         tasks_to_add, robots_to_add, robots_to_remove,
         robot_generation_strict, task_generation_strict,
         initial_jains_index=initial_jains_index,
+        task_arrival_rate=task_arrival_rate,
+        robot_arrival_rate=robot_arrival_rate,
+        robot_departure_rate=robot_departure_rate,
+        task_cancellation_rate=task_cancellation_rate,
+        remove_tasks=remove_tasks,
+        tasks_to_remove=tasks_to_remove,
     )
     execution_time = time.perf_counter_ns() - start_time
     cpu_usage = psutil.cpu_percent()
@@ -551,15 +625,15 @@ if __name__ == "__main__":
     # bypassing the suitability-matrix + voting/optimization stack. Slot here so it
     # benchmarks alongside the others.
     direct_methods = [
-        S.bypass_suitability_from_names_with_llm,
+        # S.bypass_suitability_from_names_with_llm,
     ]
     direct_names = [func_name(f) for f in direct_methods]
     all_methods = voting_methods + optimization_methods + direct_methods
     suitability_methods = [
-        # S.evaluate_suitability_balanced,
-        # S.evaluate_suitability_loose,
-        # S.evaluate_suitability_strict,
-        S.evaluate_suitability_from_names_with_llm,
+        S.evaluate_suitability_balanced,
+        S.evaluate_suitability_loose,
+        S.evaluate_suitability_strict,
+        # S.evaluate_suitability_from_names_with_llm,
     ]
 
     small_maps = [
@@ -585,17 +659,27 @@ if __name__ == "__main__":
     )
 
     robot_sizes = [2]
-    task_sizes = [2]
+    task_sizes = [10]
     Run_ID = 1
     num_repetitions = 1
-    add_tasks = False
-    add_robots = False
-    remove_robots = False
+    add_tasks = True
+    add_robots = True
+    remove_robots = True
+    tasks_to_add = 1
+    robots_to_add = 1
+    robots_to_remove = 1
     robot_generation_strict = True
     task_generation_strict = True
+    task_arrival_rate = 0.05
+    robot_arrival_rate = 0.02
+    robot_departure_rate = 0.02
+    task_cancellation_rate = 0.02
+    remove_tasks = True
+    tasks_to_remove = 1
     map_dir = r"MAPF_benchmark_maps"
 
     dir_path = os.path.join('hvbta', 'io', 'results')
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     os.makedirs(dir_path, exist_ok=True)
     full_paths = [os.path.join(map_dir, m) for m in map_paths]
 
@@ -607,8 +691,8 @@ if __name__ == "__main__":
         obstacles = create_obstacle_list(grid)
         map_dict = {'dimension': dims, 'obstacles': obstacles}
 
-        results_path = os.path.join(dir_path, f"CBS_simulation_results_{os.path.basename(map_file)}.csv")
-        profiles_path = os.path.join(dir_path, f"CBS_profiles_{os.path.basename(map_file)}.csv")
+        results_path = os.path.join(dir_path, f"{stamp}_simulation_{os.path.basename(map_file)}.csv")
+        profiles_path = os.path.join(dir_path, f"{stamp}_profiles_{os.path.basename(map_file)}.csv")
 
         with open(results_path, mode="w", newline='') as file, \
              open(profiles_path, mode="w", newline='') as profile_file:
@@ -630,6 +714,9 @@ if __name__ == "__main__":
                 'total_reassignment_time', 'total_reassignment_score',
                 'total_reassignments', 'Total Time Steps', 'Average Reassignment Score',
                 'Average Path Length', 'Initial Jains Index (sim)', 'Avg Reassignment Jains Index',
+                # Lifelong-operation metrics inserted here to line up with the
+                # new tail of the main_simulation return tuple.
+                'Attempted_Completion_Rate', 'Tasks_Attempted', 'Tasks_Spawned',
                 'Avg_Reass_Below_GE_Frac', 'Avg_Reass_Below_Good_Frac',
                 'Avg_Reass_Deficit_All_GE', 'Avg_Reass_Deficit_Below_GE',
                 'Avg_Reass_Deficit_All_Good', 'Avg_Reass_Deficit_Below_Good',
@@ -743,11 +830,31 @@ if __name__ == "__main__":
                                 for idx, (out_tuple, meth) in enumerate(zip(outputs, all_methods)):
                                     out, initial_jains = out_tuple
                                     output_tuple = benchmark_simulation(
-                                        out, copy.deepcopy(robots), copy.deepcopy(tasks),
-                                        nc, meth, grid, map_dict, sm, suitability_matrix,
-                                        max_time_steps, add_tasks, add_robots, remove_robots,
-                                        10, 10, 10, robot_generation_strict, task_generation_strict,
-                                        initial_jains_index=initial_jains,
+                                        output=out, 
+                                        robots=copy.deepcopy(robots), 
+                                        tasks=copy.deepcopy(tasks),
+                                        num_candidates=nc, 
+                                        voting_method=meth, 
+                                        grid=grid, 
+                                        map_dict=map_dict, 
+                                        suitability_method=sm, 
+                                        suitability_matrix=suitability_matrix, 
+                                        max_time_steps=max_time_steps, 
+                                        add_tasks=add_tasks, 
+                                        add_robots=add_robots, 
+                                        remove_robots=remove_robots,
+                                        tasks_to_add=tasks_to_add, 
+                                        robots_to_add=robots_to_add, 
+                                        robots_to_remove=robots_to_remove,
+                                        robot_generation_strict=robot_generation_strict, 
+                                        task_generation_strict=task_generation_strict,
+                                        initial_jains_index=initial_jains, 
+                                        task_arrival_rate=task_arrival_rate,
+                                        robot_arrival_rate=robot_arrival_rate, 
+                                        robot_departure_rate=robot_departure_rate,
+                                        task_cancellation_rate=task_cancellation_rate, 
+                                        remove_tasks=remove_tasks, 
+                                        tasks_to_remove=tasks_to_remove
                                     )
                                     row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [Run_ID, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0]
                                     writer.writerow(row_prefix + list(output_tuple) + [map_size])
