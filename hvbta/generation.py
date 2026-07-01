@@ -19,29 +19,51 @@ def _sample(items: List[str], k_min: int = 0, k_max: int = None) -> List[str]:
     k = random.randint(k_min, k_max)
     return random.sample(items, k)
 
-def get_unique_task_location(tasks, grid, occupied_locations, max_attempts=100):
+def get_unique_task_location(tasks, grid, occupied_locations=None, max_attempts=100):
     """
-    Finds a unique location for a new task that does not overlap with existing tasks or occupied robot locations.
-    Occupied locations only include robot locations, not task locations so we check both with this function.
+    Spawn rule: no two task locations may overlap, but a task may share a cell with a robot.
     Args:
         tasks: List of existing TaskDescription objects to check against.
         grid: The grid representing the environment, used to find free positions.
-        occupied_locations: A set of tuples representing locations occupied by robots.
-        max_attempts: Maximum number of attempts to find a unique location before giving up.
+        occupied_locations: Ignored for the overlap check (kept for backward-compat); only
+            other-task locations are forbidden.
+        max_attempts: Maximum number of attempts before giving up.
 
     Returns:
         location: A unique (x, y, z) location tuple for the new task.
     """
-    attempts = 0
     task_locations = {task.location for task in tasks}
-    all_occupied_locations = occupied_locations | task_locations  # Combine occupied locations with existing task locations
-    location = get_random_free_position(grid, all_occupied_locations)
-    # Ensure the location is unique and not occupied by any robot or existing task
-    while any(np.allclose(location, occ_loc) for occ_loc in all_occupied_locations):
+    location = get_random_free_position(grid, task_locations)
+    attempts = 0
+    while any(np.allclose(location, occ_loc) for occ_loc in task_locations):
         attempts += 1
         if attempts >= max_attempts:
             raise Exception(f"Could not find a unique task location after {max_attempts} attempts")
-        location = get_random_free_position(grid, all_occupied_locations)
+        location = get_random_free_position(grid, task_locations)
+    return location
+
+
+def get_unique_robot_location(robots, grid, occupied_locations=None, max_attempts=100):
+    """
+    Spawn rule: no two robot locations may overlap, but a robot may share a cell with a task.
+    Args:
+        robots: List of existing CapabilityProfile objects to check against.
+        grid: The grid representing the environment.
+        occupied_locations: Ignored for the overlap check (kept for backward-compat); only
+            other-robot locations are forbidden.
+        max_attempts: Maximum number of attempts before giving up.
+
+    Returns:
+        location: A unique (x, y, z) location tuple for the new robot.
+    """
+    robot_locations = {r.location for r in robots if getattr(r, "location", None) is not None}
+    location = get_random_free_position(grid, robot_locations)
+    attempts = 0
+    while any(np.allclose(location, occ_loc) for occ_loc in robot_locations):
+        attempts += 1
+        if attempts >= max_attempts:
+            raise Exception(f"Could not find a unique robot location after {max_attempts} attempts")
+        location = get_random_free_position(grid, robot_locations)
     return location
 
 def generate_random_robot_profile(robot_id: str, grid: List[List[int]], occupied_locations: set) -> CapabilityProfile:

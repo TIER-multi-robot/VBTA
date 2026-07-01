@@ -217,6 +217,7 @@ def assign_tasks_with_method(
     
     # Extract per-agent scores for fairness calculation (only assigned agents)
     per_agent_scores = [float(suitability_matrix[r][t]) for r, t in assignment]
+    print(f"Best assignment in optimization {assignment}")
     
     return (assignment, unassigned_robots, unassigned_tasks), total_score, allocation_time, per_agent_scores
 
@@ -266,7 +267,7 @@ def assign_tasks_with_method_randomly(
     unassigned_robots = []
     unassigned_tasks = []
 
-    print(f"\n\n\n\nPAIRS: {final_pairs} \n\n\n\n UNR: {final_unr_idx} \n\n\n\n UNT: {final_unt_idx}\n\n\n\n")
+    print(f"ASSIGNED PAIRS: {final_pairs} \n UNASSIGNED ROBOTS: {final_unr_idx} \n UNASSIGNED TASKS: {final_unt_idx}")
     for robot_id, task_id in final_pairs:
         assigned_pairs.append((robot_id, task_id))
 
@@ -281,7 +282,7 @@ def assign_tasks_with_method_randomly(
 
     filtered_best_assignments = (assigned_pairs, unassigned_robots, unassigned_tasks)
 
-    print(f"Best assignment in optimization: {filtered_best_assignments}")
+    # print(f"Best assignment in optimization: {filtered_best_assignments}")
     
     # Per-agent scores are all 0.0 for random assignment (all-zero suitability case)
     per_agent_scores = [0.0] * len(assigned_pairs)
@@ -482,7 +483,7 @@ def reassign_robots_to_tasks_randomly_with_method(
     unassigned_robots = []
     unassigned_tasks = []
 
-    print(f"\n\n\n\nPAIRS: {final_pairs} \n\n\n\n UNR: {final_unr_idx} \n\n\n\n UNT: {final_unt_idx}\n\n\n\n")
+    print(f"ASSIGNED PAIRS: {final_pairs} \n UNASSIGNED ROBOTS: {final_unr_idx} \n UNASSIGNED TASKS: {final_unt_idx}")
 
     for robot_id, task_id in final_pairs:
         assigned_pairs.append((robot_id, task_id))
