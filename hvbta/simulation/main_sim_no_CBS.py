@@ -761,23 +761,22 @@ if __name__ == "__main__":
 
                                     # Spawn rule: robots may not overlap each other, tasks may not overlap
                                     # each other, but a robot and a task may share a cell.
+                                    # Strict-only generation (see todo item).
                                     robot_locs = set()
                                     robots = []
-                                    gen_robot = G.generate_random_robot_profile_strict if robot_generation_strict else G.generate_random_robot_profile
                                     for idx in range(num_robots):
-                                        r = gen_robot(f"R{idx+1}", grid, robot_locs)
+                                        r = G.generate_random_robot_profile_strict(f"R{idx+1}", grid, robot_locs)
                                         robots.append(r)
                                         robot_locs.add(r.location)
-                                    robot_profiles = [r.strict_profile_name for r in robots] if robot_generation_strict else []
+                                    robot_profiles = [r.strict_profile_name for r in robots]
 
                                     task_locs = set()
                                     tasks = []
-                                    gen_task = G.generate_random_task_description_strict if task_generation_strict else G.generate_random_task_description
                                     for idx in range(num_tasks):
-                                        t = gen_task(f"T{idx+1}", grid, task_locs, [])
+                                        t = G.generate_random_task_description_strict(f"T{idx+1}", grid, task_locs, [])
                                         tasks.append(t)
                                         task_locs.add(t.location)
-                                    task_profiles = [t.strict_profile_name for t in tasks] if task_generation_strict else []
+                                    task_profiles = [t.strict_profile_name for t in tasks]
 
                                     pairwise_scorer = sm
                                     if getattr(sm, "_is_llm_batch", False):

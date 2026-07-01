@@ -63,14 +63,13 @@ def add_new_tasks(tasks: List[TaskDescription], unassigned_tasks: List[str], tas
         task_max_id: The updated maximum task ID after adding new tasks.
         total_tasks: The updated total number of tasks in the system.
     """
+    # Strict-only generation. The `strict` parameter is kept for API compat but
+    # ignored - random-profile generation is no longer a supported code path.
     for _ in range(new_task_count):
         task_id = f"T{task_max_id}"
         task_max_id += 1
         total_tasks += 1
-        if strict:
-            new_task = G.generate_random_task_description_strict(task_id, grid, occupied_locations, tasks)
-        else:
-            new_task = G.generate_random_task_description(task_id, grid, occupied_locations, tasks)
+        new_task = G.generate_random_task_description_strict(task_id, grid, occupied_locations, tasks)
         tasks.append(new_task)
         unassigned_tasks.append(task_id)
     return task_max_id, total_tasks
@@ -91,13 +90,12 @@ def add_new_robots(robots: List[CapabilityProfile], unassigned_robots: List[str]
     Returns:
         robot_max_id: The updated maximum robot ID after adding new robots.
         """
+    # Strict-only generation. The `strict` parameter is kept for API compat but
+    # ignored - random-profile generation is no longer a supported code path.
     for _ in range(new_robot_count):
         robot_id = f"R{robot_max_id}"
         robot_max_id += 1
-        if strict:
-            new_robot = G.generate_random_robot_profile_strict(robot_id, grid, occupied_locations)
-        else:
-            new_robot = G.generate_random_robot_profile(robot_id, grid, occupied_locations)
+        new_robot = G.generate_random_robot_profile_strict(robot_id, grid, occupied_locations)
         robots.append(new_robot)
         unassigned_robots.append(robot_id)
         occupied_locations.add(new_robot.location)

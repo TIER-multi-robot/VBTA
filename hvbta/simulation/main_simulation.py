@@ -92,12 +92,15 @@ def run_cbs(robots, start_positions, goal_positions, map_dict):
     undetected physical collisions.
 
     Writes resulting paths back onto each robot's `current_path` and
-    `remaining_distance`. Returns the average moving-agent path length over
-    successful agents, or 0.0 if CBS fails / no agents.
+    `remaining_distance`. Returns (avg_moving_path_length, cbs_succeeded). The
+    success flag lets the outer loop drain pending event timestamps for
+    adaptation-latency accounting only on real CBS resolution, not on failure.
     """
     if not start_positions or not goal_positions:
-        # Even with no assigned agents, unassigned robots are trivially stationary; nothing to plan.
-        return 0.0
+        # No mover agents to plan for; treat as trivial success so pending
+        # event latencies are still measured against "the next moment CBS
+        # was invoked and did not fail."
+        return 0.0, True
 
     # Augment with stationary agents for unassigned robots so CBS sees them as blockers.
     aug_starts = dict(start_positions)
@@ -114,13 +117,13 @@ def run_cbs(robots, start_positions, goal_positions, map_dict):
 
     agents = build_cbs_agents(robots, aug_starts, aug_goals)
     if not agents:
-        return 0.0
+        return 0.0, True
 
     # duplicate-start guard - CBS rejects this anyway, but fail fast and informative
     start_locations = [a['start'] for a in agents]
     if len(start_locations) != len(set(start_locations)):
         print("ERROR: Duplicate start locations in agent list. Skipping CBS.")
-        return 0.0
+        return 0.0, False
 
     env = Environment(
         dimension=map_dict['dimension'],
@@ -130,7 +133,7 @@ def run_cbs(robots, start_positions, goal_positions, map_dict):
     res = CBS(env).search()
     if not res:
         print("CBS failed to find a plan under current constraints.")
-        return 0.0
+        return 0.0, False
 
     solution, _nodes_expanded, _conflicts = res
     id_to_index = {r.robot_id: idx for idx, r in enumerate(robots)}
@@ -146,7 +149,7 @@ def run_cbs(robots, start_positions, goal_positions, map_dict):
         r.remaining_distance = max(0, len(schedule) - 1)
         if len(schedule) > 1:
             valid_lengths.append(len(schedule) - 1)
-    return float(np.mean(valid_lengths)) if valid_lengths else 0.0
+    return (float(np.mean(valid_lengths)) if valid_lengths else 0.0), True
 
 
 def _with_seeded_random(seed, fn, *args, **kwargs):
@@ -234,16 +237,11 @@ def build_event_schedule(
                 tid = f"T{next_task_id}"
                 next_task_id += 1
                 gen_seed = ev_rng.randint(0, 2**32 - 1)
-                if task_generation_strict:
-                    new_t = _with_seeded_random(
-                        gen_seed,
-                        G.generate_random_task_description_strict, tid, grid, set(), [],
-                    )
-                else:
-                    new_t = _with_seeded_random(
-                        gen_seed,
-                        G.generate_random_task_description, tid, grid, set(), [],
-                    )
+                # Strict-only generation; the *_generation_strict flags are vestigial.
+                new_t = _with_seeded_random(
+                    gen_seed,
+                    G.generate_random_task_description_strict, tid, grid, set(), [],
+                )
                 entry["add_tasks"].append(new_t)
                 shadow_task_ids.append(tid)
 
@@ -254,16 +252,10 @@ def build_event_schedule(
                 rid = f"R{next_robot_id}"
                 next_robot_id += 1
                 gen_seed = ev_rng.randint(0, 2**32 - 1)
-                if robot_generation_strict:
-                    new_r = _with_seeded_random(
-                        gen_seed,
-                        G.generate_random_robot_profile_strict, rid, grid, set(),
-                    )
-                else:
-                    new_r = _with_seeded_random(
-                        gen_seed,
-                        G.generate_random_robot_profile, rid, grid, set(),
-                    )
+                new_r = _with_seeded_random(
+                    gen_seed,
+                    G.generate_random_robot_profile_strict, rid, grid, set(),
+                )
                 entry["add_robots"].append(new_r)
                 shadow_robot_ids.append(rid)
 
@@ -421,6 +413,30 @@ def main_simulation(
     # cleared. Lets downstream analysis compute variable-length metrics
     # (throughput, adaptation latency) against a real completion horizon.
     all_tasks_completed_at_step = None
+
+    # Primary comparative-metric trackers.
+    # completed_per_step: one entry per elapsed timestep with # of task completions
+    #     that step. Mean = throughput; variance = burstiness.
+    # pending_event_steps: FIFO of timesteps at which a dynamic event fired without
+    #     a subsequent successful CBS resolution yet. Drained when run_cbs succeeds.
+    # adaptation_latencies: timesteps elapsed between each drained event and the
+    #     replan that resolved it.
+    completed_per_step = []
+    pending_event_steps = []
+    adaptation_latencies = []
+
+    # Full-schedule denominators. Constant across all methods in a (rep, sm) group
+    # regardless of which method terminated early. Use these as denominators when
+    # comparing across methods; use per-method total_tasks / len(robots) when you
+    # want "what this method actually experienced".
+    if event_schedule is not None:
+        full_schedule_tasks_added = sum(len(e["add_tasks"]) for e in event_schedule)
+        full_schedule_robots_added = sum(len(e["add_robots"]) for e in event_schedule)
+    else:
+        full_schedule_tasks_added = 0
+        full_schedule_robots_added = 0
+    full_schedule_tasks_spawned = total_tasks + full_schedule_tasks_added
+    full_schedule_robots_max = len(robots) + full_schedule_robots_added
     total_reassignment_time = 0.0
     total_reassignment_score = 0.0
     total_reassignments = 0
@@ -456,7 +472,7 @@ def main_simulation(
     start_positions = {r.robot_id: r.location for r in robots if r.assigned and r.current_task}
     goal_positions = {r.robot_id: r.current_task.location for r in robots if r.assigned and r.current_task}
 
-    avg_path_length = run_cbs(robots, start_positions, goal_positions, map_dict)
+    avg_path_length, _ = run_cbs(robots, start_positions, goal_positions, map_dict)
 
     # create the initial state
     previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
@@ -476,6 +492,8 @@ def main_simulation(
             suitability_method, occupied_positions, start_positions,
             goal_positions, 1.0, total_reward, total_success,
         )
+        # Per-step throughput signal (used for mean + variance at end).
+        completed_per_step.append(completed_this_step)
 
         # First moment len(tasks) hits 0: record it so variable-length
         # normalized metrics (throughput = success / completion_step) work.
@@ -506,6 +524,7 @@ def main_simulation(
                     unassigned_tasks.append(t_copy.task_id)
                     total_tasks += 1
                     events["new_tasks"] += 1
+                pending_event_steps.append(time_step)
 
             # scheduled robot arrivals
             if entry["add_robots"]:
@@ -517,15 +536,20 @@ def main_simulation(
                     occupied_positions.add(r_copy.location)
                     idle_steps.setdefault(r_copy.robot_id, 0)
                     events["new_robots"] += 1
+                pending_event_steps.append(time_step)
 
             # scheduled robot departures (targeted, id-based)
             if entry["remove_robot_ids"]:
+                departed_here = 0
                 for rid in entry["remove_robot_ids"]:
                     if remove_robot_by_id(
                         robots, tasks, unassigned_robots, unassigned_tasks,
                         rid, occupied_positions, start_positions, goal_positions,
                     ):
                         idle_steps.pop(rid, None)
+                        departed_here += 1
+                if departed_here:
+                    pending_event_steps.append(time_step)
 
             # scheduled task cancellations (targeted, id-based). Treat as a
             # completion-shaped event so the replan logic kicks in.
@@ -535,6 +559,8 @@ def main_simulation(
                     if remove_task_by_id(tasks, unassigned_tasks, tid, robots, unassigned_robots):
                         cancelled_here += 1
                 events["completed_tasks"] += cancelled_here
+                if cancelled_here:
+                    pending_event_steps.append(time_step)
         else:
             # legacy random-rate path (unchanged from prior implementation)
             if add_tasks and random.random() < task_arrival_rate:
@@ -545,6 +571,7 @@ def main_simulation(
                     grid, occupied_positions, task_generation_strict,
                 )
                 events["new_tasks"] += n
+                pending_event_steps.append(time_step)
 
             if add_robots and random.random() < robot_arrival_rate:
                 print(f"ADDING NEW ROBOTS AT TIME STEP {time_step + 1}")
@@ -556,6 +583,7 @@ def main_simulation(
                 events["new_robots"] += n
                 for r in robots:
                     idle_steps.setdefault(r.robot_id, 0)
+                pending_event_steps.append(time_step)
 
             if remove_robots and random.random() < robot_departure_rate:
                 if len(robots) > 1:
@@ -567,6 +595,8 @@ def main_simulation(
                     )
                     for removed_robot in removed:
                         idle_steps.pop(removed_robot.robot_id, None)
+                    if removed:
+                        pending_event_steps.append(time_step)
 
             if remove_tasks and random.random() < task_cancellation_rate:
                 if len(tasks) > 0:
@@ -577,6 +607,8 @@ def main_simulation(
                         robots, unassigned_robots,
                     )
                     events["completed_tasks"] += len(removed_t)
+                    if removed_t:
+                        pending_event_steps.append(time_step)
 
         # increment or reset idle steps for idle robots
         for r in robots:
@@ -699,7 +731,14 @@ def main_simulation(
         # rerun cbs if needed, update state, and clear events
         if should_replan_cbs and start_positions and goal_positions:
             print("\nRERUNNING CBS\n")
-            avg_path_length = run_cbs(robots, start_positions, goal_positions, map_dict) or avg_path_length
+            new_len, cbs_ok = run_cbs(robots, start_positions, goal_positions, map_dict)
+            avg_path_length = new_len or avg_path_length
+            if cbs_ok and pending_event_steps:
+                # Adaptation latency: elapsed timesteps from each event to this
+                # successful resolution. Drain the queue.
+                for ev_step in pending_event_steps:
+                    adaptation_latencies.append(time_step - ev_step)
+                pending_event_steps.clear()
             previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
             events = {k: 0 for k in events}
 
@@ -720,10 +759,24 @@ def main_simulation(
     all_tasks_completed_flag = all_tasks_completed_at_step is not None
     completion_step_out = all_tasks_completed_at_step if all_tasks_completed_at_step is not None else -1
 
+    # Primary comparative metrics: throughput, adaptation latency, workload variance.
+    # These are the numbers voting is *supposed* to look good on relative to
+    # optimization methods, per the todo.
+    throughput_mean = float(np.mean(completed_per_step)) if completed_per_step else 0.0
+    throughput_var = float(np.var(completed_per_step)) if completed_per_step else 0.0
+    adaptation_latency_mean = float(np.mean(adaptation_latencies)) if adaptation_latencies else 0.0
+    adaptation_latency_max = float(max(adaptation_latencies)) if adaptation_latencies else 0.0
+    task_success_counts = [r.tasks_successful for r in robots]
+    workload_variance = float(np.var(task_success_counts)) if task_success_counts else 0.0
+    workload_mean = float(np.mean(task_success_counts)) if task_success_counts else 0.0
+
     print(f"Voting: Total reward: {total_reward}, "
           f"Overall success rate: {overall_success_rate:.2%} ({total_success}/{total_tasks} spawned), "
           f"Attempted completion rate: {attempted_completion_rate:.2%} ({total_success}/{len(tasks_ever_assigned)} attempted), "
           f"All tasks completed: {all_tasks_completed_flag} (step {completion_step_out}), "
+          f"Throughput: mean={throughput_mean:.3f}/step var={throughput_var:.3f}, "
+          f"Adaptation latency: mean={adaptation_latency_mean:.2f} max={adaptation_latency_max:.0f} (over {len(adaptation_latencies)} events), "
+          f"Workload: mean={workload_mean:.2f} var={workload_variance:.3f}, "
           f"Reassignment Time: {total_reassignment_time}, "
           f"Reassignment Score: {total_reassignment_score}, total reassignments: {total_reassignments}, "
           f"Total robots: {len(robots)}")
@@ -735,6 +788,11 @@ def main_simulation(
         initial_jains_index, avg_reassignment_jains_index,
         attempted_completion_rate, len(tasks_ever_assigned), total_tasks,
         int(all_tasks_completed_flag), completion_step_out,
+        throughput_mean, throughput_var,
+        adaptation_latency_mean, adaptation_latency_max,
+        workload_variance, workload_mean,
+        # Full-schedule denominators, constant across methods in a (rep, sm) group.
+        full_schedule_tasks_spawned, full_schedule_robots_max,
     ) + avg_reassign_metrics[1:]  # skip first (Jains) - already exposed above
 
 
@@ -920,6 +978,12 @@ if __name__ == "__main__":
                 # new tail of the main_simulation return tuple.
                 'Attempted_Completion_Rate', 'Tasks_Attempted', 'Tasks_Spawned',
                 'All_Tasks_Completed', 'Completion_Step',
+                # Primary comparative metrics (throughput / adaptation latency / workload).
+                'Throughput_Mean', 'Throughput_Var',
+                'Adaptation_Latency_Mean', 'Adaptation_Latency_Max',
+                'Workload_Variance', 'Workload_Mean',
+                # Full-schedule denominators, constant across methods in a (rep, sm) group.
+                'Full_Schedule_Tasks_Spawned', 'Full_Schedule_Robots_Max',
                 'Avg_Reass_Below_GE_Frac', 'Avg_Reass_Below_Good_Frac',
                 'Avg_Reass_Deficit_All_GE', 'Avg_Reass_Deficit_Below_GE',
                 'Avg_Reass_Deficit_All_Good', 'Avg_Reass_Deficit_Below_Good',
@@ -955,21 +1019,20 @@ if __name__ == "__main__":
                                 # each other, but a robot and a task may share a cell.
                                 robot_locs = set()
                                 robots = []
-                                gen_robot = G.generate_random_robot_profile_strict if robot_generation_strict else G.generate_random_robot_profile
+                                # Strict-only generation (see todo item).
                                 for idx in range(num_robots):
-                                    r = gen_robot(f"R{idx+1}", grid, robot_locs)
+                                    r = G.generate_random_robot_profile_strict(f"R{idx+1}", grid, robot_locs)
                                     robots.append(r)
                                     robot_locs.add(r.location)
-                                robot_profiles = [r.strict_profile_name for r in robots] if robot_generation_strict else []
+                                robot_profiles = [r.strict_profile_name for r in robots]
 
                                 task_locs = set()
                                 tasks = []
-                                gen_task = G.generate_random_task_description_strict if task_generation_strict else G.generate_random_task_description
                                 for idx in range(num_tasks):
-                                    t = gen_task(f"T{idx+1}", grid, task_locs, [])
+                                    t = G.generate_random_task_description_strict(f"T{idx+1}", grid, task_locs, [])
                                     tasks.append(t)
                                     task_locs.add(t.location)
-                                task_profiles = [t.strict_profile_name for t in tasks] if task_generation_strict else []
+                                task_profiles = [t.strict_profile_name for t in tasks]
 
                                 # Pre-build one deterministic event schedule per (map, num_robots,
                                 # num_tasks, nc, sm, rep). Every method in this group replays the
