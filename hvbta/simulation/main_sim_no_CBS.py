@@ -205,7 +205,7 @@ def main_simulation(
     total_success = 0.0
     total_tasks = len(tasks)
     total_reassignment_time = 0.0
-    total_reassignment_score = 0.0
+    cumulative_reassignment_quality = 0.0
     total_reassignments = 0
     total_time_steps = max_time_steps
     reassignment_jains_indices = []  # Track per-event fairness for reassignments
@@ -456,7 +456,7 @@ def main_simulation(
                     reassignment_jains_indices.append(calculate_jains_index(reassign_per_agent_scores))
                     reassignment_fairness_metrics.append(compute_all_fairness_metrics(reassign_per_agent_scores))
             total_reassignment_time  += reassign_length
-            total_reassignment_score += reassign_score
+            cumulative_reassignment_quality += reassign_score
 
             # rebuild starts/goals after potential changes from reassignment
             for robot in robots:
@@ -504,8 +504,8 @@ def main_simulation(
             previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)  # update to the post-replan state
             events = {k: 0 for k in events}  # reset counters we just consumed
 
-    overall_success_rate = total_success / total_tasks
-    avg_reassignment_score = (total_reassignment_score / total_reassignments) if total_reassignments > 0 else 0.0
+    task_completion_fraction = total_success / total_tasks
+    avg_reassignment_score = (cumulative_reassignment_quality / total_reassignments) if total_reassignments > 0 else 0.0
     avg_reassignment_jains_index = (sum(reassignment_jains_indices) / len(reassignment_jains_indices)) if reassignment_jains_indices else 0.0
     
     # Compute average fairness metrics across reassignments
@@ -519,11 +519,11 @@ def main_simulation(
         # Default zeros if no reassignments occurred
         avg_reassign_metrics = tuple(0.0 for _ in FAIRNESS_METRIC_NAMES)
     
-    print(f"Voting: Total reward: {total_reward}, Overall success rate: {overall_success_rate:.2%}, Tasks completed: {total_success}, Reassignment Time: {total_reassignment_time}, Reassignment Score: {total_reassignment_score}, \ntotal reassignments: {total_reassignments}, total tasks: {total_tasks}, Total robots: {len(robots)}")
+    print(f"Voting: Total reward: {total_reward}, Overall success rate: {task_completion_fraction:.2%}, Tasks completed: {total_success}, Reassignment Time: {total_reassignment_time}, Reassignment Score: {cumulative_reassignment_quality}, \ntotal reassignments: {total_reassignments}, total tasks: {total_tasks}, Total robots: {len(robots)}")
     
     # Return: base metrics + initial_jains_index + avg_reassignment_jains_index + avg reassignment fairness metrics (14 additional)
-    return (total_reward, overall_success_rate, total_success, total_reassignment_time, 
-            total_reassignment_score, total_reassignments, min(total_time_steps, max_time_steps), 
+    return (total_reward, task_completion_fraction, total_success, total_reassignment_time, 
+            cumulative_reassignment_quality, total_reassignments, min(total_time_steps, max_time_steps), 
             avg_reassignment_score, avg_path_length, initial_jains_index, avg_reassignment_jains_index) + avg_reassign_metrics[1:]  # Skip first (Jains) as it's already in avg_reassignment_jains_index
 
 
@@ -696,7 +696,7 @@ if __name__ == "__main__":
                 writer.writerow([
                     'Run ID', 'Method', 'Suitability Method', 'Num Robots', 
                     'Num Tasks', 'Num Candidates', 'Total Score', 
-                    'Task Normalized Score', 'Score Density', 'Length',
+                    'Mean_Assignment_Suitability', 'Population_Coverage_Score', 'Planning_Time_us',
                     # Initial fairness metrics (15 columns from assignment_infos)
                     'Init_Jains_Index', 'Init_Below_GE_Frac', 'Init_Below_Good_Frac',
                     'Init_Deficit_All_GE', 'Init_Deficit_Below_GE',
@@ -706,8 +706,8 @@ if __name__ == "__main__":
                     'Init_Median', 'Init_Mean',
                     'Init_Med_Mean_Gap', 'Init_IQR',
                     # Output from simulation
-                    'total_reward', 'overall_success_rate', 'total_success', 
-                    'total_reassignment_time', 'total_reassignment_score', 
+                    'total_reward', 'Task_Completion_Fraction', 'total_success',
+                    'total_reassignment_time', 'Cumulative_Reassignment_Quality',
                     'total_reassignments', 'Total Time Steps', 'Average Reassignment Score',
                     'Average Path Length', 'Initial Jains Index (sim)', 'Avg Reassignment Jains Index',
                     # Additional fairness metrics (14 columns for avg reassignment, excluding Jains which is above)
@@ -805,9 +805,9 @@ if __name__ == "__main__":
                                             initial_metrics = compute_all_fairness_metrics(per_agent_scores)
                                             initial_jains = initial_metrics[0]
                                             assigned_count = len(output[0]) if output and output[0] else 0
-                                            task_normalized_score = (score / assigned_count) if assigned_count > 0 else 0.0
-                                            score_density = (score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and score > 0 else 0.0
-                                            assignment_infos.append([Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, task_normalized_score, score_density, length] + list(initial_metrics))
+                                            mean_assignment_suitability = (score / assigned_count) if assigned_count > 0 else 0.0
+                                            population_coverage_score = (score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and score > 0 else 0.0
+                                            assignment_infos.append([Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, mean_assignment_suitability, population_coverage_score, length] + list(initial_metrics))
                                             voting_outputs.append((output, initial_jains))
                                         
                                         # Optimization - random fallback
@@ -815,33 +815,33 @@ if __name__ == "__main__":
                                         cbba_initial_metrics = compute_all_fairness_metrics(cbba_per_agent_scores)
                                         cbba_initial_jains = cbba_initial_metrics[0]
                                         assigned_count = len(cbba_output[0]) if cbba_output and cbba_output[0] else 0 # nuber of pairs in the chosen assignment
-                                        task_normalized_score = (cbba_score / assigned_count) if assigned_count > 0 else 0.0
-                                        score_density = (cbba_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and cbba_score > 0 else 0.0
-                                        assignment_infos.append([Run_ID, "cbba_task_allocation", sm_name, num_robots, num_tasks, nc, cbba_score, task_normalized_score, score_density, cbba_length] + list(cbba_initial_metrics))
+                                        mean_assignment_suitability = (cbba_score / assigned_count) if assigned_count > 0 else 0.0
+                                        population_coverage_score = (cbba_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and cbba_score > 0 else 0.0
+                                        assignment_infos.append([Run_ID, "cbba_task_allocation", sm_name, num_robots, num_tasks, nc, cbba_score, mean_assignment_suitability, population_coverage_score, cbba_length] + list(cbba_initial_metrics))
 
                                         ssia_output, ssia_score, ssia_length, ssia_per_agent_scores = O.assign_tasks_with_method_randomly(O.ssia_task_allocation, suitability_matrix, nc)
                                         ssia_initial_metrics = compute_all_fairness_metrics(ssia_per_agent_scores)
                                         ssia_initial_jains = ssia_initial_metrics[0]
                                         assigned_count = len(ssia_output[0]) if ssia_output and ssia_output[0] else 0
-                                        task_normalized_score = (ssia_score / assigned_count) if assigned_count > 0 else 0.0
-                                        score_density = (ssia_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and ssia_score > 0 else 0.0
-                                        assignment_infos.append([Run_ID, "ssia_task_allocation", sm_name, num_robots, num_tasks, nc, ssia_score, task_normalized_score, score_density, ssia_length] + list(ssia_initial_metrics))
+                                        mean_assignment_suitability = (ssia_score / assigned_count) if assigned_count > 0 else 0.0
+                                        population_coverage_score = (ssia_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and ssia_score > 0 else 0.0
+                                        assignment_infos.append([Run_ID, "ssia_task_allocation", sm_name, num_robots, num_tasks, nc, ssia_score, mean_assignment_suitability, population_coverage_score, ssia_length] + list(ssia_initial_metrics))
 
                                         ilp_output, ilp_score, ilp_length, ilp_per_agent_scores = O.assign_tasks_with_method_randomly(O.ilp_task_allocation, suitability_matrix, nc)
                                         ilp_initial_metrics = compute_all_fairness_metrics(ilp_per_agent_scores)
                                         ilp_initial_jains = ilp_initial_metrics[0]
                                         assigned_count = len(ilp_output[0]) if ilp_output and ilp_output[0] else 0
-                                        task_normalized_score = (ilp_score / assigned_count) if assigned_count > 0 else 0.0
-                                        score_density = (ilp_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and ilp_score > 0 else 0.0
-                                        assignment_infos.append([Run_ID, "ilp_task_allocation", sm_name, num_robots, num_tasks, nc, ilp_score, task_normalized_score, score_density, ilp_length] + list(ilp_initial_metrics))
+                                        mean_assignment_suitability = (ilp_score / assigned_count) if assigned_count > 0 else 0.0
+                                        population_coverage_score = (ilp_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and ilp_score > 0 else 0.0
+                                        assignment_infos.append([Run_ID, "ilp_task_allocation", sm_name, num_robots, num_tasks, nc, ilp_score, mean_assignment_suitability, population_coverage_score, ilp_length] + list(ilp_initial_metrics))
 
                                         jv_output, jv_score, jv_length, jv_per_agent_scores = O.assign_tasks_with_method_randomly(O.jv_task_allocation, suitability_matrix, nc)
                                         jv_initial_metrics = compute_all_fairness_metrics(jv_per_agent_scores)
                                         jv_initial_jains = jv_initial_metrics[0]
                                         assigned_count = len(jv_output[0]) if jv_output and jv_output[0] else 0
-                                        task_normalized_score = (jv_score / assigned_count) if assigned_count > 0 else 0.0
-                                        score_density = (jv_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and jv_score > 0 else 0.0
-                                        assignment_infos.append([Run_ID, "jv_task_allocation", sm_name, num_robots, num_tasks, nc, jv_score, task_normalized_score, score_density, jv_length] + list(jv_initial_metrics))
+                                        mean_assignment_suitability = (jv_score / assigned_count) if assigned_count > 0 else 0.0
+                                        population_coverage_score = (jv_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and jv_score > 0 else 0.0
+                                        assignment_infos.append([Run_ID, "jv_task_allocation", sm_name, num_robots, num_tasks, nc, jv_score, mean_assignment_suitability, population_coverage_score, jv_length] + list(jv_initial_metrics))
 
                                         outputs = voting_outputs + [(cbba_output, cbba_initial_jains), (ssia_output, ssia_initial_jains), (ilp_output, ilp_initial_jains), (jv_output, jv_initial_jains)]
 
@@ -852,9 +852,9 @@ if __name__ == "__main__":
                                             initial_metrics = compute_all_fairness_metrics(per_agent_scores)
                                             initial_jains = initial_metrics[0]
                                             assigned_count = len(output[0]) if output and output[0] else 0 # nuber of pairs in the chosen assignment
-                                            task_normalized_score = (score / assigned_count) if assigned_count > 0 else 0.0 # per assigned task normalized score
-                                            score_density = (score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and score > 0 else 0.0
-                                            assignment_infos.append([Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, task_normalized_score, score_density, length] + list(initial_metrics))
+                                            mean_assignment_suitability = (score / assigned_count) if assigned_count > 0 else 0.0 # per assigned task normalized score
+                                            population_coverage_score = (score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and score > 0 else 0.0
+                                            assignment_infos.append([Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, mean_assignment_suitability, population_coverage_score, length] + list(initial_metrics))
                                             voting_outputs.append((output, initial_jains))
 
                                         # Optimization - normal
@@ -862,33 +862,33 @@ if __name__ == "__main__":
                                         cbba_initial_metrics = compute_all_fairness_metrics(cbba_per_agent_scores)
                                         cbba_initial_jains = cbba_initial_metrics[0]
                                         assigned_count = len(cbba_output[0]) if cbba_output and cbba_output[0] else 0 # nuber of pairs in the chosen assignment
-                                        task_normalized_score = (cbba_score / assigned_count) if assigned_count > 0 else 0.0
-                                        score_density = (cbba_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and cbba_score > 0 else 0.0
-                                        assignment_infos.append([Run_ID, "cbba_task_allocation", sm_name, num_robots, num_tasks, nc, cbba_score, task_normalized_score, score_density, cbba_length] + list(cbba_initial_metrics))
+                                        mean_assignment_suitability = (cbba_score / assigned_count) if assigned_count > 0 else 0.0
+                                        population_coverage_score = (cbba_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and cbba_score > 0 else 0.0
+                                        assignment_infos.append([Run_ID, "cbba_task_allocation", sm_name, num_robots, num_tasks, nc, cbba_score, mean_assignment_suitability, population_coverage_score, cbba_length] + list(cbba_initial_metrics))
 
                                         ssia_output, ssia_score, ssia_length, ssia_per_agent_scores = O.assign_tasks_with_method(O.ssia_task_allocation,suitability_matrix)
                                         ssia_initial_metrics = compute_all_fairness_metrics(ssia_per_agent_scores)
                                         ssia_initial_jains = ssia_initial_metrics[0]
                                         assigned_count = len(ssia_output[0]) if ssia_output and ssia_output[0] else 0
-                                        task_normalized_score = (ssia_score / assigned_count) if assigned_count > 0 else 0.0
-                                        score_density = (ssia_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and ssia_score > 0 else 0.0
-                                        assignment_infos.append([Run_ID, "ssia_task_allocation", sm_name, num_robots, num_tasks, nc, ssia_score, task_normalized_score, score_density, ssia_length] + list(ssia_initial_metrics))
+                                        mean_assignment_suitability = (ssia_score / assigned_count) if assigned_count > 0 else 0.0
+                                        population_coverage_score = (ssia_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and ssia_score > 0 else 0.0
+                                        assignment_infos.append([Run_ID, "ssia_task_allocation", sm_name, num_robots, num_tasks, nc, ssia_score, mean_assignment_suitability, population_coverage_score, ssia_length] + list(ssia_initial_metrics))
 
                                         ilp_output, ilp_score, ilp_length, ilp_per_agent_scores = O.assign_tasks_with_method(O.ilp_task_allocation,suitability_matrix)
                                         ilp_initial_metrics = compute_all_fairness_metrics(ilp_per_agent_scores)
                                         ilp_initial_jains = ilp_initial_metrics[0]
                                         assigned_count = len(ilp_output[0]) if ilp_output and ilp_output[0] else 0
-                                        task_normalized_score = (ilp_score / assigned_count) if assigned_count > 0 else 0.0
-                                        score_density = (ilp_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and ilp_score > 0 else 0.0
-                                        assignment_infos.append([Run_ID, "ilp_task_allocation", sm_name, num_robots, num_tasks, nc, ilp_score, task_normalized_score, score_density, ilp_length] + list(ilp_initial_metrics))
+                                        mean_assignment_suitability = (ilp_score / assigned_count) if assigned_count > 0 else 0.0
+                                        population_coverage_score = (ilp_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and ilp_score > 0 else 0.0
+                                        assignment_infos.append([Run_ID, "ilp_task_allocation", sm_name, num_robots, num_tasks, nc, ilp_score, mean_assignment_suitability, population_coverage_score, ilp_length] + list(ilp_initial_metrics))
 
                                         jv_output, jv_score, jv_length, jv_per_agent_scores = O.assign_tasks_with_method(O.jv_task_allocation,suitability_matrix)
                                         jv_initial_metrics = compute_all_fairness_metrics(jv_per_agent_scores)
                                         jv_initial_jains = jv_initial_metrics[0]
                                         assigned_count = len(jv_output[0]) if jv_output and jv_output[0] else 0
-                                        task_normalized_score = (jv_score / assigned_count) if assigned_count > 0 else 0.0
-                                        score_density = (jv_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and jv_score > 0 else 0.0
-                                        assignment_infos.append([Run_ID, "jv_task_allocation", sm_name, num_robots, num_tasks, nc, jv_score, task_normalized_score, score_density, jv_length] + list(jv_initial_metrics))
+                                        mean_assignment_suitability = (jv_score / assigned_count) if assigned_count > 0 else 0.0
+                                        population_coverage_score = (jv_score / (num_robots * num_tasks)) if (num_robots * num_tasks) > 0 and jv_score > 0 else 0.0
+                                        assignment_infos.append([Run_ID, "jv_task_allocation", sm_name, num_robots, num_tasks, nc, jv_score, mean_assignment_suitability, population_coverage_score, jv_length] + list(jv_initial_metrics))
 
                                         outputs = voting_outputs + [(cbba_output, cbba_initial_jains), (ssia_output, ssia_initial_jains), (ilp_output, ilp_initial_jains), (jv_output, jv_initial_jains)]
 
