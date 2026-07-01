@@ -417,6 +417,16 @@ def main_simulation(
     completed_per_step = []
     pending_event_steps = []
     adaptation_latencies = []
+    # Urgency accounting. At each replan tick we record:
+    #   percentage_urgent_per_replan: fraction of currently-unassigned tasks
+    #     whose priority_level == "urgent". Cross-run comparable in [0, 1].
+    #   robot_pressure_per_replan:    1 if the "add robots" event fired in the
+    #     same tick as this replan, else 0. Cross-run comparable in [0, 1] when
+    #     averaged.
+    # Report mean + max of each at run end so runs can be bucketed by
+    # ("none urgent, no pressure") ... ("all urgent, high pressure").
+    percentage_urgent_per_replan = []
+    robot_pressure_per_replan = []
 
     # Full-schedule denominators. Constant across all methods in a (rep, sm) group
     # regardless of which method terminated early. Use these as denominators when
@@ -639,6 +649,20 @@ def main_simulation(
             should_replan_cbs = True
 
         if should_replan:
+            # ---- urgency + pressure snapshot for this replan ----
+            # Compute once so voting/optimization/direct-LLM all see the same
+            # numbers and downstream analysis can bucket runs by these dimensions.
+            unassigned_task_objs = [t for t in tasks if not t.assigned]
+            num_unassigned = len(unassigned_task_objs)
+            num_urgent = sum(
+                1 for t in unassigned_task_objs
+                if getattr(t, "priority_level", "medium") == "urgent"
+            )
+            percentage_urgent = (num_urgent / num_unassigned) if num_unassigned else 0.0
+            robot_pressure = 1.0 if events["new_robots"] > 0 else 0.0
+            percentage_urgent_per_replan.append(percentage_urgent)
+            robot_pressure_per_replan.append(robot_pressure)
+
             # determine what to pass to the reassignment functions
             if getattr(suitability_method, "_is_llm_batch", False):
                 current_robot_ids = {r.robot_id for r in robots}
@@ -667,11 +691,20 @@ def main_simulation(
 
             # assign with voting
             if voting_method in voting_methods:
-                print(f"REASSIGNING WITH VOTING METHOD: {voting_method_name}")
+                # Anytime pressure: any urgent unassigned task or a new-robot
+                # event this tick triggers a tight budget so voting bails on
+                # the first good-enough candidate.
+                urgent_pressure = (percentage_urgent > 0.0) or (robot_pressure > 0.0) # here I c
+                voting_budget_ms = 20.0 if urgent_pressure else None
+                voting_score_threshold = 0.7 if urgent_pressure else None
+                print(f"REASSIGNING WITH VOTING METHOD: {voting_method_name}"
+                      f"{f' (URGENT: pct_urgent={percentage_urgent:.0%}, robot_pressure={int(robot_pressure)}, 20ms budget, 0.7 threshold)' if urgent_pressure else ''}")
                 total_reassignments += 1
                 _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = V.reassign_robots_to_tasks(
                     robots, tasks, num_candidates, voting_method, suitability_source,
                     unassigned_robots, unassigned_tasks, start_positions, goal_positions, HYPOTENUSE,
+                    time_budget_ms=voting_budget_ms,
+                    score_threshold=voting_score_threshold,
                 )
                 if reassign_per_agent_scores:
                     reassignment_jains_indices.append(calculate_jains_index(reassign_per_agent_scores))
@@ -757,6 +790,14 @@ def main_simulation(
     adaptation_latency_max = float(max(adaptation_latencies)) if adaptation_latencies else 0.0
     task_success_counts = [r.tasks_successful for r in robots]
     workload_variance = float(np.var(task_success_counts)) if task_success_counts else 0.0
+    # Urgency + pressure summaries. Bucketing key for downstream analysis:
+    #   "none urgent, no pressure"    -> Percentage_Urgent_Mean == 0 AND Robot_Pressure_Fraction == 0
+    #   "some urgent, no pressure"    -> Percentage_Urgent_Mean > 0  AND Robot_Pressure_Fraction == 0
+    #   "none urgent, some pressure"  -> Percentage_Urgent_Mean == 0 AND Robot_Pressure_Fraction > 0
+    #   "all urgent, high pressure"   -> Percentage_Urgent_Mean == 1 AND Robot_Pressure_Fraction > 0
+    percentage_urgent_mean = float(np.mean(percentage_urgent_per_replan)) if percentage_urgent_per_replan else 0.0
+    percentage_urgent_max = float(max(percentage_urgent_per_replan)) if percentage_urgent_per_replan else 0.0
+    robot_pressure_fraction = float(np.mean(robot_pressure_per_replan)) if robot_pressure_per_replan else 0.0
 
     print(f"Voting: "
           f"Task completion fraction: {task_completion_fraction:.2%} ({total_success}/{total_tasks} spawned), "
@@ -765,6 +806,8 @@ def main_simulation(
           f"Throughput: mean={throughput_mean:.3f}/step var={throughput_var:.3f}, "
           f"Adaptation latency: mean={adaptation_latency_mean:.2f} max={adaptation_latency_max:.0f} (over {len(adaptation_latencies)} events), "
           f"Workload variance: {workload_variance:.3f}, "
+          f"Urgency mean={percentage_urgent_mean:.2%} max={percentage_urgent_max:.2%}, "
+          f"Robot-pressure fraction={robot_pressure_fraction:.2%}, "
           f"Reassignment Time: {total_reassignment_time}, "
           f"Reassignment quality: {cumulative_reassignment_quality}, reassignments: {total_reassignments}, "
           f"Robots: {len(robots)}")
@@ -784,6 +827,8 @@ def main_simulation(
         workload_variance,
         # Section 7 - full-schedule denominators, constant across methods in a (rep, sm) group.
         full_schedule_tasks_spawned, full_schedule_robots_max,
+        # Section 8 - urgency + pressure summaries.
+        percentage_urgent_mean, percentage_urgent_max, robot_pressure_fraction,
     ) + avg_reassign_metrics[1:]  # skip first (Jains) - already exposed above
 
 
@@ -964,6 +1009,8 @@ if __name__ == "__main__":
                 'Workload_Variance',
                 # Full-schedule denominators, constant across methods in a (rep, sm) group.
                 'Full_Schedule_Tasks_Spawned', 'Full_Schedule_Robots_Max',
+                # Urgency + pressure bucketing keys.
+                'Percentage_Urgent_Mean', 'Percentage_Urgent_Max', 'Robot_Pressure_Fraction',
                 # Reassignment fairness (trimmed to 3 canonical values; Jains already exposed above)
                 'Avg_Reass_Gini', 'Avg_Reass_Median', 'Avg_Reass_IQR',
                 # Overhead + config

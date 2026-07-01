@@ -258,44 +258,67 @@ def rank_assignments_condorcet_method(assignments: List[List[Tuple[int, int]]], 
     return pairwise_wins, ranked_assignments
 
 def assign_tasks_with_voting(
-        robots: List[CapabilityProfile], 
-        tasks: List[TaskDescription], 
-        suitability_matrix: np.ndarray, 
-        num_candidates: int, 
-        voting_method: Callable
+        robots: List[CapabilityProfile],
+        tasks: List[TaskDescription],
+        suitability_matrix: np.ndarray,
+        num_candidates: int,
+        voting_method: Callable,
+        score_threshold: float = None,
+        time_budget_ms: float = None,
         ) -> Tuple[Tuple[List[Tuple[int, int]], List[int], List[int]], float, float, List[float]]:
     """
     Assigns tasks to robots using random assignment and ranks the assignments using the specified voting method.
-    
+
     Parameters:
         robots: List of robot profiles.
         tasks: List of task descriptions.
         suitability_matrix: A 2D numpy array with suitability scores for each robot-task pair.
-        num_candidates: Number of candidate assignments to generate.
+        num_candidates: Upper bound on candidate assignments to generate.
         voting_method: The name of the voting function.
-    
+        score_threshold: If not None, a float in [0, 1]. Stop generating
+            candidates once one has mean-per-pair suitability >= this value.
+            Because every suitability path clamps to [0, 1], threshold=0.7
+            means "candidate averages 0.7 suitability per pair" and is
+            tunable across runs regardless of num_pairs.
+        time_budget_ms: If not None, stop generating candidates once wall-clock
+            elapsed (from function entry) reaches this many milliseconds.
+        When both are None, behavior matches the previous full-pool version.
+
     Returns:
         (best_assignment, best_score, length, per_agent_scores): The best assignment, its suitability score, and the time taken for the voting process.
     """
     num_robots = len(robots)
     num_tasks = len(tasks)
-    
-    random_assignments = generate_random_assignments(num_robots, num_tasks, num_candidates)
-    # def map_with_jv(S_mat):
-    #     pairs = jv_task_allocation(S_mat)  # adjust to match your JV return
-    #     return pairs
 
-    # candidate_assignments = generate_candidates_perturb_and_map(
-    #     S=suitability_matrix,
-    #     K=num_candidates,
-    #     solve_fn=map_with_jv,
-    #     noise="gumbel",
-    #     scale=0.10,
-    #     anneal=True,
-    #     seed=None
-    # )
-    
     start = time.perf_counter_ns()
+
+    # Anytime candidate accumulation. Generate one at a time so we can bail on
+    # either budget. If neither is provided, this loops num_candidates times
+    # identically to the old batch-generate behavior.
+    random_assignments = []
+    for _ in range(num_candidates):
+        one = generate_random_assignments(num_robots, num_tasks, 1)[0]
+        random_assignments.append(one)
+
+        if score_threshold is not None:
+            # Cheap per-candidate score = mean-per-pair suitability across
+            # every pair in the candidate (zeros pull it down, penalizing
+            # candidates with many unusable assignments). Because per-pair
+            # suitability is clamped to [0, 1] at every scorer, this mean is
+            # in [0, 1] too - a threshold of 0.7 means "candidate averages
+            # 0.7 suitability per pair" and is tunable across runs.
+            pairs = one[0]
+            if pairs:
+                candidate_score = sum(suitability_matrix[r][t] for r, t in pairs) / len(pairs)
+            else:
+                candidate_score = 0.0
+            if candidate_score >= score_threshold:
+                break
+        if time_budget_ms is not None:
+            if (time.perf_counter_ns() - start) / 1e6 >= time_budget_ms:
+                break
+
+    # Run the voting rule on whatever pool we accumulated (>= 1 candidate).
     total_scores, assignment_ranking = voting_method(random_assignments, suitability_matrix)
     end = time.perf_counter_ns()
     length = (end - start) / 1000.0
@@ -304,7 +327,7 @@ def assign_tasks_with_voting(
     # check for zero suitability in the best assignment and move to the next best if so
     while(check_zero_suitability(random_assignments[assignment_ranking[best_ranking]][0], suitability_matrix) and best_ranking < len(assignment_ranking)-1):
         best_ranking += 1
-    if best_ranking == num_candidates-1:
+    if best_ranking == len(random_assignments) - 1:
         best_ranking = 0
 
     best_assignment = random_assignments[assignment_ranking[best_ranking]]
@@ -423,17 +446,19 @@ def assign_tasks_randomly(
     return filtered_best_assignments, total_scores, length, per_agent_scores
 
 def reassign_robots_to_tasks(
-        robots: List[CapabilityProfile], 
-        tasks: List[TaskDescription], 
-        num_candidates: int, 
-        voting_method: Callable, 
+        robots: List[CapabilityProfile],
+        tasks: List[TaskDescription],
+        num_candidates: int,
+        voting_method: Callable,
         suitability_source,  # Can be Callable (scorer) OR tuple (matrix, r_idx, t_idx) for LLM
-        unassigned_robots: List[str], 
-        unassigned_tasks: List[str], 
-        start_positions: dict, 
+        unassigned_robots: List[str],
+        unassigned_tasks: List[str],
+        start_positions: dict,
         goal_positions: dict,
         map_size: int,
-        inertia_threshold: float = 0.1):
+        inertia_threshold: float = 0.1,
+        score_threshold: float = None,
+        time_budget_ms: float = None):
     """
     Reassigns unassigned robots to unassigned tasks using a voting method.
     Parameters:
@@ -480,7 +505,8 @@ def reassign_robots_to_tasks(
         output, score, length, per_agent_scores = reassign_robots_to_tasks_randomly(robots, tasks, num_candidates, unassigned_robots, unassigned_tasks)
     else:
         output, score, length, per_agent_scores = assign_tasks_with_voting(
-            urobots, utasks, suitability_matrix, num_candidates, voting_method)
+            urobots, utasks, suitability_matrix, num_candidates, voting_method,
+            score_threshold=score_threshold, time_budget_ms=time_budget_ms)
 
     # this assigned_pairs only contains the unassigned robots and tasks, I may have to pass in the actual assigned_pairs to update it
     assigned_pairs = output[0] # list of tuples
