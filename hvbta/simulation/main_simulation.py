@@ -22,7 +22,10 @@ from hvbta.metrics import (
     calculate_robustness_metrics,
 )
 from hvbta.pathfinding.CBS import load_map, create_obstacle_list, build_cbs_agents
-from hvbta.allocators.misc_assignment import add_new_tasks, add_new_robots, remove_random_robots, remove_random_tasks
+from hvbta.allocators.misc_assignment import (
+    add_new_tasks, add_new_robots, remove_random_robots, remove_random_tasks,
+    remove_task_by_id, remove_robot_by_id,
+)
 from hvbta.models import CapabilityProfile, TaskDescription
 
 
@@ -146,6 +149,148 @@ def run_cbs(robots, start_positions, goal_positions, map_dict):
     return float(np.mean(valid_lengths)) if valid_lengths else 0.0
 
 
+def _with_seeded_random(seed, fn, *args, **kwargs):
+    """
+    Call `fn` with the module-level `random` RNG deterministically seeded, then
+    restore the previous RNG state. Used by build_event_schedule so generation
+    functions (which use module `random`) produce identical entities across
+    every method's replay.
+    """
+    saved = random.getstate()
+    random.seed(seed)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        random.setstate(saved)
+
+
+def build_event_schedule(
+        initial_robots: List[CapabilityProfile],
+        initial_tasks: List[TaskDescription],
+        grid: List[List[int]],
+        max_time_steps: int,
+        *,
+        add_tasks: bool = False,
+        add_robots: bool = False,
+        remove_robots_flag: bool = False,
+        remove_tasks_flag: bool = False,
+        task_arrival_rate: float = 0.0,
+        robot_arrival_rate: float = 0.0,
+        robot_departure_rate: float = 0.0,
+        task_cancellation_rate: float = 0.0,
+        tasks_to_add: int = 1,
+        robots_to_add: int = 1,
+        robots_to_remove: int = 1,
+        tasks_to_remove: int = 1,
+        robot_generation_strict: bool = True,
+        task_generation_strict: bool = True,
+        seed: int = 0) -> list:
+    """
+    Pre-materialize a deterministic per-timestep event script that every method
+    in a (rep, sm) group replays identically.
+
+    Each entry is a dict with pre-built entity objects for additions and IDs
+    for removals:
+        {
+            "add_tasks":       [TaskDescription, ...],
+            "add_robots":      [CapabilityProfile, ...],
+            "remove_task_ids":  [str, ...],
+            "remove_robot_ids": [str, ...],
+        }
+
+    Fairness properties:
+      - Two methods pointed at the same schedule see identical events at
+        identical timesteps with identical entity capabilities/task_types.
+      - A method that terminates early (all tasks completed, or hits max_time_steps)
+        simply consumes a prefix of the schedule.
+      - Removal targets are picked from a shadow "alive" list at schedule-build
+        time. If a scheduled removal references an entity that method X has already
+        completed / lost, replay no-ops for that method - the method just got there
+        faster.
+
+    Locations for added entities are picked at build time with an empty occupied
+    set. At replay time a fresh copy of each entity is inserted; minor location
+    conflicts are tolerated because runtime add_new_* was already permissive.
+    """
+    ev_rng = random.Random(seed)
+    shadow_robot_ids = [r.robot_id for r in initial_robots]
+    shadow_task_ids = [t.task_id for t in initial_tasks]
+    next_robot_id = len(initial_robots) + 1
+    next_task_id = len(initial_tasks) + 1
+
+    schedule = []
+    for _t in range(max_time_steps):
+        entry = {
+            "add_tasks": [],
+            "add_robots": [],
+            "remove_task_ids": [],
+            "remove_robot_ids": [],
+        }
+
+        # task arrivals
+        if add_tasks and ev_rng.random() < task_arrival_rate:
+            n = ev_rng.randint(1, max(1, tasks_to_add))
+            for _ in range(n):
+                tid = f"T{next_task_id}"
+                next_task_id += 1
+                gen_seed = ev_rng.randint(0, 2**32 - 1)
+                if task_generation_strict:
+                    new_t = _with_seeded_random(
+                        gen_seed,
+                        G.generate_random_task_description_strict, tid, grid, set(), [],
+                    )
+                else:
+                    new_t = _with_seeded_random(
+                        gen_seed,
+                        G.generate_random_task_description, tid, grid, set(), [],
+                    )
+                entry["add_tasks"].append(new_t)
+                shadow_task_ids.append(tid)
+
+        # robot arrivals
+        if add_robots and ev_rng.random() < robot_arrival_rate:
+            n = ev_rng.randint(1, max(1, robots_to_add))
+            for _ in range(n):
+                rid = f"R{next_robot_id}"
+                next_robot_id += 1
+                gen_seed = ev_rng.randint(0, 2**32 - 1)
+                if robot_generation_strict:
+                    new_r = _with_seeded_random(
+                        gen_seed,
+                        G.generate_random_robot_profile_strict, rid, grid, set(),
+                    )
+                else:
+                    new_r = _with_seeded_random(
+                        gen_seed,
+                        G.generate_random_robot_profile, rid, grid, set(),
+                    )
+                entry["add_robots"].append(new_r)
+                shadow_robot_ids.append(rid)
+
+        # robot departures - pick from currently-alive shadow list
+        if remove_robots_flag and ev_rng.random() < robot_departure_rate:
+            n = ev_rng.randint(1, max(1, robots_to_remove))
+            if len(shadow_robot_ids) > 1:
+                n = min(n, len(shadow_robot_ids) - 1)  # never drain to zero
+                victims = ev_rng.sample(shadow_robot_ids, n)
+                entry["remove_robot_ids"].extend(victims)
+                for v in victims:
+                    shadow_robot_ids.remove(v)
+
+        # task cancellations
+        if remove_tasks_flag and ev_rng.random() < task_cancellation_rate:
+            n = ev_rng.randint(1, max(1, tasks_to_remove))
+            if shadow_task_ids:
+                n = min(n, len(shadow_task_ids))
+                victims = ev_rng.sample(shadow_task_ids, n)
+                entry["remove_task_ids"].extend(victims)
+                for v in victims:
+                    shadow_task_ids.remove(v)
+
+        schedule.append(entry)
+    return schedule
+
+
 def reassign_robots_to_tasks_direct(
         robots: List[CapabilityProfile],
         tasks: List[TaskDescription],
@@ -240,7 +385,11 @@ def main_simulation(
         robot_departure_rate: float = 0.02,
         task_cancellation_rate: float = 0.02,
         remove_tasks: bool = False,
-        tasks_to_remove: int = 1):
+        tasks_to_remove: int = 1,
+        # When provided, dynamic events are replayed from this schedule instead of
+        # drawn from the random-rate gates. Enables fair cross-method comparison
+        # within a (rep, sm) group.
+        event_schedule: list = None):
     print(f"SUITABILITY METHOD: {suitability_method}")
 
     voting_methods = {
@@ -268,6 +417,10 @@ def main_simulation(
     # attempted_completion_rate, which excludes late-arriving tasks that never
     # got a chance to be attempted before max_time_steps.
     tasks_ever_assigned = set()
+    # Records the timestep at which len(tasks) first hit 0. None if never fully
+    # cleared. Lets downstream analysis compute variable-length metrics
+    # (throughput, adaptation latency) against a real completion horizon.
+    all_tasks_completed_at_step = None
     total_reassignment_time = 0.0
     total_reassignment_score = 0.0
     total_reassignments = 0
@@ -324,64 +477,106 @@ def main_simulation(
             goal_positions, 1.0, total_reward, total_success,
         )
 
-        # check if no tasks are left
-        if len(tasks) == 0:
-            print(f"All tasks completed in {time_step + 1} time steps!")
+        # First moment len(tasks) hits 0: record it so variable-length
+        # normalized metrics (throughput = success / completion_step) work.
+        if len(tasks) == 0 and all_tasks_completed_at_step is None:
+            all_tasks_completed_at_step = time_step + 1
+            print(f"All tasks completed at time step {time_step + 1}!")
             total_time_steps = time_step + 1
-            break
+            break  # variable-length exit; comment out to run full horizon
 
         # update events with any completed tasks this timestep
         events["completed_tasks"] += completed_this_step
         # set the replan_cbs flag
         should_replan_cbs = completed_this_step > 0
 
-        # Lifelong dynamic events: each channel fires with per-timestep probability.
-        # add tasks
-        if add_tasks and random.random() < task_arrival_rate:
-            print(f"ADDING NEW TASKS AT TIME STEP {time_step + 1}")
-            n = random.randint(1, max(1, tasks_to_add))
-            task_max_id, total_tasks = add_new_tasks(
-                tasks, unassigned_tasks, task_max_id, n, total_tasks,
-                grid, occupied_positions, task_generation_strict,
-            )
-            events["new_tasks"] += n
+        # Dynamic events. When an event_schedule is supplied, replay it
+        # deterministically so every method in a (rep, sm) group sees the same
+        # arrivals/departures at the same timesteps. Otherwise fall back to
+        # the legacy random-rate gates.
+        if event_schedule is not None and time_step < len(event_schedule):
+            entry = event_schedule[time_step]
 
-        # add robots
-        if add_robots and random.random() < robot_arrival_rate:
-            print(f"ADDING NEW ROBOTS AT TIME STEP {time_step + 1}")
-            n = random.randint(1, max(1, robots_to_add))
-            robot_max_id = add_new_robots(
-                robots, unassigned_robots, robot_max_id, n,
-                grid, occupied_positions, robot_generation_strict,
-            )
-            events["new_robots"] += n
-            for r in robots:
-                idle_steps.setdefault(r.robot_id, 0)
+            # scheduled task arrivals
+            if entry["add_tasks"]:
+                print(f"ADDING NEW TASKS AT TIME STEP {time_step + 1} (scheduled)")
+                for new_t in entry["add_tasks"]:
+                    t_copy = copy.deepcopy(new_t)
+                    tasks.append(t_copy)
+                    unassigned_tasks.append(t_copy.task_id)
+                    total_tasks += 1
+                    events["new_tasks"] += 1
 
-        # remove robots
-        if remove_robots and random.random() < robot_departure_rate:
-            if len(robots) > 1:
-                print(f"REMOVING RANDOM ROBOTS AT TIME STEP {time_step + 1}")
-                removed = remove_random_robots(
-                    robots, tasks, unassigned_robots, unassigned_tasks,
-                    random.randint(1, max(1, robots_to_remove)),
-                    occupied_positions, start_positions, goal_positions,
+            # scheduled robot arrivals
+            if entry["add_robots"]:
+                print(f"ADDING NEW ROBOTS AT TIME STEP {time_step + 1} (scheduled)")
+                for new_r in entry["add_robots"]:
+                    r_copy = copy.deepcopy(new_r)
+                    robots.append(r_copy)
+                    unassigned_robots.append(r_copy.robot_id)
+                    occupied_positions.add(r_copy.location)
+                    idle_steps.setdefault(r_copy.robot_id, 0)
+                    events["new_robots"] += 1
+
+            # scheduled robot departures (targeted, id-based)
+            if entry["remove_robot_ids"]:
+                for rid in entry["remove_robot_ids"]:
+                    if remove_robot_by_id(
+                        robots, tasks, unassigned_robots, unassigned_tasks,
+                        rid, occupied_positions, start_positions, goal_positions,
+                    ):
+                        idle_steps.pop(rid, None)
+
+            # scheduled task cancellations (targeted, id-based). Treat as a
+            # completion-shaped event so the replan logic kicks in.
+            if entry["remove_task_ids"]:
+                cancelled_here = 0
+                for tid in entry["remove_task_ids"]:
+                    if remove_task_by_id(tasks, unassigned_tasks, tid, robots, unassigned_robots):
+                        cancelled_here += 1
+                events["completed_tasks"] += cancelled_here
+        else:
+            # legacy random-rate path (unchanged from prior implementation)
+            if add_tasks and random.random() < task_arrival_rate:
+                print(f"ADDING NEW TASKS AT TIME STEP {time_step + 1}")
+                n = random.randint(1, max(1, tasks_to_add))
+                task_max_id, total_tasks = add_new_tasks(
+                    tasks, unassigned_tasks, task_max_id, n, total_tasks,
+                    grid, occupied_positions, task_generation_strict,
                 )
-                for removed_robot in removed:
-                    idle_steps.pop(removed_robot.robot_id, None)
+                events["new_tasks"] += n
 
-        # cancel tasks
-        if remove_tasks and random.random() < task_cancellation_rate:
-            if len(tasks) > 0:
-                print(f"CANCELLING RANDOM TASKS AT TIME STEP {time_step + 1}")
-                removed_t = remove_random_tasks(
-                    tasks, unassigned_tasks,
-                    random.randint(1, max(1, tasks_to_remove)),
-                    robots, unassigned_robots,
+            if add_robots and random.random() < robot_arrival_rate:
+                print(f"ADDING NEW ROBOTS AT TIME STEP {time_step + 1}")
+                n = random.randint(1, max(1, robots_to_add))
+                robot_max_id = add_new_robots(
+                    robots, unassigned_robots, robot_max_id, n,
+                    grid, occupied_positions, robot_generation_strict,
                 )
-                # Cancellations free their robots via unassign_task_from_robot, so a
-                # replan is warranted; treat it as a completion-shaped event.
-                events["completed_tasks"] += len(removed_t)
+                events["new_robots"] += n
+                for r in robots:
+                    idle_steps.setdefault(r.robot_id, 0)
+
+            if remove_robots and random.random() < robot_departure_rate:
+                if len(robots) > 1:
+                    print(f"REMOVING RANDOM ROBOTS AT TIME STEP {time_step + 1}")
+                    removed = remove_random_robots(
+                        robots, tasks, unassigned_robots, unassigned_tasks,
+                        random.randint(1, max(1, robots_to_remove)),
+                        occupied_positions, start_positions, goal_positions,
+                    )
+                    for removed_robot in removed:
+                        idle_steps.pop(removed_robot.robot_id, None)
+
+            if remove_tasks and random.random() < task_cancellation_rate:
+                if len(tasks) > 0:
+                    print(f"CANCELLING RANDOM TASKS AT TIME STEP {time_step + 1}")
+                    removed_t = remove_random_tasks(
+                        tasks, unassigned_tasks,
+                        random.randint(1, max(1, tasks_to_remove)),
+                        robots, unassigned_robots,
+                    )
+                    events["completed_tasks"] += len(removed_t)
 
         # increment or reset idle steps for idle robots
         for r in robots:
@@ -522,9 +717,13 @@ def main_simulation(
     else:
         avg_reassign_metrics = tuple(0.0 for _ in FAIRNESS_METRIC_NAMES)
 
+    all_tasks_completed_flag = all_tasks_completed_at_step is not None
+    completion_step_out = all_tasks_completed_at_step if all_tasks_completed_at_step is not None else -1
+
     print(f"Voting: Total reward: {total_reward}, "
           f"Overall success rate: {overall_success_rate:.2%} ({total_success}/{total_tasks} spawned), "
           f"Attempted completion rate: {attempted_completion_rate:.2%} ({total_success}/{len(tasks_ever_assigned)} attempted), "
+          f"All tasks completed: {all_tasks_completed_flag} (step {completion_step_out}), "
           f"Reassignment Time: {total_reassignment_time}, "
           f"Reassignment Score: {total_reassignment_score}, total reassignments: {total_reassignments}, "
           f"Total robots: {len(robots)}")
@@ -535,6 +734,7 @@ def main_simulation(
         min(total_time_steps, max_time_steps), avg_reassignment_score, avg_path_length,
         initial_jains_index, avg_reassignment_jains_index,
         attempted_completion_rate, len(tasks_ever_assigned), total_tasks,
+        int(all_tasks_completed_flag), completion_step_out,
     ) + avg_reassign_metrics[1:]  # skip first (Jains) - already exposed above
 
 
@@ -563,7 +763,8 @@ def benchmark_simulation(
         robot_departure_rate: float = 0.02,
         task_cancellation_rate: float = 0.02,
         remove_tasks: bool = False,
-        tasks_to_remove: int = 1):
+        tasks_to_remove: int = 1,
+        event_schedule: list = None):
     start_time = time.perf_counter_ns()
     output_tuple = main_simulation(
         output, robots, tasks, num_candidates, voting_method,
@@ -578,6 +779,7 @@ def benchmark_simulation(
         task_cancellation_rate=task_cancellation_rate,
         remove_tasks=remove_tasks,
         tasks_to_remove=tasks_to_remove,
+        event_schedule=event_schedule,
     )
     execution_time = time.perf_counter_ns() - start_time
     cpu_usage = psutil.cpu_percent()
@@ -631,8 +833,8 @@ if __name__ == "__main__":
     all_methods = voting_methods + optimization_methods + direct_methods
     suitability_methods = [
         S.evaluate_suitability_balanced,
-        S.evaluate_suitability_loose,
-        S.evaluate_suitability_strict,
+        # S.evaluate_suitability_loose,
+        # S.evaluate_suitability_strict,
         # S.evaluate_suitability_from_names_with_llm,
     ]
 
@@ -717,6 +919,7 @@ if __name__ == "__main__":
                 # Lifelong-operation metrics inserted here to line up with the
                 # new tail of the main_simulation return tuple.
                 'Attempted_Completion_Rate', 'Tasks_Attempted', 'Tasks_Spawned',
+                'All_Tasks_Completed', 'Completion_Step',
                 'Avg_Reass_Below_GE_Frac', 'Avg_Reass_Below_Good_Frac',
                 'Avg_Reass_Deficit_All_GE', 'Avg_Reass_Deficit_Below_GE',
                 'Avg_Reass_Deficit_All_Good', 'Avg_Reass_Deficit_Below_Good',
@@ -767,6 +970,31 @@ if __name__ == "__main__":
                                     tasks.append(t)
                                     task_locs.add(t.location)
                                 task_profiles = [t.strict_profile_name for t in tasks] if task_generation_strict else []
+
+                                # Pre-build one deterministic event schedule per (map, num_robots,
+                                # num_tasks, nc, sm, rep). Every method in this group replays the
+                                # same schedule so their comparisons are fair.
+                                schedule_seed = hash(
+                                    (os.path.basename(map_file), num_robots, num_tasks, nc, sm_name, rep)
+                                ) & 0xFFFFFFFF
+                                event_schedule = build_event_schedule(
+                                    robots, tasks, grid, max_time_steps,
+                                    add_tasks=add_tasks,
+                                    add_robots=add_robots,
+                                    remove_robots_flag=remove_robots,
+                                    remove_tasks_flag=remove_tasks,
+                                    task_arrival_rate=task_arrival_rate,
+                                    robot_arrival_rate=robot_arrival_rate,
+                                    robot_departure_rate=robot_departure_rate,
+                                    task_cancellation_rate=task_cancellation_rate,
+                                    tasks_to_add=tasks_to_add,
+                                    robots_to_add=robots_to_add,
+                                    robots_to_remove=robots_to_remove,
+                                    tasks_to_remove=tasks_to_remove,
+                                    robot_generation_strict=robot_generation_strict,
+                                    task_generation_strict=task_generation_strict,
+                                    seed=schedule_seed,
+                                )
 
                                 if getattr(sm, "_is_llm_batch", False):
                                     result = sm(robots, tasks)
@@ -852,9 +1080,10 @@ if __name__ == "__main__":
                                         task_arrival_rate=task_arrival_rate,
                                         robot_arrival_rate=robot_arrival_rate, 
                                         robot_departure_rate=robot_departure_rate,
-                                        task_cancellation_rate=task_cancellation_rate, 
-                                        remove_tasks=remove_tasks, 
-                                        tasks_to_remove=tasks_to_remove
+                                        task_cancellation_rate=task_cancellation_rate,
+                                        remove_tasks=remove_tasks,
+                                        tasks_to_remove=tasks_to_remove,
+                                        event_schedule=event_schedule,
                                     )
                                     row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [Run_ID, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0]
                                     writer.writerow(row_prefix + list(output_tuple) + [map_size])
