@@ -1,3 +1,5 @@
+"""Helper functions for FinalCBS.py"""
+
 import random
 from typing import List, Tuple
 from hvbta.models import CapabilityProfile

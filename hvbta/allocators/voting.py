@@ -531,8 +531,14 @@ def reassign_robots_to_tasks(
                     # print(f"Better suitability in reassigning: {s}")
                     best, best_suit = r, s
                     
-            # Inertia check: if the best free robot's suitability is not significantly better, skip stealing
-            if best and (best_suit - current_suitability) >= inertia_threshold:
+            # Priority-weighted inertia check: URGENT tasks halve the required delta,
+            # LOW tasks double it, so a robot can be pulled off a low-priority job for
+            # an urgent one even when the raw suitability gain is modest.
+            _priority_factor = {"low": 0.5, "medium": 1.0, "high": 1.5, "urgent": 2.0}.get(
+                getattr(task, "priority_level", "medium"), 1.0
+            )
+            effective_threshold = inertia_threshold / _priority_factor
+            if best and (best_suit - current_suitability) >= effective_threshold:
                 # unassign the current robot from the task
                 current.current_task = None
                 current.assigned = False
