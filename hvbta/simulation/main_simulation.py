@@ -694,7 +694,7 @@ def main_simulation(
                 # Anytime pressure: any urgent unassigned task or a new-robot
                 # event this tick triggers a tight budget so voting bails on
                 # the first good-enough candidate.
-                urgent_pressure = (percentage_urgent > 0.0) or (robot_pressure > 0.0) # here I c
+                urgent_pressure = (percentage_urgent > 0.0) or (robot_pressure > 0.0) # NOTE: here I can take out robot pressure
                 voting_budget_ms = 20.0 if urgent_pressure else None
                 voting_score_threshold = 0.7 if urgent_pressure else None
                 print(f"REASSIGNING WITH VOTING METHOD: {voting_method_name}"
