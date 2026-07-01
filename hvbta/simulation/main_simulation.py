@@ -1,4 +1,3 @@
-import psutil
 import time
 import random
 import numpy as np
@@ -17,7 +16,6 @@ import hvbta.suitability as S
 import hvbta.generation as G
 from hvbta.metrics import (
     calculate_jains_index,
-    calculate_threshold_metrics,
     calculate_inequality_metrics,
     calculate_robustness_metrics,
 )
@@ -30,33 +28,28 @@ from hvbta.models import CapabilityProfile, TaskDescription
 
 
 def compute_all_fairness_metrics(scores):
-    """Flat tuple of fairness metrics in a consistent order for CSV output."""
+    """
+    Trimmed fairness bundle - four canonical numbers per snapshot:
+      Jains_Index  - overall equity (1 = perfectly equal)
+      Gini         - canonical inequality (0 = equal, 1 = maximally unequal)
+      Median       - robust central tendency
+      IQR          - robust spread
+    The dropped fields (thresholds, deficits, range, min/max ratio, CV, mean,
+    med-mean gap) are all derivable from these plus the per-run raw scores if a
+    downstream analysis ever needs them.
+    """
     jains = calculate_jains_index(scores)
-    threshold = calculate_threshold_metrics(scores)
     inequality = calculate_inequality_metrics(scores)
     robustness = calculate_robustness_metrics(scores)
     return (
         jains,
-        threshold["below_ge_frac"], threshold["below_good_frac"],
-        threshold["deficit_all_ge"], threshold["deficit_below_ge"],
-        threshold["deficit_all_good"], threshold["deficit_below_good"],
-        inequality["score_range"], inequality["min_max_ratio"],
-        inequality["gini"], inequality["cv"],
-        robustness["median"], robustness["mean"],
-        robustness["med_mean_gap"], robustness["iqr"],
+        inequality["gini"],
+        robustness["median"],
+        robustness["iqr"],
     )
 
 
-FAIRNESS_METRIC_NAMES = [
-    "Jains_Index",
-    "Below_GE_Frac", "Below_Good_Frac",
-    "Deficit_All_GE", "Deficit_Below_GE",
-    "Deficit_All_Good", "Deficit_Below_Good",
-    "Score_Range", "Min_Max_Ratio",
-    "Gini", "CV",
-    "Median", "Mean",
-    "Med_Mean_Gap", "IQR",
-]
+FAIRNESS_METRIC_NAMES = ["Jains_Index", "Gini", "Median", "IQR"]
 
 
 def func_name(f):
@@ -438,7 +431,7 @@ def main_simulation(
     full_schedule_tasks_spawned = total_tasks + full_schedule_tasks_added
     full_schedule_robots_max = len(robots) + full_schedule_robots_added
     total_reassignment_time = 0.0
-    total_reassignment_score = 0.0
+    cumulative_reassignment_quality = 0.0
     total_reassignments = 0
     total_time_steps = max_time_steps
     reassignment_jains_indices = []
@@ -710,7 +703,7 @@ def main_simulation(
                     reassignment_jains_indices.append(calculate_jains_index(reassign_per_agent_scores))
                     reassignment_fairness_metrics.append(compute_all_fairness_metrics(reassign_per_agent_scores))
             total_reassignment_time += reassign_length
-            total_reassignment_score += reassign_score
+            cumulative_reassignment_quality += reassign_score
 
             # update location dicts
             for robot in robots:
@@ -742,9 +735,8 @@ def main_simulation(
             previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
             events = {k: 0 for k in events}
 
-    overall_success_rate = total_success / total_tasks if total_tasks else 0.0
+    task_completion_fraction = total_success / total_tasks if total_tasks else 0.0
     attempted_completion_rate = total_success / len(tasks_ever_assigned) if tasks_ever_assigned else 0.0
-    avg_reassignment_score = (total_reassignment_score / total_reassignments) if total_reassignments > 0 else 0.0
     avg_reassignment_jains_index = (sum(reassignment_jains_indices) / len(reassignment_jains_indices)) if reassignment_jains_indices else 0.0
 
     if reassignment_fairness_metrics:
@@ -756,42 +748,41 @@ def main_simulation(
     else:
         avg_reassign_metrics = tuple(0.0 for _ in FAIRNESS_METRIC_NAMES)
 
-    all_tasks_completed_flag = all_tasks_completed_at_step is not None
     completion_step_out = all_tasks_completed_at_step if all_tasks_completed_at_step is not None else -1
 
     # Primary comparative metrics: throughput, adaptation latency, workload variance.
-    # These are the numbers voting is *supposed* to look good on relative to
-    # optimization methods, per the todo.
     throughput_mean = float(np.mean(completed_per_step)) if completed_per_step else 0.0
     throughput_var = float(np.var(completed_per_step)) if completed_per_step else 0.0
     adaptation_latency_mean = float(np.mean(adaptation_latencies)) if adaptation_latencies else 0.0
     adaptation_latency_max = float(max(adaptation_latencies)) if adaptation_latencies else 0.0
     task_success_counts = [r.tasks_successful for r in robots]
     workload_variance = float(np.var(task_success_counts)) if task_success_counts else 0.0
-    workload_mean = float(np.mean(task_success_counts)) if task_success_counts else 0.0
 
-    print(f"Voting: Total reward: {total_reward}, "
-          f"Overall success rate: {overall_success_rate:.2%} ({total_success}/{total_tasks} spawned), "
+    print(f"Voting: "
+          f"Task completion fraction: {task_completion_fraction:.2%} ({total_success}/{total_tasks} spawned), "
           f"Attempted completion rate: {attempted_completion_rate:.2%} ({total_success}/{len(tasks_ever_assigned)} attempted), "
-          f"All tasks completed: {all_tasks_completed_flag} (step {completion_step_out}), "
+          f"Completion step: {completion_step_out}, "
           f"Throughput: mean={throughput_mean:.3f}/step var={throughput_var:.3f}, "
           f"Adaptation latency: mean={adaptation_latency_mean:.2f} max={adaptation_latency_max:.0f} (over {len(adaptation_latencies)} events), "
-          f"Workload: mean={workload_mean:.2f} var={workload_variance:.3f}, "
+          f"Workload variance: {workload_variance:.3f}, "
           f"Reassignment Time: {total_reassignment_time}, "
-          f"Reassignment Score: {total_reassignment_score}, total reassignments: {total_reassignments}, "
-          f"Total robots: {len(robots)}")
+          f"Reassignment quality: {cumulative_reassignment_quality}, reassignments: {total_reassignments}, "
+          f"Robots: {len(robots)}")
 
     return (
-        total_reward, overall_success_rate, total_success,
-        total_reassignment_time, total_reassignment_score, total_reassignments,
-        min(total_time_steps, max_time_steps), avg_reassignment_score, avg_path_length,
-        initial_jains_index, avg_reassignment_jains_index,
+        # Section 4 - aggregate outcome (kept only)
+        task_completion_fraction,
+        total_reassignment_time, cumulative_reassignment_quality, total_reassignments,
+        min(total_time_steps, max_time_steps),
+        avg_reassignment_jains_index,
+        # Section 5 - lifelong metrics (kept only)
         attempted_completion_rate, len(tasks_ever_assigned), total_tasks,
-        int(all_tasks_completed_flag), completion_step_out,
+        completion_step_out,
+        # Section 6 - primary comparative metrics (kept only)
         throughput_mean, throughput_var,
         adaptation_latency_mean, adaptation_latency_max,
-        workload_variance, workload_mean,
-        # Full-schedule denominators, constant across methods in a (rep, sm) group.
+        workload_variance,
+        # Section 7 - full-schedule denominators, constant across methods in a (rep, sm) group.
         full_schedule_tasks_spawned, full_schedule_robots_max,
     ) + avg_reassign_metrics[1:]  # skip first (Jains) - already exposed above
 
@@ -840,26 +831,20 @@ def benchmark_simulation(
         event_schedule=event_schedule,
     )
     execution_time = time.perf_counter_ns() - start_time
-    cpu_usage = psutil.cpu_percent()
-    memory_usage = psutil.virtual_memory().used
-
     print(f"Simulation completed in {execution_time:.5f} nanoseconds.")
-    print(f"CPU Usage: {cpu_usage}%")
-    print(f"Memory Usage: {memory_usage / (1024 * 1024)} MB")
-
-    return output_tuple + (execution_time, cpu_usage, memory_usage)
+    return output_tuple + (execution_time,)
 
 
 def _record_assignment(assignment_infos, run_id, method_name, sm_name, num_robots,
-                       num_tasks, nc, score, length, per_agent_scores):
+                       num_tasks, nc, score, planning_time_us, per_agent_scores):
     """Compute initial fairness metrics, derived score fields, and append a row."""
     metrics = compute_all_fairness_metrics(per_agent_scores)
     assigned_count = len(per_agent_scores) if per_agent_scores else 0
-    task_normalized = (score / assigned_count) if assigned_count > 0 else 0.0
-    score_density = (score / (num_robots * num_tasks)) if num_robots * num_tasks > 0 and score > 0 else 0.0
+    # arithmetic mean suitability across assigned pairs (score / assigned_count).
+    mean_assignment_suitability = (score / assigned_count) if assigned_count > 0 else 0.0
     assignment_infos.append(
         [run_id, method_name, sm_name, num_robots, num_tasks, nc, score,
-         task_normalized, score_density, length] + list(metrics)
+         mean_assignment_suitability, planning_time_us] + list(metrics)
     )
     return metrics[0]  # initial jains
 
@@ -919,7 +904,7 @@ if __name__ == "__main__":
     )
 
     robot_sizes = [2]
-    task_sizes = [10]
+    task_sizes = [5]
     Run_ID = 1
     num_repetitions = 1
     add_tasks = True
@@ -960,38 +945,29 @@ if __name__ == "__main__":
             profiles_w = csv.writer(profile_file)
 
             writer.writerow([
-                'Run ID', 'Method', 'Suitability Method', 'Num Robots',
-                'Num Tasks', 'Num Candidates', 'Total Score',
-                'Task Normalized Score', 'Score Density', 'Length',
-                'Init_Jains_Index', 'Init_Below_GE_Frac', 'Init_Below_Good_Frac',
-                'Init_Deficit_All_GE', 'Init_Deficit_Below_GE',
-                'Init_Deficit_All_Good', 'Init_Deficit_Below_Good',
-                'Init_Score_Range', 'Init_Min_Max_Ratio',
-                'Init_Gini', 'Init_CV',
-                'Init_Median', 'Init_Mean',
-                'Init_Med_Mean_Gap', 'Init_IQR',
-                'total_reward', 'overall_success_rate', 'total_success',
-                'total_reassignment_time', 'total_reassignment_score',
-                'total_reassignments', 'Total Time Steps', 'Average Reassignment Score',
-                'Average Path Length', 'Initial Jains Index (sim)', 'Avg Reassignment Jains Index',
-                # Lifelong-operation metrics inserted here to line up with the
-                # new tail of the main_simulation return tuple.
-                'Attempted_Completion_Rate', 'Tasks_Attempted', 'Tasks_Spawned',
-                'All_Tasks_Completed', 'Completion_Step',
-                # Primary comparative metrics (throughput / adaptation latency / workload).
+                # Row identity
+                'Run ID', 'Method', 'Suitability Method',
+                'Num Robots', 'Num Tasks', 'Num Candidates',
+                # Initial allocation quality
+                'Total Score', 'Mean_Assignment_Suitability', 'Planning_Time_us',
+                # Initial fairness (trimmed to 4 canonical values)
+                'Init_Jains_Index', 'Init_Gini', 'Init_Median', 'Init_IQR',
+                # Aggregate simulation outcome
+                'Task_Completion_Fraction',
+                'total_reassignment_time', 'Cumulative_Reassignment_Quality', 'total_reassignments',
+                'Total Time Steps', 'Avg Reassignment Jains Index',
+                # Lifelong-operation metrics
+                'Attempted_Completion_Rate', 'Tasks_Attempted', 'Tasks_Spawned', 'Completion_Step',
+                # Primary comparative metrics
                 'Throughput_Mean', 'Throughput_Var',
                 'Adaptation_Latency_Mean', 'Adaptation_Latency_Max',
-                'Workload_Variance', 'Workload_Mean',
+                'Workload_Variance',
                 # Full-schedule denominators, constant across methods in a (rep, sm) group.
                 'Full_Schedule_Tasks_Spawned', 'Full_Schedule_Robots_Max',
-                'Avg_Reass_Below_GE_Frac', 'Avg_Reass_Below_Good_Frac',
-                'Avg_Reass_Deficit_All_GE', 'Avg_Reass_Deficit_Below_GE',
-                'Avg_Reass_Deficit_All_Good', 'Avg_Reass_Deficit_Below_Good',
-                'Avg_Reass_Score_Range', 'Avg_Reass_Min_Max_Ratio',
-                'Avg_Reass_Gini', 'Avg_Reass_CV',
-                'Avg_Reass_Median', 'Avg_Reass_Mean',
-                'Avg_Reass_Med_Mean_Gap', 'Avg_Reass_IQR',
-                'Execution Time', 'CPU Usage', 'Memory Usage', 'Map Size',
+                # Reassignment fairness (trimmed to 3 canonical values; Jains already exposed above)
+                'Avg_Reass_Gini', 'Avg_Reass_Median', 'Avg_Reass_IQR',
+                # Overhead + config
+                'Execution Time', 'Map Size',
             ])
             profiles_w.writerow([
                 'Run_ID', 'Map', 'Num Robots', 'Num Tasks',

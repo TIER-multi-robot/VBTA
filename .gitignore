@@ -18,3 +18,4 @@ hvbta/io/*
 *.prof
 unused/*
 todo
+CSV_COLUMNS.md
