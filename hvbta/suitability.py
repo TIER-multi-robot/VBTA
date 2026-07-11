@@ -732,6 +732,37 @@ def calculate_suitability_matrix(
     M = result[0] if isinstance(result, tuple) else result
     return np.clip(M, 0.0, 1.0)
 
+
+# Priority-factor table used by apply_priority_weights. Kept at module scope so
+# callers can inspect or override without patching a magic number in-place.
+PRIORITY_FACTORS = {
+    "urgent": 2.0,
+    "high":   1.5,
+    "medium": 1.0,
+    "low":    0.5,
+}
+
+
+def apply_priority_weights(suitability_matrix, tasks) -> NDArray[np.float64]:
+    """
+    Multiply each column of the (R, T) suitability matrix by its target task's
+    priority factor. Voting rules ranking on the result naturally prefer
+    assignments that cover urgent tasks without any change to the aggregation
+    logic. Factors come from PRIORITY_FACTORS; missing / unknown levels default
+    to medium (1.0).
+
+    Returns a new ndarray; the input is not mutated. Output values may exceed
+    1.0 (urgent-scaled), so downstream code that assumes [0, 1] semantics
+    (anytime score_threshold, zero-detection filters) should stay on the raw
+    matrix.
+    """
+    factors = np.array(
+        [PRIORITY_FACTORS.get(getattr(t, "priority_level", "medium"), 1.0) for t in tasks],
+        dtype=float,
+    )
+    return np.asarray(suitability_matrix, dtype=float) * factors  # broadcasts column-wise
+
+
 def _to_jsonable(x):
     """Recursively convert to JSON-safe Python objects."""
     if is_dataclass(x):

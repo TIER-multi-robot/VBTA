@@ -267,6 +267,7 @@ def assign_tasks_with_voting(
         time_budget_ms: float = None,
         generator: Callable = None,
         seed_assignment: List[Tuple[int, int]] = None,
+        diversity_threshold: float = 0.8,
         ) -> Tuple[Tuple[List[Tuple[int, int]], List[int], List[int]], float, float, List[float]]:
     """
     Assigns tasks to robots using random assignment and ranks the assignments using the specified voting method.
@@ -290,6 +291,14 @@ def assign_tasks_with_voting(
             when the matrix has any positive entry, otherwise
             generate_random_assignments. Callers can pass a specific
             generator to override the auto-selection.
+        seed_assignment: Optional warm-start seed as list of (local_r_idx,
+            local_t_idx). Prepended to the pool as candidate #0.
+        diversity_threshold: Float in [0, 1] or None. Reject a newly-generated
+            candidate if its pair-overlap with any already-accepted candidate
+            (|A ∩ B| / |A|) exceeds this value. 0.8 means "must have >= 20% of
+            pairs different from every prior candidate". None or >= 1.0
+            disables the filter. Retries are capped at 5 * num_candidates so
+            small state spaces don't loop forever.
         When budgets are both None, behavior matches the previous full-pool version.
 
     Returns:
@@ -312,25 +321,57 @@ def assign_tasks_with_voting(
         else:
             generator = generate_random_assignments
 
-    # Pre-materialize the full biased/random pool. Both generators are cheap
-    # (rank + sample or uniform sample), so building all K upfront is fine and
-    # keeps the anytime loop below to pure scoring + budget checks.
-    # When a warm-start seed is provided, reserve one slot for it so the total
-    # pool size is still num_candidates.
-    seed_slot = 1 if seed_assignment else 0
-    full_pool = generator(num_robots, num_tasks, max(1, num_candidates - seed_slot))
-
-    # Prepend the warm-start seed. Wrap the raw (local_r_idx, local_t_idx) list
-    # into the same 3-tuple shape the generators produce so downstream code can
-    # treat it identically.
+    # Pre-materialize the pool with three combined concerns:
+    #   1. Warm-start seed (if any) sits at index 0.
+    #   2. Generator fills the rest via the biased/random generator.
+    #   3. Diversity filter rejects candidates whose pair-overlap with any
+    #      already-accepted candidate exceeds diversity_threshold (bounded
+    #      retry loop; degrades gracefully in tiny state spaces).
+    full_pool = []
     if seed_assignment:
         seed_pairs = [(int(r), int(t)) for r, t in seed_assignment]
         seed_robot_ids = {r for r, _ in seed_pairs}
         seed_task_ids = {t for _, t in seed_pairs}
         seed_unr = [r for r in range(num_robots) if r not in seed_robot_ids]
         seed_unt = [t for t in range(num_tasks) if t not in seed_task_ids]
-        seed_candidate = (seed_pairs, seed_unr, seed_unt)
-        full_pool = [seed_candidate] + list(full_pool)
+        full_pool.append((seed_pairs, seed_unr, seed_unt))
+
+    diversity_active = diversity_threshold is not None and diversity_threshold < 1.0
+    accepted_pair_sets = [set(c[0]) for c in full_pool]
+    tries = 0
+    max_tries = max(1, 5 * num_candidates)
+    while len(full_pool) < num_candidates and tries < max_tries:
+        tries += 1
+        need = num_candidates - len(full_pool)
+        # Ask the generator for a batch. Smaller batches keep the retry loop
+        # responsive; larger batches amortize generator overhead. A batch
+        # size of `need` is a reasonable compromise.
+        batch = generator(num_robots, num_tasks, need)
+        for candidate in batch:
+            if len(full_pool) >= num_candidates:
+                break
+            if not diversity_active:
+                full_pool.append(candidate)
+                continue
+            new_pairs = set(candidate[0])
+            if not new_pairs:
+                full_pool.append(candidate)
+                accepted_pair_sets.append(new_pairs)
+                continue
+            too_similar = False
+            for accepted in accepted_pair_sets:
+                if not accepted:
+                    continue
+                overlap = len(new_pairs & accepted) / len(new_pairs)
+                if overlap > diversity_threshold:
+                    too_similar = True
+                    break
+            if not too_similar:
+                full_pool.append(candidate)
+                accepted_pair_sets.append(new_pairs)
+
+    # If the retry cap was hit before we filled the pool, we still proceed
+    # with what we have (>= 1 candidate). Voting rules handle any pool size.
 
     # Anytime accumulation over the pre-generated pool. When neither budget is
     # set the loop consumes the whole pool identically to the old flow.
@@ -506,7 +547,8 @@ def reassign_robots_to_tasks(
         score_threshold: float = None,
         time_budget_ms: float = None,
         generator: Callable = None,
-        seed_assignment_ids: List[Tuple[str, str]] = None):
+        seed_assignment_ids: List[Tuple[str, str]] = None,
+        diversity_threshold: float = 0.8):
     """
     Reassigns unassigned robots to unassigned tasks using a voting method.
     Parameters:
@@ -573,7 +615,8 @@ def reassign_robots_to_tasks(
         output, score, length, per_agent_scores = assign_tasks_with_voting(
             urobots, utasks, suitability_matrix, num_candidates, voting_method,
             score_threshold=score_threshold, time_budget_ms=time_budget_ms,
-            generator=generator, seed_assignment=seed_local)
+            generator=generator, seed_assignment=seed_local,
+            diversity_threshold=diversity_threshold)
 
     # this assigned_pairs only contains the unassigned robots and tasks, I may have to pass in the actual assigned_pairs to update it
     assigned_pairs = output[0] # list of tuples
