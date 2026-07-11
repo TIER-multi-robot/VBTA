@@ -427,6 +427,11 @@ def main_simulation(
     # ("none urgent, no pressure") ... ("all urgent, high pressure").
     percentage_urgent_per_replan = []
     robot_pressure_per_replan = []
+    # Warm-start seed for the next voting replan. Persists across the loop as
+    # a list of (robot_id, task_id) tuples (ID-based so it survives adds /
+    # removes / completions). Updated after every successful voting replan.
+    # None until the first voting round produces something.
+    previous_best_id_pairs = None
 
     # Full-schedule denominators. Constant across all methods in a (rep, sm) group
     # regardless of which method terminated early. Use these as denominators when
@@ -698,17 +703,29 @@ def main_simulation(
                 voting_budget_ms = 20.0 if urgent_pressure else None
                 voting_score_threshold = 0.7 if urgent_pressure else None
                 print(f"REASSIGNING WITH VOTING METHOD: {voting_method_name}"
-                      f"{f' (URGENT: pct_urgent={percentage_urgent:.0%}, robot_pressure={int(robot_pressure)}, 20ms budget, 0.7 threshold)' if urgent_pressure else ''}")
+                      f"{f' (URGENT: pct_urgent={percentage_urgent:.0%}, robot_pressure={int(robot_pressure)}, 20ms budget, 0.7 threshold)' if urgent_pressure else ''}"
+                      f"{f' [warm-start seed: {len(previous_best_id_pairs)} pairs]' if previous_best_id_pairs else ''}")
                 total_reassignments += 1
                 _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = V.reassign_robots_to_tasks(
                     robots, tasks, num_candidates, voting_method, suitability_source,
                     unassigned_robots, unassigned_tasks, start_positions, goal_positions, HYPOTENUSE,
                     time_budget_ms=voting_budget_ms,
                     score_threshold=voting_score_threshold,
+                    seed_assignment_ids=previous_best_id_pairs,
                 )
                 if reassign_per_agent_scores:
                     reassignment_jains_indices.append(calculate_jains_index(reassign_per_agent_scores))
                     reassignment_fairness_metrics.append(compute_all_fairness_metrics(reassign_per_agent_scores))
+                # Capture this round's winner as ID pairs so the next voting
+                # round can warm-start from it. The stealing block in
+                # reassign_robots_to_tasks may have added more pairs after
+                # return_assignments was populated, so read state off the
+                # robot objects instead of the returned dict.
+                previous_best_id_pairs = [
+                    (r.robot_id, r.current_task.task_id)
+                    for r in robots
+                    if r.assigned and r.current_task is not None
+                ] or None
             
             # assign with optimization
             elif voting_method in optimization_methods:

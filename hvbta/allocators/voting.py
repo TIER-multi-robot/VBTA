@@ -266,6 +266,7 @@ def assign_tasks_with_voting(
         score_threshold: float = None,
         time_budget_ms: float = None,
         generator: Callable = None,
+        seed_assignment: List[Tuple[int, int]] = None,
         ) -> Tuple[Tuple[List[Tuple[int, int]], List[int], List[int]], float, float, List[float]]:
     """
     Assigns tasks to robots using random assignment and ranks the assignments using the specified voting method.
@@ -314,7 +315,22 @@ def assign_tasks_with_voting(
     # Pre-materialize the full biased/random pool. Both generators are cheap
     # (rank + sample or uniform sample), so building all K upfront is fine and
     # keeps the anytime loop below to pure scoring + budget checks.
-    full_pool = generator(num_robots, num_tasks, num_candidates)
+    # When a warm-start seed is provided, reserve one slot for it so the total
+    # pool size is still num_candidates.
+    seed_slot = 1 if seed_assignment else 0
+    full_pool = generator(num_robots, num_tasks, max(1, num_candidates - seed_slot))
+
+    # Prepend the warm-start seed. Wrap the raw (local_r_idx, local_t_idx) list
+    # into the same 3-tuple shape the generators produce so downstream code can
+    # treat it identically.
+    if seed_assignment:
+        seed_pairs = [(int(r), int(t)) for r, t in seed_assignment]
+        seed_robot_ids = {r for r, _ in seed_pairs}
+        seed_task_ids = {t for _, t in seed_pairs}
+        seed_unr = [r for r in range(num_robots) if r not in seed_robot_ids]
+        seed_unt = [t for t in range(num_tasks) if t not in seed_task_ids]
+        seed_candidate = (seed_pairs, seed_unr, seed_unt)
+        full_pool = [seed_candidate] + list(full_pool)
 
     # Anytime accumulation over the pre-generated pool. When neither budget is
     # set the loop consumes the whole pool identically to the old flow.
@@ -481,7 +497,8 @@ def reassign_robots_to_tasks(
         inertia_threshold: float = 0.1,
         score_threshold: float = None,
         time_budget_ms: float = None,
-        generator: Callable = None):
+        generator: Callable = None,
+        seed_assignment_ids: List[Tuple[str, str]] = None):
     """
     Reassigns unassigned robots to unassigned tasks using a voting method.
     Parameters:
@@ -527,10 +544,28 @@ def reassign_robots_to_tasks(
         print("All suitability scores are zero, randomly assigning tasks to robots.")
         output, score, length, per_agent_scores = reassign_robots_to_tasks_randomly(robots, tasks, num_candidates, unassigned_robots, unassigned_tasks)
     else:
+        # Translate ID-based warm-start seed to local urobots/utasks indices.
+        # Drop pairs whose robot or task is no longer among the unassigned pool
+        # (already completed, removed, or currently assigned to something else).
+        seed_local = None
+        if seed_assignment_ids:
+            rid_to_local = {r.robot_id: i for i, r in enumerate(urobots)}
+            tid_to_local = {t.task_id: j for j, t in enumerate(utasks)}
+            seen_r, seen_t = set(), set()
+            seed_local = []
+            for rid, tid in seed_assignment_ids:
+                if (rid in rid_to_local and tid in tid_to_local
+                        and rid not in seen_r and tid not in seen_t):
+                    seed_local.append((rid_to_local[rid], tid_to_local[tid]))
+                    seen_r.add(rid)
+                    seen_t.add(tid)
+            if not seed_local:
+                seed_local = None  # nothing survived, don't wedge an empty seed into the pool
+
         output, score, length, per_agent_scores = assign_tasks_with_voting(
             urobots, utasks, suitability_matrix, num_candidates, voting_method,
             score_threshold=score_threshold, time_budget_ms=time_budget_ms,
-            generator=generator)
+            generator=generator, seed_assignment=seed_local)
 
     # this assigned_pairs only contains the unassigned robots and tasks, I may have to pass in the actual assigned_pairs to update it
     assigned_pairs = output[0] # list of tuples
