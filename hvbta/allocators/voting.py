@@ -2,7 +2,7 @@ import time, numpy as np
 from typing import List, Tuple, Callable
 from .assignments import generate_random_assignments, generate_high_suitability_assignments
 from hvbta.models import CapabilityProfile, TaskDescription
-from hvbta.suitability import calculate_total_suitability, check_zero_suitability, calculate_suitability_matrix
+from hvbta.suitability import calculate_total_suitability, check_zero_suitability, calculate_suitability_matrix, apply_priority_weights
 from .misc_assignment import extract_submatrix
 
 def suitability_all_zero(suitability_matrix):
@@ -356,8 +356,16 @@ def assign_tasks_with_voting(
             if (time.perf_counter_ns() - start) / 1e6 >= time_budget_ms:
                 break
 
+    # Priority-weighted view for voting ranking ONLY. Everything else in this
+    # function (anytime score_threshold above, zero-detection below, best_score
+    # reporting) stays on the raw matrix to preserve [0, 1] semantics and cross-
+    # run comparability of reported scores. The weighted matrix may have entries
+    # up to 2.0 (urgent factor), which is fine for internal ranking but would
+    # inflate reported metrics.
+    priority_weighted_matrix = apply_priority_weights(suitability_matrix, tasks)
+
     # Run the voting rule on whatever pool we accumulated (>= 1 candidate).
-    total_scores, assignment_ranking = voting_method(random_assignments, suitability_matrix)
+    total_scores, assignment_ranking = voting_method(random_assignments, priority_weighted_matrix)
     end = time.perf_counter_ns()
     length = (end - start) / 1000.0
 
