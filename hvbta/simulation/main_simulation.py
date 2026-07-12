@@ -6,6 +6,7 @@ import os
 import json
 import copy
 import datetime
+from collections import deque
 from typing import List
 
 from hvbta.pathfinding.Final_CBS import CBS, Environment
@@ -433,6 +434,21 @@ def main_simulation(
     # None until the first voting round produces something.
     previous_best_id_pairs = None
 
+    # Adaptive candidate count. Rolling window of per-timestep event counts over
+    # the last 5 steps; recent churn shrinks the voting candidate pool so voting
+    # responds fast under stress and explores broadly when calm.
+    ADAPTIVE_WINDOW = 5
+    MIN_CANDIDATES = 5
+    recent_events_window = deque(maxlen=ADAPTIVE_WINDOW)
+
+    # Hall of fame candidate cache. List of ID-pair-list candidates (each a list
+    # of (robot_id, task_id)) carried across timesteps. After each voting round
+    # its top-K survivors are merged in; at the next round they are translated to
+    # local indices (dropping invalid pairs) and injected alongside fresh ones.
+    HALL_OF_FAME_MAX = 20
+    HALL_OF_FAME_K = 3
+    candidate_cache = []
+
     # Full-schedule denominators. Constant across all methods in a (rep, sm) group
     # regardless of which method terminated early. Use these as denominators when
     # comparing across methods; use per-method total_tasks / len(robots) when you
@@ -515,6 +531,12 @@ def main_simulation(
         events["completed_tasks"] += completed_this_step
         # set the replan_cbs flag
         should_replan_cbs = completed_this_step > 0
+
+        # Snapshot pool sizes so we can measure add/remove churn from the dynamic
+        # block below. Combined with completions, this feeds the adaptive
+        # candidate-count rolling window.
+        n_tasks_before_events = len(tasks)
+        n_robots_before_events = len(robots)
 
         # Dynamic events. When an event_schedule is supplied, replay it
         # deterministically so every method in a (rep, sm) group sees the same
@@ -618,6 +640,16 @@ def main_simulation(
                     if removed_t:
                         pending_event_steps.append(time_step)
 
+        # Record this step's churn for the adaptive candidate window. Sum of
+        # completions + |task pool delta| + |robot pool delta| approximates
+        # total activity this step (a heuristic; exactness is not required).
+        events_this_step = (
+            completed_this_step
+            + abs(len(tasks) - n_tasks_before_events)
+            + abs(len(robots) - n_robots_before_events)
+        )
+        recent_events_window.append(events_this_step)
+
         # increment or reset idle steps for idle robots
         for r in robots:
             if not r.assigned:
@@ -702,16 +734,32 @@ def main_simulation(
                 urgent_pressure = (percentage_urgent > 0.0) or (robot_pressure > 0.0) # NOTE: here I can take out robot pressure
                 voting_budget_ms = 20.0 if urgent_pressure else None
                 voting_score_threshold = 0.7 if urgent_pressure else None
+
+                # Adaptive candidate count: recent churn shrinks the pool so
+                # voting responds fast under stress and explores broadly when
+                # calm. Floors at MIN_CANDIDATES.
+                recent_event_count = sum(recent_events_window)
+                effective_candidates = max(MIN_CANDIDATES, num_candidates // (1 + recent_event_count))
+
+                # Hall of fame: hand the surviving cached candidates to the pool
+                # and collect this round's top-K back out.
+                top_k_out_ids = []
+
                 print(f"REASSIGNING WITH VOTING METHOD: {voting_method_name}"
                       f"{f' (URGENT: pct_urgent={percentage_urgent:.0%}, robot_pressure={int(robot_pressure)}, 20ms budget, 0.7 threshold)' if urgent_pressure else ''}"
-                      f"{f' [warm-start seed: {len(previous_best_id_pairs)} pairs]' if previous_best_id_pairs else ''}")
+                      f"{f' [warm-start seed: {len(previous_best_id_pairs)} pairs]' if previous_best_id_pairs else ''}"
+                      f" [candidates: {effective_candidates}/{num_candidates}, recent_events={recent_event_count}]"
+                      f"{f' [hall-of-fame: {len(candidate_cache)} cached]' if candidate_cache else ''}")
                 total_reassignments += 1
                 _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = V.reassign_robots_to_tasks(
-                    robots, tasks, num_candidates, voting_method, suitability_source,
+                    robots, tasks, effective_candidates, voting_method, suitability_source,
                     unassigned_robots, unassigned_tasks, start_positions, goal_positions, HYPOTENUSE,
                     time_budget_ms=voting_budget_ms,
                     score_threshold=voting_score_threshold,
                     seed_assignment_ids=previous_best_id_pairs,
+                    cached_candidate_ids=(candidate_cache or None),
+                    top_k_out_ids=top_k_out_ids,
+                    hall_of_fame_k=HALL_OF_FAME_K,
                 )
                 if reassign_per_agent_scores:
                     reassignment_jains_indices.append(calculate_jains_index(reassign_per_agent_scores))
@@ -726,6 +774,18 @@ def main_simulation(
                     for r in robots
                     if r.assigned and r.current_task is not None
                 ] or None
+
+                # Merge this round's top-K into the hall of fame (dedup by
+                # canonical pair-set, keep most-recent HALL_OF_FAME_MAX).
+                if top_k_out_ids:
+                    existing_keys = {frozenset(c) for c in candidate_cache}
+                    for cand in top_k_out_ids:
+                        key = frozenset(cand)
+                        if key not in existing_keys:
+                            candidate_cache.append(cand)
+                            existing_keys.add(key)
+                    if len(candidate_cache) > HALL_OF_FAME_MAX:
+                        candidate_cache = candidate_cache[-HALL_OF_FAME_MAX:]
             
             # assign with optimization
             elif voting_method in optimization_methods:
@@ -965,8 +1025,8 @@ if __name__ == "__main__":
         # + random.sample(large_maps, 1)
     )
 
-    robot_sizes = [2]
-    task_sizes = [5]
+    robot_sizes = [10]
+    task_sizes = [10]
     Run_ID = 1
     num_repetitions = 1
     add_tasks = True

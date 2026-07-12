@@ -268,6 +268,9 @@ def assign_tasks_with_voting(
         generator: Callable = None,
         seed_assignment: List[Tuple[int, int]] = None,
         diversity_threshold: float = 0.8,
+        extra_candidates: List = None,
+        top_k_out: List = None,
+        top_k: int = 3,
         ) -> Tuple[Tuple[List[Tuple[int, int]], List[int], List[int]], float, float, List[float]]:
     """
     Assigns tasks to robots using random assignment and ranks the assignments using the specified voting method.
@@ -293,6 +296,15 @@ def assign_tasks_with_voting(
             generator to override the auto-selection.
         seed_assignment: Optional warm-start seed as list of (local_r_idx,
             local_t_idx). Prepended to the pool as candidate #0.
+        extra_candidates: Optional list of pre-built candidates (each a local-
+            index 3-tuple (pairs, unassigned_robots, unassigned_tasks)) injected
+            into the pool right after the seed - used for the hall-of-fame cache.
+            They count against num_candidates and seed the diversity filter, so
+            generated candidates explore away from them.
+        top_k_out: Optional mutable list. If provided, after ranking it is
+            populated with the top-`top_k` candidates (local-index 3-tuples) so
+            the caller can cache them.
+        top_k: How many top candidates to write into top_k_out (default 3).
         diversity_threshold: Float in [0, 1] or None. Reject a newly-generated
             candidate if its pair-overlap with any already-accepted candidate
             (|A ∩ B| / |A|) exceeds this value. 0.8 means "must have >= 20% of
@@ -335,6 +347,15 @@ def assign_tasks_with_voting(
         seed_unr = [r for r in range(num_robots) if r not in seed_robot_ids]
         seed_unt = [t for t in range(num_tasks) if t not in seed_task_ids]
         full_pool.append((seed_pairs, seed_unr, seed_unt))
+
+    # Hall-of-fame extras (already validated/translated by the caller). Add as
+    # many as fit; they earned their place so they bypass the diversity filter,
+    # but they DO seed accepted_pair_sets so generated candidates avoid them.
+    if extra_candidates:
+        for cand in extra_candidates:
+            if len(full_pool) >= num_candidates:
+                break
+            full_pool.append(cand)
 
     diversity_active = diversity_threshold is not None and diversity_threshold < 1.0
     accepted_pair_sets = [set(c[0]) for c in full_pool]
@@ -409,6 +430,11 @@ def assign_tasks_with_voting(
     total_scores, assignment_ranking = voting_method(random_assignments, priority_weighted_matrix)
     end = time.perf_counter_ns()
     length = (end - start) / 1000.0
+
+    # Hall of fame: hand the top-`top_k` ranked candidates back to the caller.
+    if top_k_out is not None:
+        for rank_idx in assignment_ranking[:top_k]:
+            top_k_out.append(random_assignments[rank_idx])
 
     best_ranking = 0
     # check for zero suitability in the best assignment and move to the next best if so
@@ -548,7 +574,10 @@ def reassign_robots_to_tasks(
         time_budget_ms: float = None,
         generator: Callable = None,
         seed_assignment_ids: List[Tuple[str, str]] = None,
-        diversity_threshold: float = 0.8):
+        diversity_threshold: float = 0.8,
+        cached_candidate_ids: List = None,
+        top_k_out_ids: List = None,
+        hall_of_fame_k: int = 3):
     """
     Reassigns unassigned robots to unassigned tasks using a voting method.
     Parameters:
@@ -594,29 +623,63 @@ def reassign_robots_to_tasks(
         print("All suitability scores are zero, randomly assigning tasks to robots.")
         output, score, length, per_agent_scores = reassign_robots_to_tasks_randomly(robots, tasks, num_candidates, unassigned_robots, unassigned_tasks)
     else:
-        # Translate ID-based warm-start seed to local urobots/utasks indices.
-        # Drop pairs whose robot or task is no longer among the unassigned pool
-        # (already completed, removed, or currently assigned to something else).
-        seed_local = None
-        if seed_assignment_ids:
-            rid_to_local = {r.robot_id: i for i, r in enumerate(urobots)}
-            tid_to_local = {t.task_id: j for j, t in enumerate(utasks)}
+        # ID -> local index maps for the current unassigned pools. Shared by the
+        # seed translation and the hall-of-fame cache translation below.
+        rid_to_local = {r.robot_id: i for i, r in enumerate(urobots)}
+        tid_to_local = {t.task_id: j for j, t in enumerate(utasks)}
+
+        def _translate_id_pairs(id_pairs):
+            """ID pairs -> local (r_idx, t_idx) pairs, dropping any pair whose
+            robot or task is no longer among the unassigned pool. Enforces one
+            robot / one task per candidate (first valid wins)."""
             seen_r, seen_t = set(), set()
-            seed_local = []
-            for rid, tid in seed_assignment_ids:
+            local = []
+            for rid, tid in id_pairs:
                 if (rid in rid_to_local and tid in tid_to_local
                         and rid not in seen_r and tid not in seen_t):
-                    seed_local.append((rid_to_local[rid], tid_to_local[tid]))
+                    local.append((rid_to_local[rid], tid_to_local[tid]))
                     seen_r.add(rid)
                     seen_t.add(tid)
-            if not seed_local:
-                seed_local = None  # nothing survived, don't wedge an empty seed into the pool
+            return local
+
+        # Warm-start seed (single candidate).
+        seed_local = _translate_id_pairs(seed_assignment_ids) if seed_assignment_ids else None
+        if not seed_local:
+            seed_local = None  # nothing survived, don't wedge an empty seed into the pool
+
+        # Hall-of-fame cache (multiple candidates). Wrap each surviving pair set
+        # into the local 3-tuple candidate shape the generators produce.
+        extra_local = None
+        if cached_candidate_ids:
+            extra_local = []
+            for cand_ids in cached_candidate_ids:
+                local_pairs = _translate_id_pairs(cand_ids)
+                if not local_pairs:
+                    continue
+                used_r = {r for r, _ in local_pairs}
+                used_t = {t for _, t in local_pairs}
+                unr = [i for i in range(len(urobots)) if i not in used_r]
+                unt = [j for j in range(len(utasks)) if j not in used_t]
+                extra_local.append((local_pairs, unr, unt))
+            if not extra_local:
+                extra_local = None
+
+        # Local accumulator for this round's top-K, translated back to IDs after.
+        local_top_k = [] if top_k_out_ids is not None else None
 
         output, score, length, per_agent_scores = assign_tasks_with_voting(
             urobots, utasks, suitability_matrix, num_candidates, voting_method,
             score_threshold=score_threshold, time_budget_ms=time_budget_ms,
             generator=generator, seed_assignment=seed_local,
-            diversity_threshold=diversity_threshold)
+            diversity_threshold=diversity_threshold,
+            extra_candidates=extra_local, top_k_out=local_top_k, top_k=hall_of_fame_k)
+
+        # Translate the top-K candidates back to ID pairs for the caller's cache.
+        if top_k_out_ids is not None and local_top_k:
+            for cand in local_top_k:
+                id_pairs = [(urobots[i].robot_id, utasks[j].task_id) for i, j in cand[0]]
+                if id_pairs:
+                    top_k_out_ids.append(id_pairs)
 
     # this assigned_pairs only contains the unassigned robots and tasks, I may have to pass in the actual assigned_pairs to update it
     assigned_pairs = output[0] # list of tuples
