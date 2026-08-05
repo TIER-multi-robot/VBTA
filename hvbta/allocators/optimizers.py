@@ -12,6 +12,25 @@ def suitability_all_zero(suitability_matrix):
     return all(value == 0 for row in suitability_matrix for value in row)
 
 def jv_task_allocation(matrix):
+    """
+    Solves the task allocation problem using the Jonker-Volgenant (JV) algorithm
+    via `scipy.optimize.linear_sum_assignment`, which finds the optimal one-to-one
+    assignment that maximizes total suitability.
+
+    Since `linear_sum_assignment` solves the minimum-cost assignment problem, the
+    suitability matrix is converted to a cost matrix by subtracting each score
+    from the maximum value in the matrix (`max_val - matrix`). Pairs with a zero
+    suitability score are dropped from the result, so only meaningful (positive)
+    assignments are returned.
+
+    Parameters:
+        matrix: A 2D array-like where the element at [i][j] represents the
+                suitability score of robot i for task j.
+
+    Returns:
+        assignment: A list of (robot, task) index pairs representing the optimal
+                    allocation, excluding any pairs with a zero suitability score.
+    """
     matrix = np.array(matrix)
     max_val = np.max(matrix)
     

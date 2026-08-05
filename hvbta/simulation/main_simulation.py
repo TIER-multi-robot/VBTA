@@ -9,7 +9,6 @@ import datetime
 from collections import deque
 from typing import List
 
-from hvbta.pathfinding.Final_CBS import CBS, Environment
 from hvbta.simulation.timestep import simulate_time_step
 import hvbta.allocators.voting as V
 import hvbta.allocators.optimizers as O
@@ -20,7 +19,8 @@ from hvbta.metrics import (
     calculate_inequality_metrics,
     calculate_robustness_metrics,
 )
-from hvbta.pathfinding.CBS import load_map, create_obstacle_list, build_cbs_agents
+from hvbta.pathfinding.CBS_helper import load_map, create_obstacle_list
+from hvbta.pathfinding.MAPF_wrapper import run_planner
 from hvbta.allocators.misc_assignment import (
     add_new_tasks, add_new_robots, remove_random_robots, remove_random_tasks,
     remove_task_by_id, remove_robot_by_id,
@@ -74,76 +74,6 @@ def state_check(robots: List[CapabilityProfile], unassigned_robots: List[str], u
         tuple(sorted(unassigned_robots)),
         tuple(sorted(unassigned_tasks)),
     )
-
-
-def run_cbs(robots, start_positions, goal_positions, map_dict):
-    """
-    Plan all assigned-robot paths jointly with CBS.
-
-    Unassigned robots are added as stationary CBS agents (start == goal == current
-    location). This lets CBS route the moving robots around them; otherwise CBS
-    would happily plan paths straight through an idle robot's cell, causing
-    undetected physical collisions.
-
-    Writes resulting paths back onto each robot's `current_path` and
-    `remaining_distance`. Returns (avg_moving_path_length, cbs_succeeded). The
-    success flag lets the outer loop drain pending event timestamps for
-    adaptation-latency accounting only on real CBS resolution, not on failure.
-    """
-    if not start_positions or not goal_positions:
-        # No mover agents to plan for; treat as trivial success so pending
-        # event latencies are still measured against "the next moment CBS
-        # was invoked and did not fail."
-        return 0.0, True
-
-    # Augment with stationary agents for unassigned robots so CBS sees them as blockers.
-    aug_starts = dict(start_positions)
-    aug_goals = dict(goal_positions)
-    stationary_ids = set()
-    for r in robots:
-        if r.robot_id in aug_starts:
-            continue  # already planned as a mover
-        if getattr(r, "location", None) is None:
-            continue
-        aug_starts[r.robot_id] = r.location
-        aug_goals[r.robot_id] = r.location
-        stationary_ids.add(r.robot_id)
-
-    agents = build_cbs_agents(robots, aug_starts, aug_goals)
-    if not agents:
-        return 0.0, True
-
-    # duplicate-start guard - CBS rejects this anyway, but fail fast and informative
-    start_locations = [a['start'] for a in agents]
-    if len(start_locations) != len(set(start_locations)):
-        print("ERROR: Duplicate start locations in agent list. Skipping CBS.")
-        return 0.0, False
-
-    env = Environment(
-        dimension=map_dict['dimension'],
-        agents=agents,
-        obstacles=map_dict['obstacles'],
-    )
-    res = CBS(env).search()
-    if not res:
-        print("CBS failed to find a plan under current constraints.")
-        return 0.0, False
-
-    solution, _nodes_expanded, _conflicts = res
-    id_to_index = {r.robot_id: idx for idx, r in enumerate(robots)}
-    valid_lengths = []
-    for robot_id, schedule in solution.items():
-        if robot_id not in id_to_index:
-            continue
-        r = robots[id_to_index[robot_id]]
-        # Skip stationary blockers - do not overwrite their (empty) current_path with the trivial wait schedule.
-        if robot_id in stationary_ids:
-            continue
-        r.current_path = [(p['x'], p['y']) for p in schedule]
-        r.remaining_distance = max(0, len(schedule) - 1)
-        if len(schedule) > 1:
-            valid_lengths.append(len(schedule) - 1)
-    return (float(np.mean(valid_lengths)) if valid_lengths else 0.0), True
 
 
 def _with_seeded_random(seed, fn, *args, **kwargs):
@@ -375,7 +305,11 @@ def main_simulation(
         # When provided, dynamic events are replayed from this schedule instead of
         # drawn from the random-rate gates. Enables fair cross-method comparison
         # within a (rep, sm) group.
-        event_schedule: list = None):
+        event_schedule: list = None,
+        # MAPF planner selector ("cbs" | "pp" | "pibt" | "lacam"). Routes through
+        # MAPF_wrapper.run_planner so the outer loop is untouched. Default "cbs"
+        # during the refactor so partial progress never breaks a run.
+        planner: str = "cbs"):
     print(f"SUITABILITY METHOD: {suitability_method}")
 
     voting_methods = {
@@ -416,6 +350,14 @@ def main_simulation(
     # adaptation_latencies: timesteps elapsed between each drained event and the
     #     replan that resolved it.
     completed_per_step = []
+    # Phase 0 diagnostics: per-timestep task-pool and fleet-size logs. Used to
+    # diagnose the regime (steady state vs. overload) and to confirm the
+    # fleet-size random walk isn't drifting when arrival == departure rate.
+    # Surfaced via a single print at run end so a pilot run's stdout can be
+    # scraped for plotting without shifting the metric return tuple (CSV
+    # plumbing for these is deferred to Phase 4).
+    task_pool_size_per_step = []
+    fleet_size_per_step = []
     pending_event_steps = []
     adaptation_latencies = []
     # Urgency accounting. At each replan tick we record:
@@ -496,7 +438,7 @@ def main_simulation(
     start_positions = {r.robot_id: r.location for r in robots if r.assigned and r.current_task}
     goal_positions = {r.robot_id: r.current_task.location for r in robots if r.assigned and r.current_task}
 
-    avg_path_length, _ = run_cbs(robots, start_positions, goal_positions, map_dict)
+    avg_path_length, _ = run_planner(planner, robots, start_positions, goal_positions, map_dict)
 
     # create the initial state
     previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
@@ -518,14 +460,18 @@ def main_simulation(
         )
         # Per-step throughput signal (used for mean + variance at end).
         completed_per_step.append(completed_this_step)
+        # Phase 0: log pool/fleet size every timestep, right after the step.
+        task_pool_size_per_step.append(len(tasks))
+        fleet_size_per_step.append(len(robots))
 
         # First moment len(tasks) hits 0: record it so variable-length
         # normalized metrics (throughput = success / completion_step) work.
         if len(tasks) == 0 and all_tasks_completed_at_step is None:
             all_tasks_completed_at_step = time_step + 1
-            print(f"All tasks completed at time step {time_step + 1}!")
-            total_time_steps = time_step + 1
-            break  # variable-length exit; comment out to run full horizon
+        if len(tasks) == 0 and not(e["add_tasks"] for e in event_schedule[time_step+1:]):
+                print(f"All tasks completed at time step {time_step + 1}!")
+                total_time_steps = time_step + 1
+                break  # variable-length exit; comment out to run full horizon
 
         # update events with any completed tasks this timestep
         events["completed_tasks"] += completed_this_step
@@ -834,7 +780,7 @@ def main_simulation(
         # rerun cbs if needed, update state, and clear events
         if should_replan_cbs and start_positions and goal_positions:
             print("\nRERUNNING CBS\n")
-            new_len, cbs_ok = run_cbs(robots, start_positions, goal_positions, map_dict)
+            new_len, cbs_ok = run_planner(planner, robots, start_positions, goal_positions, map_dict)
             avg_path_length = new_len or avg_path_length
             if cbs_ok and pending_event_steps:
                 # Adaptation latency: elapsed timesteps from each event to this
@@ -889,6 +835,13 @@ def main_simulation(
           f"Reassignment quality: {cumulative_reassignment_quality}, reassignments: {total_reassignments}, "
           f"Robots: {len(robots)}")
 
+    # Phase 0: emit the per-step pool/fleet series on a single line each so a
+    # pilot run's stdout can be scraped to plot pool size vs. timestep, measure
+    # the transient length, and check for fleet-size drift. Tagged prefixes
+    # (POOL_SERIES / FLEET_SERIES) make them easy to grep out of a log.
+    print(f"POOL_SERIES\t" + ",".join(str(n) for n in task_pool_size_per_step))
+    print(f"FLEET_SERIES\t" + ",".join(str(n) for n in fleet_size_per_step))
+
     return (
         # Section 4 - aggregate outcome (kept only)
         task_completion_fraction,
@@ -935,7 +888,8 @@ def benchmark_simulation(
         task_cancellation_rate: float = 0.02,
         remove_tasks: bool = False,
         tasks_to_remove: int = 1,
-        event_schedule: list = None):
+        event_schedule: list = None,
+        planner: str = "cbs"):
     start_time = time.perf_counter_ns()
     output_tuple = main_simulation(
         output, robots, tasks, num_candidates, voting_method,
@@ -951,6 +905,7 @@ def benchmark_simulation(
         remove_tasks=remove_tasks,
         tasks_to_remove=tasks_to_remove,
         event_schedule=event_schedule,
+        planner=planner,
     )
     execution_time = time.perf_counter_ns() - start_time
     print(f"Simulation completed in {execution_time:.5f} nanoseconds.")
@@ -1020,15 +975,16 @@ if __name__ == "__main__":
         r"lak307d.map", r"ost002d.map",
     ]
     map_paths = (
-        random.sample(small_maps, 1)
-        # + random.sample(medium_maps, 1)
-        # + random.sample(large_maps, 1)
+        # random.sample(small_maps, 1)
+        random.sample(medium_maps, 1)
+        # + random.sample(large_maps, 7)
     )
 
     robot_sizes = [10]
     task_sizes = [10]
+    candidate_sizes = [50]
     Run_ID = 1
-    num_repetitions = 1
+    num_repetitions = 10
     add_tasks = True
     add_robots = True
     remove_robots = True
@@ -1043,6 +999,11 @@ if __name__ == "__main__":
     task_cancellation_rate = 0.02
     remove_tasks = True
     tasks_to_remove = 1
+    # MAPF planner: "cbs" | "pp" | "pibt" | "lacam". Single choice for now (not
+    # a swept axis); flip to a planner_choices loop to make it an experimental
+    # axis. Planner choice must NOT alter the event schedule -- same (map,
+    # robots, tasks, nc, sm, rep) => same schedule, regardless of planner.
+    PLANNER = "cbs"
     map_dir = r"MAPF_benchmark_maps"
 
     dir_path = os.path.join('hvbta', 'io', 'results')
@@ -1054,7 +1015,7 @@ if __name__ == "__main__":
         grid = load_map(map_file)
         HYPOTENUSE = (len(grid) ** 2 + len(grid[0]) ** 2) ** 0.5
         dims = (len(grid), len(grid[0]))
-        map_size = "Small" if dims[0] < 40 and dims[1] < 40 else "Medium" if dims[0] < 75 and dims[1] < 75 else "Large"
+        map_size = "Small" if HYPOTENUSE < 55 else "Medium" if HYPOTENUSE < 105 else "Large"
         obstacles = create_obstacle_list(grid)
         map_dict = {'dimension': dims, 'obstacles': obstacles}
 
@@ -1068,7 +1029,7 @@ if __name__ == "__main__":
 
             writer.writerow([
                 # Row identity
-                'Run ID', 'Method', 'Suitability Method',
+                'Run ID', 'Method', 'Suitability Method', 'Planner',
                 'Num Robots', 'Num Tasks', 'Num Candidates',
                 # Initial allocation quality
                 'Total Score', 'Mean_Assignment_Suitability', 'Planning_Time_us',
@@ -1102,7 +1063,6 @@ if __name__ == "__main__":
                 print(f"\n\n\nSTARTING SIMULATION FOR {num_robots} ROBOTS")
                 for num_tasks in task_sizes:
                     print(f"\n\n\nSTARTING SIMULATION FOR {num_tasks} TASKS")
-                    candidate_sizes = [50]
                     workload = max(1.0, num_tasks / num_robots)
                     extender = 1.5 if workload > 10 else 1.2 if workload > 5 else 1.0
                     max_time_steps = max(200, int(HYPOTENUSE * 1.5 * extender))
@@ -1247,7 +1207,11 @@ if __name__ == "__main__":
                                         remove_tasks=remove_tasks,
                                         tasks_to_remove=tasks_to_remove,
                                         event_schedule=event_schedule,
+                                        planner=PLANNER,
                                     )
                                     row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [Run_ID, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0]
+                                    # Inject the planner name at the CSV's 'Planner' column slot
+                                    # (after Run ID / Method, before Suitability Method).
+                                    row_prefix = [row_prefix[0], row_prefix[1], PLANNER] + row_prefix[2:]
                                     writer.writerow(row_prefix + list(output_tuple) + [map_size])
                                 Run_ID += 1

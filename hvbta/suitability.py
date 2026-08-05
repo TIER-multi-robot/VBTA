@@ -1019,6 +1019,21 @@ def _parse_output_matrix_bypass(
 
 
 def build_name_only_prompt(robots_json: str, tasks_json: str) -> str:
+    """
+    Build the "name-only" LLM prompt that asks the model to score each robot
+    against each task using only the task's name (and optional nl_description),
+    with no access to the full capability profile.
+
+    Parameters:
+        robots_json: JSON string of the minimal robot views (id, mobility,
+            manipulators, payload, reach, sensors, etc.).
+        tasks_json: JSON string of the minimal task views (id, task_type, and
+            optional nl_description / strict_profile_name).
+
+    Returns:
+        A formatted prompt string ending with the strict OUTPUT-matrix format
+        the parser in _parse_output_matrix expects.
+    """
     return f"""
 You score robot–task suitability using ONLY each task's name and a short description (if provided).
 Infer typical requirements from the task name (and description), then score how suitable each robot is.
