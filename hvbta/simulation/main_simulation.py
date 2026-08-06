@@ -779,7 +779,7 @@ def main_simulation(
 
         # rerun cbs if needed, update state, and clear events
         if should_replan_cbs and start_positions and goal_positions:
-            print("\nRERUNNING CBS\n")
+            print("\nRERUNNING PLANNER\n")
             new_len, cbs_ok = run_planner(planner, robots, start_positions, goal_positions, map_dict)
             avg_path_length = new_len or avg_path_length
             if cbs_ok and pending_event_steps:
@@ -974,17 +974,18 @@ if __name__ == "__main__":
         r"den998d.map", r"hrt001d.map", r"lak106d.map", r"lak203d.map",
         r"lak307d.map", r"ost002d.map",
     ]
-    map_paths = (
-        # random.sample(small_maps, 1)
-        random.sample(medium_maps, 1)
-        # + random.sample(large_maps, 7)
-    )
+    # map_paths = (
+    #     # random.sample(small_maps, 1)
+    #     # + random.sample(medium_maps, 1)
+    #     # + random.sample(large_maps, 1)
+    # )
+    map_paths = [r"arena.map"]
 
-    robot_sizes = [10]
+    robot_sizes = [3]
     task_sizes = [10]
     candidate_sizes = [50]
     Run_ID = 1
-    num_repetitions = 10
+    num_repetitions = 1
     add_tasks = True
     add_robots = True
     remove_robots = True
@@ -1003,7 +1004,7 @@ if __name__ == "__main__":
     # a swept axis); flip to a planner_choices loop to make it an experimental
     # axis. Planner choice must NOT alter the event schedule -- same (map,
     # robots, tasks, nc, sm, rep) => same schedule, regardless of planner.
-    PLANNER = "cbs"
+    PLANNER = ["pp", "pibt", "lacam"]
     map_dir = r"MAPF_benchmark_maps"
 
     dir_path = os.path.join('hvbta', 'io', 'results')
@@ -1063,155 +1064,157 @@ if __name__ == "__main__":
                 print(f"\n\n\nSTARTING SIMULATION FOR {num_robots} ROBOTS")
                 for num_tasks in task_sizes:
                     print(f"\n\n\nSTARTING SIMULATION FOR {num_tasks} TASKS")
-                    workload = max(1.0, num_tasks / num_robots)
-                    extender = 1.5 if workload > 10 else 1.2 if workload > 5 else 1.0
-                    max_time_steps = max(200, int(HYPOTENUSE * 1.5 * extender))
+                    for algo in PLANNER:
+                        print(f"\n\n\nSTARTING SIMULATION WITH {algo} PLANNER")
+                        workload = max(1.0, num_tasks / num_robots)
+                        extender = 1.5 if workload > 10 else 1.2 if workload > 5 else 1.0
+                        max_time_steps = max(200, int(HYPOTENUSE * 1.5 * extender))
 
-                    for nc in candidate_sizes:
-                        for sm in suitability_methods:
-                            sm_name = func_name(sm)
-                            for rep in range(num_repetitions):
-                                print(f"\n\n\nSTARTING SIMULATION REPETITION {rep+1}/{num_repetitions}")
-                                voting_outputs = []
-                                assignment_infos = []
+                        for nc in candidate_sizes:
+                            for sm in suitability_methods:
+                                sm_name = func_name(sm)
+                                for rep in range(num_repetitions):
+                                    print(f"\n\n\nSTARTING SIMULATION REPETITION {rep+1}/{num_repetitions}")
+                                    voting_outputs = []
+                                    assignment_infos = []
 
-                                # Spawn rule: robots may not overlap each other, tasks may not overlap
-                                # each other, but a robot and a task may share a cell.
-                                robot_locs = set()
-                                robots = []
-                                # Strict-only generation (see todo item).
-                                for idx in range(num_robots):
-                                    r = G.generate_random_robot_profile_strict(f"R{idx+1}", grid, robot_locs)
-                                    robots.append(r)
-                                    robot_locs.add(r.location)
-                                robot_profiles = [r.strict_profile_name for r in robots]
+                                    # Spawn rule: robots may not overlap each other, tasks may not overlap
+                                    # each other, but a robot and a task may share a cell.
+                                    robot_locs = set()
+                                    robots = []
+                                    # Strict-only generation (see todo item).
+                                    for idx in range(num_robots):
+                                        r = G.generate_random_robot_profile_strict(f"R{idx+1}", grid, robot_locs)
+                                        robots.append(r)
+                                        robot_locs.add(r.location)
+                                    robot_profiles = [r.strict_profile_name for r in robots]
 
-                                task_locs = set()
-                                tasks = []
-                                for idx in range(num_tasks):
-                                    t = G.generate_random_task_description_strict(f"T{idx+1}", grid, task_locs, [])
-                                    tasks.append(t)
-                                    task_locs.add(t.location)
-                                task_profiles = [t.strict_profile_name for t in tasks]
+                                    task_locs = set()
+                                    tasks = []
+                                    for idx in range(num_tasks):
+                                        t = G.generate_random_task_description_strict(f"T{idx+1}", grid, task_locs, [])
+                                        tasks.append(t)
+                                        task_locs.add(t.location)
+                                    task_profiles = [t.strict_profile_name for t in tasks]
 
-                                # Pre-build one deterministic event schedule per (map, num_robots,
-                                # num_tasks, nc, sm, rep). Every method in this group replays the
-                                # same schedule so their comparisons are fair.
-                                schedule_seed = hash(
-                                    (os.path.basename(map_file), num_robots, num_tasks, nc, sm_name, rep)
-                                ) & 0xFFFFFFFF
-                                event_schedule = build_event_schedule(
-                                    robots, tasks, grid, max_time_steps,
-                                    add_tasks=add_tasks,
-                                    add_robots=add_robots,
-                                    remove_robots_flag=remove_robots,
-                                    remove_tasks_flag=remove_tasks,
-                                    task_arrival_rate=task_arrival_rate,
-                                    robot_arrival_rate=robot_arrival_rate,
-                                    robot_departure_rate=robot_departure_rate,
-                                    task_cancellation_rate=task_cancellation_rate,
-                                    tasks_to_add=tasks_to_add,
-                                    robots_to_add=robots_to_add,
-                                    robots_to_remove=robots_to_remove,
-                                    tasks_to_remove=tasks_to_remove,
-                                    robot_generation_strict=robot_generation_strict,
-                                    task_generation_strict=task_generation_strict,
-                                    seed=schedule_seed,
-                                )
-
-                                if getattr(sm, "_is_llm_batch", False):
-                                    result = sm(robots, tasks)
-                                    # LLM scorers return (matrix, parse_failed); unwrap so the
-                                    # matrix is what flows through to llm_cache and downstream
-                                    # indexing in reassign_robots_to_tasks_direct.
-                                    suitability_matrix = result[0] if isinstance(result, tuple) else result
-                                else:
-                                    suitability_matrix = S.calculate_suitability_matrix(robots, tasks, sm, HYPOTENUSE)
-
-                                if robot_generation_strict and task_generation_strict:
-                                    profiles_w.writerow([
-                                        Run_ID, os.path.basename(map_file),
-                                        num_robots, num_tasks, sm_name,
-                                        json.dumps(robot_profiles), json.dumps(task_profiles),
-                                    ])
-
-                                # Direct LLM assignment is independent of the matrix; time it and
-                                # score its chosen pairs against the rule-based matrix for parity
-                                # with voting/optimization rows.
-                                direct_outputs = []
-                                for d_fn, d_name in zip(direct_methods, direct_names):
-                                    d_start = time.perf_counter_ns()
-                                    out, parse_failed = d_fn(robots, tasks)
-                                    d_length = (time.perf_counter_ns() - d_start) / 1000.0
-                                    if parse_failed:
-                                        print(f"[{d_name}] parse failed - empty assignment fallback")
-                                    pairs = out[0]
-                                    per_agent_direct = [float(suitability_matrix[r][t]) for (r, t) in pairs] if not isinstance(suitability_matrix, tuple) else [0.0] * len(pairs)
-                                    d_score = sum(per_agent_direct)
-                                    initial_jains = _record_assignment(assignment_infos, Run_ID, d_name, sm_name, num_robots, num_tasks, nc, d_score, d_length, per_agent_direct)
-                                    direct_outputs.append((out, initial_jains))
-
-                                if suitability_all_zero(suitability_matrix):
-                                    # voting - random fallback
-                                    for method_fn, method_name in zip(voting_methods, voting_names):
-                                        output, score, length, per_agent = V.assign_tasks_randomly(robots, tasks, suitability_matrix, nc)
-                                        initial_jains = _record_assignment(assignment_infos, Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                        voting_outputs.append((output, initial_jains))
-                                    # optimization - random fallback
-                                    opt_outputs = []
-                                    for opt_fn, opt_name in zip(optimization_methods, optimization_names):
-                                        out, score, length, per_agent = O.assign_tasks_with_method_randomly(opt_fn, suitability_matrix, nc)
-                                        initial_jains = _record_assignment(assignment_infos, Run_ID, opt_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                        opt_outputs.append((out, initial_jains))
-                                    outputs = voting_outputs + opt_outputs + direct_outputs
-                                else:
-                                    # voting - normal
-                                    for method_fn, method_name in zip(voting_methods, voting_names):
-                                        output, score, length, per_agent = V.assign_tasks_with_voting(robots, tasks, suitability_matrix, nc, method_fn)
-                                        initial_jains = _record_assignment(assignment_infos, Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                        voting_outputs.append((output, initial_jains))
-                                    # optimization - normal
-                                    opt_outputs = []
-                                    for opt_fn, opt_name in zip(optimization_methods, optimization_names):
-                                        out, score, length, per_agent = O.assign_tasks_with_method(opt_fn, suitability_matrix)
-                                        initial_jains = _record_assignment(assignment_infos, Run_ID, opt_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                        opt_outputs.append((out, initial_jains))
-                                    outputs = voting_outputs + opt_outputs + direct_outputs
-
-                                for idx, (out_tuple, meth) in enumerate(zip(outputs, all_methods)):
-                                    out, initial_jains = out_tuple
-                                    output_tuple = benchmark_simulation(
-                                        output=out, 
-                                        robots=copy.deepcopy(robots), 
-                                        tasks=copy.deepcopy(tasks),
-                                        num_candidates=nc, 
-                                        voting_method=meth, 
-                                        grid=grid, 
-                                        map_dict=map_dict, 
-                                        suitability_method=sm, 
-                                        suitability_matrix=suitability_matrix, 
-                                        max_time_steps=max_time_steps, 
-                                        add_tasks=add_tasks, 
-                                        add_robots=add_robots, 
-                                        remove_robots=remove_robots,
-                                        tasks_to_add=tasks_to_add, 
-                                        robots_to_add=robots_to_add, 
-                                        robots_to_remove=robots_to_remove,
-                                        robot_generation_strict=robot_generation_strict, 
-                                        task_generation_strict=task_generation_strict,
-                                        initial_jains_index=initial_jains, 
+                                    # Pre-build one deterministic event schedule per (map, num_robots,
+                                    # num_tasks, nc, sm, rep). Every method in this group replays the
+                                    # same schedule so their comparisons are fair.
+                                    schedule_seed = hash(
+                                        (os.path.basename(map_file), num_robots, num_tasks, nc, sm_name, rep)
+                                    ) & 0xFFFFFFFF
+                                    event_schedule = build_event_schedule(
+                                        robots, tasks, grid, max_time_steps,
+                                        add_tasks=add_tasks,
+                                        add_robots=add_robots,
+                                        remove_robots_flag=remove_robots,
+                                        remove_tasks_flag=remove_tasks,
                                         task_arrival_rate=task_arrival_rate,
-                                        robot_arrival_rate=robot_arrival_rate, 
+                                        robot_arrival_rate=robot_arrival_rate,
                                         robot_departure_rate=robot_departure_rate,
                                         task_cancellation_rate=task_cancellation_rate,
-                                        remove_tasks=remove_tasks,
+                                        tasks_to_add=tasks_to_add,
+                                        robots_to_add=robots_to_add,
+                                        robots_to_remove=robots_to_remove,
                                         tasks_to_remove=tasks_to_remove,
-                                        event_schedule=event_schedule,
-                                        planner=PLANNER,
+                                        robot_generation_strict=robot_generation_strict,
+                                        task_generation_strict=task_generation_strict,
+                                        seed=schedule_seed,
                                     )
-                                    row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [Run_ID, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0]
-                                    # Inject the planner name at the CSV's 'Planner' column slot
-                                    # (after Run ID / Method, before Suitability Method).
-                                    row_prefix = [row_prefix[0], row_prefix[1], PLANNER] + row_prefix[2:]
-                                    writer.writerow(row_prefix + list(output_tuple) + [map_size])
-                                Run_ID += 1
+
+                                    if getattr(sm, "_is_llm_batch", False):
+                                        result = sm(robots, tasks)
+                                        # LLM scorers return (matrix, parse_failed); unwrap so the
+                                        # matrix is what flows through to llm_cache and downstream
+                                        # indexing in reassign_robots_to_tasks_direct.
+                                        suitability_matrix = result[0] if isinstance(result, tuple) else result
+                                    else:
+                                        suitability_matrix = S.calculate_suitability_matrix(robots, tasks, sm, HYPOTENUSE)
+
+                                    if robot_generation_strict and task_generation_strict:
+                                        profiles_w.writerow([
+                                            Run_ID, os.path.basename(map_file),
+                                            num_robots, num_tasks, sm_name,
+                                            json.dumps(robot_profiles), json.dumps(task_profiles),
+                                        ])
+
+                                    # Direct LLM assignment is independent of the matrix; time it and
+                                    # score its chosen pairs against the rule-based matrix for parity
+                                    # with voting/optimization rows.
+                                    direct_outputs = []
+                                    for d_fn, d_name in zip(direct_methods, direct_names):
+                                        d_start = time.perf_counter_ns()
+                                        out, parse_failed = d_fn(robots, tasks)
+                                        d_length = (time.perf_counter_ns() - d_start) / 1000.0
+                                        if parse_failed:
+                                            print(f"[{d_name}] parse failed - empty assignment fallback")
+                                        pairs = out[0]
+                                        per_agent_direct = [float(suitability_matrix[r][t]) for (r, t) in pairs] if not isinstance(suitability_matrix, tuple) else [0.0] * len(pairs)
+                                        d_score = sum(per_agent_direct)
+                                        initial_jains = _record_assignment(assignment_infos, Run_ID, d_name, sm_name, num_robots, num_tasks, nc, d_score, d_length, per_agent_direct)
+                                        direct_outputs.append((out, initial_jains))
+
+                                    if suitability_all_zero(suitability_matrix):
+                                        # voting - random fallback
+                                        for method_fn, method_name in zip(voting_methods, voting_names):
+                                            output, score, length, per_agent = V.assign_tasks_randomly(robots, tasks, suitability_matrix, nc)
+                                            initial_jains = _record_assignment(assignment_infos, Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
+                                            voting_outputs.append((output, initial_jains))
+                                        # optimization - random fallback
+                                        opt_outputs = []
+                                        for opt_fn, opt_name in zip(optimization_methods, optimization_names):
+                                            out, score, length, per_agent = O.assign_tasks_with_method_randomly(opt_fn, suitability_matrix, nc)
+                                            initial_jains = _record_assignment(assignment_infos, Run_ID, opt_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
+                                            opt_outputs.append((out, initial_jains))
+                                        outputs = voting_outputs + opt_outputs + direct_outputs
+                                    else:
+                                        # voting - normal
+                                        for method_fn, method_name in zip(voting_methods, voting_names):
+                                            output, score, length, per_agent = V.assign_tasks_with_voting(robots, tasks, suitability_matrix, nc, method_fn)
+                                            initial_jains = _record_assignment(assignment_infos, Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
+                                            voting_outputs.append((output, initial_jains))
+                                        # optimization - normal
+                                        opt_outputs = []
+                                        for opt_fn, opt_name in zip(optimization_methods, optimization_names):
+                                            out, score, length, per_agent = O.assign_tasks_with_method(opt_fn, suitability_matrix)
+                                            initial_jains = _record_assignment(assignment_infos, Run_ID, opt_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
+                                            opt_outputs.append((out, initial_jains))
+                                        outputs = voting_outputs + opt_outputs + direct_outputs
+
+                                    for idx, (out_tuple, meth) in enumerate(zip(outputs, all_methods)):
+                                        out, initial_jains = out_tuple
+                                        output_tuple = benchmark_simulation(
+                                            output=out, 
+                                            robots=copy.deepcopy(robots), 
+                                            tasks=copy.deepcopy(tasks),
+                                            num_candidates=nc, 
+                                            voting_method=meth, 
+                                            grid=grid, 
+                                            map_dict=map_dict, 
+                                            suitability_method=sm, 
+                                            suitability_matrix=suitability_matrix, 
+                                            max_time_steps=max_time_steps, 
+                                            add_tasks=add_tasks, 
+                                            add_robots=add_robots, 
+                                            remove_robots=remove_robots,
+                                            tasks_to_add=tasks_to_add, 
+                                            robots_to_add=robots_to_add, 
+                                            robots_to_remove=robots_to_remove,
+                                            robot_generation_strict=robot_generation_strict, 
+                                            task_generation_strict=task_generation_strict,
+                                            initial_jains_index=initial_jains, 
+                                            task_arrival_rate=task_arrival_rate,
+                                            robot_arrival_rate=robot_arrival_rate, 
+                                            robot_departure_rate=robot_departure_rate,
+                                            task_cancellation_rate=task_cancellation_rate,
+                                            remove_tasks=remove_tasks,
+                                            tasks_to_remove=tasks_to_remove,
+                                            event_schedule=event_schedule,
+                                            planner=algo,
+                                        )
+                                        row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [Run_ID, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0]
+                                        # Inject the planner name at the CSV's 'Planner' column slot
+                                        # (after Run ID / Method, before Suitability Method).
+                                        row_prefix = [row_prefix[0], row_prefix[1], algo] + row_prefix[2:]
+                                        writer.writerow(row_prefix + list(output_tuple) + [map_size])
+                                    Run_ID += 1

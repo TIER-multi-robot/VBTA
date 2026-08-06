@@ -94,7 +94,7 @@ def run_native(plan_fn, robots, start_positions, goal_positions, map_dict):
 #     guard; the write-back is identical.
 # ===========================================================================
 def run_stepwise(step_fn, robots, start_positions, goal_positions, map_dict,
-                 max_internal_steps=None, no_progress_limit=None):
+                 max_internal_steps=None, no_progress_limit=None, **kw):
     """
     Wraps a per-timestep rule (PIBT) so this function returns full paths like
     run_cbs. Internally advances a private clock, calling the one-step rule
@@ -114,26 +114,35 @@ def run_stepwise(step_fn, robots, start_positions, goal_positions, map_dict,
 
     dim = map_dict["dimension"]
     if max_internal_steps is None:
-        max_internal_steps = 4 * (dim[0] + dim[1])   # generous; tune per map
+        # Generous: PIBT is cheap per tick, so allow plenty of steps for
+        # agents to detour around each other. 50x the map diameter gives
+        # even congested 10-agent instances room to resolve.
+        max_internal_steps = 50 * (dim[0] + dim[1])
     if no_progress_limit is None:
-        no_progress_limit = 2 * (dim[0] + dim[1])
+        # Stall = no agent moved for this many consecutive ticks. PIBT can
+        # cycle (agents moving but not arriving) without stalling, so this
+        # only fires on true deadlock.
+        no_progress_limit = 20 * (dim[0] + dim[1])
 
     pos = {a["id"]: a["start"] for a in agents}
     goal = {a["id"]: a["goal"] for a in agents}
     trail = {a["id"]: [a["start"]] for a in agents}
 
-    # PIBT requires a strict total order; ties broken by id via sorted().
+    import random as _random
+    # PIBT requires a strict total order; ties broken by a per-tick random
+    # jitter so symmetric deadlocks (e.g. two agents oscillating in a cycle)
+    # break instead of livelocking forever. Deterministic given a fixed seed.
+    _rng = _random.Random(kw.get("seed", 0))
+
     def priority(aid):
-        return _manhattan(pos[aid], goal[aid])   # higher = plans first
+        return _manhattan(pos[aid], goal[aid]) + _rng.random() * 0.999
 
     stationary = set(stationary_ids)
 
     def all_arrived():
         return all(pos[aid] == goal[aid] for aid in pos if aid not in stationary)
 
-    prev_remaining = sum(
-        1 for aid in pos if aid not in stationary and pos[aid] != goal[aid]
-    )
+    prev_pos = dict(pos)
     stall = 0
 
     for _tick in range(max_internal_steps):
@@ -144,6 +153,7 @@ def run_stepwise(step_fn, robots, start_positions, goal_positions, map_dict,
             pos=pos, goal=goal, obstacles=map_dict["obstacles"],
             dimension=dim, priority=priority,
             pinned=stationary,       # never yield these
+            rng=_rng,                # randomize PIBT tie-breaks to escape cycles
         )
         if next_pos is None:
             print("stepwise engine reported no valid configuration.")
@@ -154,13 +164,14 @@ def run_stepwise(step_fn, robots, start_positions, goal_positions, map_dict,
             if aid not in stationary:
                 trail[aid].append(cell)
 
-        remaining = sum(
-            1 for aid in pos if aid not in stationary and pos[aid] != goal[aid]
-        )
-        stall = stall + 1 if remaining >= prev_remaining else 0
-        prev_remaining = remaining
+        # stall = consecutive ticks where NO agent moved. Cycling (agents
+        # moving but not arriving) is NOT a stall -- randomization may break
+        # it on a later tick.
+        moved = any(pos[aid] != prev_pos[aid] for aid in pos if aid not in stationary)
+        stall = 0 if moved else stall + 1
+        prev_pos = dict(pos)
         if stall >= no_progress_limit:
-            print("stepwise engine livelock: no progress within limit -> failing out.")
+            print("stepwise engine livelock: no agent moved within limit -> failing out.")
             return 0.0, False
     else:
         if not all_arrived():
