@@ -115,24 +115,33 @@ def run_stepwise(step_fn, robots, start_positions, goal_positions, map_dict,
     dim = map_dict["dimension"]
     if max_internal_steps is None:
         # Generous: PIBT is cheap per tick, so allow plenty of steps for
-        # agents to detour around each other. 50x the map diameter gives
-        # even congested 10-agent instances room to resolve.
-        max_internal_steps = 50 * (dim[0] + dim[1])
+        # agents to detour around each other and obstacles. 200x the map
+        # diameter gives even congested instances with obstacles room.
+        max_internal_steps = 200 * (dim[0] + dim[1])
     if no_progress_limit is None:
-        # Stall = no agent moved for this many consecutive ticks. PIBT can
-        # cycle (agents moving but not arriving) without stalling, so this
-        # only fires on true deadlock.
-        no_progress_limit = 20 * (dim[0] + dim[1])
+        # Stall = no agent moved for this many consecutive ticks. With
+        # obstacles, agents can get stuck in corridors and need many ticks
+        # of randomized PIBT to break out. 50x the diameter gives the
+        # randomization time to escape corridor deadlocks.
+        no_progress_limit = 50 * (dim[0] + dim[1])
 
     pos = {a["id"]: a["start"] for a in agents}
     goal = {a["id"]: a["goal"] for a in agents}
     trail = {a["id"]: [a["start"]] for a in agents}
 
     import random as _random
+    from collections import deque
     # PIBT requires a strict total order; ties broken by a per-tick random
     # jitter so symmetric deadlocks (e.g. two agents oscillating in a cycle)
     # break instead of livelocking forever. Deterministic given a fixed seed.
     _rng = _random.Random(kw.get("seed", 0))
+
+    # Tabu table: per-agent deque of recently visited cells (last TABU_LEN).
+    # Prevents dead-end-corridor oscillation — the standard PIBT fix.
+    TABU_LEN = 3
+    tabu = {a["id"]: deque(maxlen=TABU_LEN) for a in agents}
+    for a in agents:
+        tabu[a["id"]].append(a["start"])
 
     def priority(aid):
         return _manhattan(pos[aid], goal[aid]) + _rng.random() * 0.999
@@ -149,11 +158,13 @@ def run_stepwise(step_fn, robots, start_positions, goal_positions, map_dict,
         if all_arrived():
             break
 
+        tabu_sets = {aid: set(tabu[aid]) for aid in tabu}
         next_pos = step_fn(
             pos=pos, goal=goal, obstacles=map_dict["obstacles"],
             dimension=dim, priority=priority,
             pinned=stationary,       # never yield these
             rng=_rng,                # randomize PIBT tie-breaks to escape cycles
+            tabu=tabu_sets,          # avoid recently-visited cells
         )
         if next_pos is None:
             print("stepwise engine reported no valid configuration.")
@@ -163,6 +174,7 @@ def run_stepwise(step_fn, robots, start_positions, goal_positions, map_dict,
             pos[aid] = cell
             if aid not in stationary:
                 trail[aid].append(cell)
+                tabu[aid].append(cell)
 
         # stall = consecutive ticks where NO agent moved. Cycling (agents
         # moving but not arriving) is NOT a stall -- randomization may break

@@ -28,6 +28,29 @@ from hvbta.allocators.misc_assignment import (
 from hvbta.models import CapabilityProfile, TaskDescription
 
 
+# ---------------------------------------------------------------------------
+# Named regimes (TODO Part 2 Phase 1). Replaces the four independent rate knobs
+# with a single `scenario` selector so the sweep is tractable and tables are
+# readable. Every method + planner in a (map, robots, tasks, nc, sm, rep,
+# scenario) group replays the SAME event schedule; the scenario sets the four
+# rates that build that schedule.
+#
+# These are HYPOTHESES tuned to a 10-robot / 10-task baseline. The overload
+# rate must exceed the measured completion capacity or it isn't overload; the
+# calm rate must be low enough to sit near-static. Adjust after Phase 0 data.
+# ---------------------------------------------------------------------------
+REGIMES = {
+    "calm":        dict(task_arrival_rate=0.02, task_cancellation_rate=0.01,
+                       robot_arrival_rate=0.01, robot_departure_rate=0.01),
+    "task_churn":  dict(task_arrival_rate=0.15, task_cancellation_rate=0.08,
+                       robot_arrival_rate=0.01, robot_departure_rate=0.01),
+    "fleet_churn": dict(task_arrival_rate=0.03, task_cancellation_rate=0.02,
+                       robot_arrival_rate=0.10, robot_departure_rate=0.10),
+    "overload":    dict(task_arrival_rate=0.30, task_cancellation_rate=0.02,
+                       robot_arrival_rate=0.02, robot_departure_rate=0.04),
+}
+
+
 def compute_all_fairness_metrics(scores):
     """
     Trimmed fairness bundle - four canonical numbers per snapshot:
@@ -59,6 +82,32 @@ def func_name(f):
 
 def suitability_all_zero(suitability_matrix):
     return all(value == 0 for row in suitability_matrix for value in row)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Event-exposure-based horizon. Walks the pre-materialized schedule
+# accumulating scheduled events; returns the step at which the running total
+# first reaches K. This makes cross-regime comparison fair: every regime sees
+# a comparable NUMBER OF EVENTS, not a comparable number of steps.
+# ---------------------------------------------------------------------------
+def horizon_for_event_count(schedule, K):
+    """Return the step index at which cumulative scheduled events reach K.
+
+    Events counted per entry: len(add_tasks) + len(add_robots) +
+    len(remove_robot_ids) + len(remove_task_ids). Returns len(schedule) if K
+    is never reached (the schedule is long enough that all events fire).
+    """
+    total = 0
+    for i, entry in enumerate(schedule):
+        total += (
+            len(entry["add_tasks"])
+            + len(entry["add_robots"])
+            + len(entry["remove_robot_ids"])
+            + len(entry["remove_task_ids"])
+        )
+        if total >= K:
+            return i + 1
+    return len(schedule)
 
 
 def state_check(robots: List[CapabilityProfile], unassigned_robots: List[str], unassigned_tasks: List[str]):
@@ -309,7 +358,13 @@ def main_simulation(
         # MAPF planner selector ("cbs" | "pp" | "pibt" | "lacam"). Routes through
         # MAPF_wrapper.run_planner so the outer loop is untouched. Default "cbs"
         # during the refactor so partial progress never breaks a run.
-        planner: str = "cbs"):
+        planner: str = "cbs",
+        # Phase 4 CSV-provenance fields, passed through from the sweep so the
+        # row is self-describing. These are constant per run, not computed
+        # inside the sim — they're just threaded to the return tuple.
+        scenario: str = "",
+        scheduled_event_count: int = 0,
+        horizon_binding_term: str = ""):
     print(f"SUITABILITY METHOD: {suitability_method}")
 
     voting_methods = {
@@ -464,14 +519,25 @@ def main_simulation(
         task_pool_size_per_step.append(len(tasks))
         fleet_size_per_step.append(len(robots))
 
-        # First moment len(tasks) hits 0: record it so variable-length
-        # normalized metrics (throughput = success / completion_step) work.
+        # Record the first moment the task pool hits 0 — useful METRIC even
+        # when we don't terminate (the pool may refill from future arrivals).
+        # Captured whether or not the sim breaks here.
         if len(tasks) == 0 and all_tasks_completed_at_step is None:
             all_tasks_completed_at_step = time_step + 1
-        if len(tasks) == 0 and not(e["add_tasks"] for e in event_schedule[time_step+1:]):
-                print(f"All tasks completed at time step {time_step + 1}!")
-                total_time_steps = time_step + 1
-                break  # variable-length exit; comment out to run full horizon
+
+        # Termination: pool empty AND no future task arrivals in the schedule.
+        # This prevents the sim from ending lifelong runs early when future
+        # arrivals would refill the pool — the confound the event schedule
+        # exists to remove. Under overload the pool never empties, so this
+        # never fires and the run goes to max_time_steps (correct).
+        no_future_tasks = (
+            event_schedule is None
+            or all(len(e["add_tasks"]) == 0 for e in event_schedule[time_step + 1:])
+        )
+        if len(tasks) == 0 and no_future_tasks:
+            print(f"All tasks completed at time step {time_step + 1} (no future arrivals).")
+            total_time_steps = time_step + 1
+            break
 
         # update events with any completed tasks this timestep
         events["completed_tasks"] += completed_this_step
@@ -842,6 +908,19 @@ def main_simulation(
     print(f"POOL_SERIES\t" + ",".join(str(n) for n in task_pool_size_per_step))
     print(f"FLEET_SERIES\t" + ",".join(str(n) for n in fleet_size_per_step))
 
+    # Phase 4: empirical regime-classification metrics computed from the
+    # pool-size log. Mean_Task_Pool_Size = average pool size across the run.
+    # Pool_Size_Trend = mean(last-quartile) - mean(first-quartile); near 0 =>
+    # steady state, strongly positive => overload.
+    mean_task_pool_size = float(np.mean(task_pool_size_per_step)) if task_pool_size_per_step else 0.0
+    if len(task_pool_size_per_step) >= 4:
+        q = len(task_pool_size_per_step) // 4
+        first_q = float(np.mean(task_pool_size_per_step[:q]))
+        last_q = float(np.mean(task_pool_size_per_step[-q:]))
+        pool_size_trend = last_q - first_q
+    else:
+        pool_size_trend = 0.0
+
     return (
         # Section 4 - aggregate outcome (kept only)
         task_completion_fraction,
@@ -859,7 +938,11 @@ def main_simulation(
         full_schedule_tasks_spawned, full_schedule_robots_max,
         # Section 8 - urgency + pressure summaries.
         percentage_urgent_mean, percentage_urgent_max, robot_pressure_fraction,
-    ) + avg_reassign_metrics[1:]  # skip first (Jains) - already exposed above
+    ) + avg_reassign_metrics[1:] + (  # skip first (Jains) - already exposed above
+        # Section 11 - empirical regime classification + horizon provenance
+        mean_task_pool_size, pool_size_trend,
+        scheduled_event_count, horizon_binding_term,
+    )
 
 
 def benchmark_simulation(
@@ -889,7 +972,10 @@ def benchmark_simulation(
         remove_tasks: bool = False,
         tasks_to_remove: int = 1,
         event_schedule: list = None,
-        planner: str = "cbs"):
+        planner: str = "cbs",
+        scenario: str = "",
+        scheduled_event_count: int = 0,
+        horizon_binding_term: str = ""):
     start_time = time.perf_counter_ns()
     output_tuple = main_simulation(
         output, robots, tasks, num_candidates, voting_method,
@@ -906,6 +992,9 @@ def benchmark_simulation(
         tasks_to_remove=tasks_to_remove,
         event_schedule=event_schedule,
         planner=planner,
+        scenario=scenario,
+        scheduled_event_count=scheduled_event_count,
+        horizon_binding_term=horizon_binding_term,
     )
     execution_time = time.perf_counter_ns() - start_time
     print(f"Simulation completed in {execution_time:.5f} nanoseconds.")
@@ -981,11 +1070,13 @@ if __name__ == "__main__":
     # )
     map_paths = [r"arena.map"]
 
-    robot_sizes = [3]
-    task_sizes = [10]
-    candidate_sizes = [50]
+    robot_sizes = [40]
+    task_sizes = [40]
+    # Candidate pool sizes scale with the problem: nc = max(robot, task) * 5.
+    # Computed inside the sweep loop per (num_robots, num_tasks) pair.
+    candidate_sizes = None  # placeholder; computed dynamically below
     Run_ID = 1
-    num_repetitions = 1
+    num_repetitions = 2
     add_tasks = True
     add_robots = True
     remove_robots = True
@@ -994,17 +1085,17 @@ if __name__ == "__main__":
     robots_to_remove = 1
     robot_generation_strict = True
     task_generation_strict = True
-    task_arrival_rate = 0.05
-    robot_arrival_rate = 0.02
-    robot_departure_rate = 0.02
-    task_cancellation_rate = 0.02
     remove_tasks = True
     tasks_to_remove = 1
-    # MAPF planner: "cbs" | "pp" | "pibt" | "lacam". Single choice for now (not
-    # a swept axis); flip to a planner_choices loop to make it an experimental
-    # axis. Planner choice must NOT alter the event schedule -- same (map,
-    # robots, tasks, nc, sm, rep) => same schedule, regardless of planner.
-    PLANNER = ["pp", "pibt", "lacam"]
+    # MAPF planner: using PP during development (fastest, 100% on solvable
+    # instances). Flip to ["cbs", "pp", "pibt"] for the full sweep.
+    PLANNER = ["pp"]
+    # Phase 2: target event count K for the event-exposure-based horizon.
+    # Start at 50; raise if per-event metrics look noisy.
+    TARGET_EVENT_COUNT_K = 50
+    # Phase 2: transient floor — minimum steps before any regime's run can
+    # end. Tune after Phase 0 data shows where the transient flattens.
+    TRANSIENT_FLOOR = 200
     map_dir = r"MAPF_benchmark_maps"
 
     dir_path = os.path.join('hvbta', 'io', 'results')
@@ -1052,8 +1143,17 @@ if __name__ == "__main__":
                 'Percentage_Urgent_Mean', 'Percentage_Urgent_Max', 'Robot_Pressure_Fraction',
                 # Reassignment fairness (trimmed to 3 canonical values; Jains already exposed above)
                 'Avg_Reass_Gini', 'Avg_Reass_Median', 'Avg_Reass_IQR',
-                # Overhead + config
-                'Execution Time', 'Map Size',
+                # Empirical regime classification (computed per run from pool-size log)
+                'Mean_Task_Pool_Size', 'Pool_Size_Trend',
+                # Horizon provenance (so the horizon choice is auditable)
+                'Scheduled_Event_Count', 'Horizon_Binding_Term',
+                # Overhead
+                'Execution Time',
+                # Config covariates (constant per run)
+                'Scenario', 'Task_Arrival_Rate', 'Task_Cancellation_Rate',
+                'Robot_Arrival_Rate', 'Robot_Departure_Rate',
+                # Map size
+                'Map Size',
             ])
             profiles_w.writerow([
                 'Run_ID', 'Map', 'Num Robots', 'Num Tasks',
@@ -1064,13 +1164,21 @@ if __name__ == "__main__":
                 print(f"\n\n\nSTARTING SIMULATION FOR {num_robots} ROBOTS")
                 for num_tasks in task_sizes:
                     print(f"\n\n\nSTARTING SIMULATION FOR {num_tasks} TASKS")
+                    # Candidate pool scales with problem size.
+                    nc = max(num_robots, num_tasks) * 5
                     for algo in PLANNER:
                         print(f"\n\n\nSTARTING SIMULATION WITH {algo} PLANNER")
                         workload = max(1.0, num_tasks / num_robots)
                         extender = 1.5 if workload > 10 else 1.2 if workload > 5 else 1.0
-                        max_time_steps = max(200, int(HYPOTENUSE * 1.5 * extender))
+                        travel_floor = int(HYPOTENUSE * 1.5 * extender)
 
-                        for nc in candidate_sizes:
+                        for scenario_name, regime in REGIMES.items():
+                            print(f"\n\n\nSTARTING SCENARIO: {scenario_name}")
+                            task_arrival_rate = regime["task_arrival_rate"]
+                            task_cancellation_rate = regime["task_cancellation_rate"]
+                            robot_arrival_rate = regime["robot_arrival_rate"]
+                            robot_departure_rate = regime["robot_departure_rate"]
+
                             for sm in suitability_methods:
                                 sm_name = func_name(sm)
                                 for rep in range(num_repetitions):
@@ -1097,14 +1205,26 @@ if __name__ == "__main__":
                                         task_locs.add(t.location)
                                     task_profiles = [t.strict_profile_name for t in tasks]
 
-                                    # Pre-build one deterministic event schedule per (map, num_robots,
-                                    # num_tasks, nc, sm, rep). Every method in this group replays the
-                                    # same schedule so their comparisons are fair.
-                                    schedule_seed = hash(
-                                        (os.path.basename(map_file), num_robots, num_tasks, nc, sm_name, rep)
+                                    # Pre-build one deterministic event schedule per
+                                    # (map, num_robots, num_tasks, nc, sm, rep, scenario).
+                                    # Every method + planner in this group replays the SAME schedule
+                                    # so their comparisons are fair. Uses zlib.adler32 (stable across
+                                    # runs) instead of hash() (which is per-process-randomized in
+                                    # Python 3 unless PYTHONHASHSEED is fixed).
+                                    import zlib
+                                    seed_tuple = (
+                                        os.path.basename(map_file), num_robots, num_tasks,
+                                        nc, sm_name, rep, scenario_name
+                                    )
+                                    schedule_seed = zlib.adler32(
+                                        repr(seed_tuple).encode()
                                     ) & 0xFFFFFFFF
+
+                                    # Phase 2: build-long → compute-horizon → truncate.
+                                    # Build the schedule to a generous provisional length first.
+                                    provisional_steps = max(TRANSIENT_FLOOR, int(HYPOTENUSE * 3))
                                     event_schedule = build_event_schedule(
-                                        robots, tasks, grid, max_time_steps,
+                                        robots, tasks, grid, provisional_steps,
                                         add_tasks=add_tasks,
                                         add_robots=add_robots,
                                         remove_robots_flag=remove_robots,
@@ -1120,6 +1240,32 @@ if __name__ == "__main__":
                                         robot_generation_strict=robot_generation_strict,
                                         task_generation_strict=task_generation_strict,
                                         seed=schedule_seed,
+                                    )
+
+                                    # Compute the real horizon as the max of three floors.
+                                    event_horizon = horizon_for_event_count(
+                                        event_schedule, TARGET_EVENT_COUNT_K
+                                    )
+                                    max_time_steps = max(
+                                        TRANSIENT_FLOOR,
+                                        event_horizon,
+                                        travel_floor,
+                                    )
+                                    # Truncate the schedule to the real horizon.
+                                    event_schedule = event_schedule[:max_time_steps]
+
+                                    # Record which floor bound the horizon (for CSV provenance).
+                                    horizon_binding_term = (
+                                        "transient" if TRANSIENT_FLOOR >= event_horizon
+                                        and TRANSIENT_FLOOR >= travel_floor
+                                        else "events" if event_horizon >= travel_floor
+                                        else "travel"
+                                    )
+                                    # Count scheduled events actually in the truncated schedule.
+                                    scheduled_event_count = sum(
+                                        len(e["add_tasks"]) + len(e["add_robots"])
+                                        + len(e["remove_robot_ids"]) + len(e["remove_task_ids"])
+                                        for e in event_schedule
                                     )
 
                                     if getattr(sm, "_is_llm_batch", False):
@@ -1211,10 +1357,19 @@ if __name__ == "__main__":
                                             tasks_to_remove=tasks_to_remove,
                                             event_schedule=event_schedule,
                                             planner=algo,
+                                            scenario=scenario_name,
+                                            scheduled_event_count=scheduled_event_count,
+                                            horizon_binding_term=horizon_binding_term,
                                         )
                                         row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [Run_ID, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0]
                                         # Inject the planner name at the CSV's 'Planner' column slot
-                                        # (after Run ID / Method, before Suitability Method).
-                                        row_prefix = [row_prefix[0], row_prefix[1], algo] + row_prefix[2:]
-                                        writer.writerow(row_prefix + list(output_tuple) + [map_size])
+                                        # (after Run ID / Method / Suitability Method, before Num Robots).
+                                        row_prefix = [row_prefix[0], row_prefix[1], row_prefix[2], algo] + row_prefix[3:]
+                                        # Config covariates + provenance, appended before the map_size suffix.
+                                        config_suffix = [
+                                            scenario_name,
+                                            task_arrival_rate, task_cancellation_rate,
+                                            robot_arrival_rate, robot_departure_rate,
+                                        ]
+                                        writer.writerow(row_prefix + list(output_tuple) + config_suffix + [map_size])
                                     Run_ID += 1

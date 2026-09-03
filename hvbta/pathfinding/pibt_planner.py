@@ -27,7 +27,7 @@ recursion can't loop).
 """
 
 
-def step(pos, goal, obstacles, dimension, priority, pinned, rng=None):
+def step(pos, goal, obstacles, dimension, priority, pinned, rng=None, tabu=None):
     """
     rng: optional random.Random instance. When provided, ties in the priority
     order AND in the candidate-cell preference are broken randomly, so repeated
@@ -35,11 +35,21 @@ def step(pos, goal, obstacles, dimension, priority, pinned, rng=None):
     uses to get a real branching factor at each high-level node. When None,
     ties are broken deterministically (by id) -- used by the run_stepwise
     driver and for unit tests.
+
+    tabu: optional dict {aid: set_of_cells}. Cells in an agent's tabu set are
+    treated as LAST-RESORT candidates (tried after all other moves including
+    wait). This prevents oscillation in dead-end corridors: without it, an
+    agent whose only forward path is blocked by obstacles will bounce between
+    two cells forever. With tabu, the agent waits instead of going back to a
+    cell it just visited, giving other agents time to move and the high-level
+    search (LaCAM) time to try other configurations. Standard PIBT (Okumura
+    2019) uses this mechanism.
     """
     aids = list(pos.keys())
     obs_set = set(obstacles)
     rows, cols = dimension
     pinned = set(pinned)
+    tabu = tabu or {}
 
     # Strict total order key. Pinned get +inf so they decide first and never
     # get pushed. Ties broken by id (descending) when rng is None, else by a
@@ -78,14 +88,19 @@ def step(pos, goal, obstacles, dimension, priority, pinned, rng=None):
         # ABSOLUTE last choice (taken only when no move works) unless the agent
         # is already at its goal -- this is the PIBT-R variant that escapes
         # head-on deadlocks in open maps by detouring rather than waiting.
+        # TABU cells (recently visited) are pushed just before wait — the agent
+        # avoids going back where it just came from unless there's no other
+        # option. This breaks dead-end-corridor oscillation.
         # When rng is provided, equal-preference cells are randomly ordered so
         # repeated calls yield different successors (LaCAM branching).
+        my_tabu = tabu.get(a, set())
         def pref(c):
             d = abs(c[0] - g[0]) + abs(c[1] - g[1])
             is_wait = (c == cur)
+            is_tabu = (c in my_tabu and c != g)
             if at_goal:
-                return (0 if is_wait else 1, d)  # at goal: prefer staying
-            return (1 if is_wait else 0, d)       # not at goal: wait LAST
+                return (2 if is_tabu else 0 if is_wait else 1, d)
+            return (3 if is_tabu else 1 if is_wait else 0, d)
         cands.sort(key=pref)
         if rng is not None:
             # Stable shuffle within groups of equal `pref` value, so two
