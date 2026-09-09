@@ -255,7 +255,7 @@ STRICT_TASK_PROFILES = [
 
     {
         "task_type": "assembly",
-        "priority_level": "high",
+        "priority_level": "urgent",
         "reward": 10.0,
         "difficulty": 8.0,
         "navigation_constraints": ["crowded"],
@@ -276,7 +276,7 @@ STRICT_TASK_PROFILES = [
 
     {
         "task_type": "excavate",
-        "priority_level": "high",
+        "priority_level": "urgent",
         "reward": 11.0,
         "difficulty": 8.0,
         "navigation_constraints": ["loose debris", "low visibility"],

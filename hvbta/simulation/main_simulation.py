@@ -40,15 +40,23 @@ from hvbta.models import CapabilityProfile, TaskDescription
 # calm rate must be low enough to sit near-static. Adjust after Phase 0 data.
 # ---------------------------------------------------------------------------
 REGIMES = {
-    "calm":        dict(task_arrival_rate=0.02, task_cancellation_rate=0.01,
+    "calm":       dict(task_arrival_rate=0.10, task_cancellation_rate=0.01,
                        robot_arrival_rate=0.01, robot_departure_rate=0.01),
-    "task_churn":  dict(task_arrival_rate=0.15, task_cancellation_rate=0.08,
+    # "calm2":       dict(task_arrival_rate=0.15, task_cancellation_rate=0.01,
+    #                    robot_arrival_rate=0.01, robot_departure_rate=0.01),
+    # "task_churn1": dict(task_arrival_rate=0.20, task_cancellation_rate=0.10,  # original kinda works already
+    #                    robot_arrival_rate=0.01, robot_departure_rate=0.01),
+    "task_churn": dict(task_arrival_rate=0.30, task_cancellation_rate=0.15,
                        robot_arrival_rate=0.01, robot_departure_rate=0.01),
-    "fleet_churn": dict(task_arrival_rate=0.03, task_cancellation_rate=0.02,
-                       robot_arrival_rate=0.10, robot_departure_rate=0.10),
-    "overload":    dict(task_arrival_rate=0.30, task_cancellation_rate=0.02,
-                       robot_arrival_rate=0.02, robot_departure_rate=0.04),
-}
+    "fleet_churn":dict(task_arrival_rate=0.05, task_cancellation_rate=0.02,
+                       robot_arrival_rate=0.30, robot_departure_rate=0.15),
+    # "fleet_churn2":dict(task_arrival_rate=0.10, task_cancellation_rate=0.02,
+    #                    robot_arrival_rate=0.10, robot_departure_rate=0.10),
+    # "overload1":   dict(task_arrival_rate=0.45, task_cancellation_rate=0.02,
+    #                    robot_arrival_rate=0.02, robot_departure_rate=0.04),
+    "overload":   dict(task_arrival_rate=0.60, task_cancellation_rate=0.02,
+                       robot_arrival_rate=0.03, robot_departure_rate=0.04),
+    }
 
 
 def compute_all_fairness_metrics(scores):
@@ -401,7 +409,7 @@ def main_simulation(
     # completed_per_step: one entry per elapsed timestep with # of task completions
     #     that step. Mean = throughput; variance = burstiness.
     # pending_event_steps: FIFO of timesteps at which a dynamic event fired without
-    #     a subsequent successful CBS resolution yet. Drained when run_cbs succeeds.
+    #     a subsequent successful PLANNER resolution yet. Drained when run_planner succeeds.
     # adaptation_latencies: timesteps elapsed between each drained event and the
     #     replan that resolved it.
     completed_per_step = []
@@ -604,7 +612,7 @@ def main_simulation(
                 if cancelled_here:
                     pending_event_steps.append(time_step)
         else:
-            # legacy random-rate path (unchanged from prior implementation)
+            # legacy random-rate path (unchanged from prior implementation) NOT USED, MUST USE SCHEDULE FOR FAIR COMPARISON
             if add_tasks and random.random() < task_arrival_rate:
                 print(f"ADDING NEW TASKS AT TIME STEP {time_step + 1}")
                 n = random.randint(1, max(1, tasks_to_add))
@@ -846,9 +854,9 @@ def main_simulation(
         # rerun cbs if needed, update state, and clear events
         if should_replan_cbs and start_positions and goal_positions:
             print("\nRERUNNING PLANNER\n")
-            new_len, cbs_ok = run_planner(planner, robots, start_positions, goal_positions, map_dict)
+            new_len, planner_okay = run_planner(planner, robots, start_positions, goal_positions, map_dict)
             avg_path_length = new_len or avg_path_length
-            if cbs_ok and pending_event_steps:
+            if planner_okay and pending_event_steps:
                 # Adaptation latency: elapsed timesteps from each event to this
                 # successful resolution. Drain the queue.
                 for ev_step in pending_event_steps:
@@ -878,7 +886,9 @@ def main_simulation(
     adaptation_latency_mean = float(np.mean(adaptation_latencies)) if adaptation_latencies else 0.0
     adaptation_latency_max = float(max(adaptation_latencies)) if adaptation_latencies else 0.0
     task_success_counts = [r.tasks_successful for r in robots]
+    task_attempted_counts = [r.tasks_attempted for r in robots]
     workload_variance = float(np.var(task_success_counts)) if task_success_counts else 0.0
+    attempted_workload_variance = float(np.var(task_attempted_counts)) if task_attempted_counts else 0.0
     # Urgency + pressure summaries. Bucketing key for downstream analysis:
     #   "none urgent, no pressure"    -> Percentage_Urgent_Mean == 0 AND Robot_Pressure_Fraction == 0
     #   "some urgent, no pressure"    -> Percentage_Urgent_Mean > 0  AND Robot_Pressure_Fraction == 0
@@ -895,6 +905,7 @@ def main_simulation(
           f"Throughput: mean={throughput_mean:.3f}/step var={throughput_var:.3f}, "
           f"Adaptation latency: mean={adaptation_latency_mean:.2f} max={adaptation_latency_max:.0f} (over {len(adaptation_latencies)} events), "
           f"Workload variance: {workload_variance:.3f}, "
+          f"Attempted workload variance: {attempted_workload_variance:.3f}, "
           f"Urgency mean={percentage_urgent_mean:.2%} max={percentage_urgent_max:.2%}, "
           f"Robot-pressure fraction={robot_pressure_fraction:.2%}, "
           f"Reassignment Time: {total_reassignment_time}, "
@@ -934,6 +945,7 @@ def main_simulation(
         throughput_mean, throughput_var,
         adaptation_latency_mean, adaptation_latency_max,
         workload_variance,
+        attempted_workload_variance,
         # Section 7 - full-schedule denominators, constant across methods in a (rep, sm) group.
         full_schedule_tasks_spawned, full_schedule_robots_max,
         # Section 8 - urgency + pressure summaries.
@@ -1042,8 +1054,8 @@ if __name__ == "__main__":
     all_methods = voting_methods + optimization_methods + direct_methods
     suitability_methods = [
         S.evaluate_suitability_balanced,
-        # S.evaluate_suitability_loose,
-        # S.evaluate_suitability_strict,
+        S.evaluate_suitability_loose,
+        S.evaluate_suitability_strict,
         # S.evaluate_suitability_from_names_with_llm,
     ]
 
@@ -1063,24 +1075,24 @@ if __name__ == "__main__":
         r"den998d.map", r"hrt001d.map", r"lak106d.map", r"lak203d.map",
         r"lak307d.map", r"ost002d.map",
     ]
-    # map_paths = (
-    #     # random.sample(small_maps, 1)
-    #     # + random.sample(medium_maps, 1)
-    #     # + random.sample(large_maps, 1)
-    # )
-    map_paths = [r"arena.map"]
+    map_paths = (
+        random.sample(small_maps, 3)
+        + random.sample(medium_maps, 3)
+        + random.sample(large_maps, 3)
+    )
+    # map_paths = [r"arena.map"]
 
-    robot_sizes = [40]
-    task_sizes = [40]
+    robot_sizes = [10, 20, 30, 40, 50, 100]
+    task_sizes = [10, 20, 30, 40, 50, 100]
     # Candidate pool sizes scale with the problem: nc = max(robot, task) * 5.
     # Computed inside the sweep loop per (num_robots, num_tasks) pair.
     candidate_sizes = None  # placeholder; computed dynamically below
     Run_ID = 1
-    num_repetitions = 2
+    num_repetitions = 10
     add_tasks = True
     add_robots = True
     remove_robots = True
-    tasks_to_add = 1
+    tasks_to_add = 2
     robots_to_add = 1
     robots_to_remove = 1
     robot_generation_strict = True
@@ -1092,7 +1104,7 @@ if __name__ == "__main__":
     PLANNER = ["pp"]
     # Phase 2: target event count K for the event-exposure-based horizon.
     # Start at 50; raise if per-event metrics look noisy.
-    TARGET_EVENT_COUNT_K = 50
+    TARGET_EVENT_COUNT_K = 125
     # Phase 2: transient floor — minimum steps before any regime's run can
     # end. Tune after Phase 0 data shows where the transient flattens.
     TRANSIENT_FLOOR = 200
@@ -1136,7 +1148,7 @@ if __name__ == "__main__":
                 # Primary comparative metrics
                 'Throughput_Mean', 'Throughput_Var',
                 'Adaptation_Latency_Mean', 'Adaptation_Latency_Max',
-                'Workload_Variance',
+                'Workload_Variance', 'Attempted_Workload_Variance',
                 # Full-schedule denominators, constant across methods in a (rep, sm) group.
                 'Full_Schedule_Tasks_Spawned', 'Full_Schedule_Robots_Max',
                 # Urgency + pressure bucketing keys.
