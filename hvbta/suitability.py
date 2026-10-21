@@ -209,16 +209,16 @@ def _balanced_pair(robot: CapabilityProfile, task: TaskDescription, map_size: in
     total_weight = 0.0
 
     weights = {
-        "payload": 3.0,
-        "manipulators": 4.0,
-        "sensors": 3.0,
-        "communication": 0.5,
-        "safety": 1.0,
-        "environmental": 1.0,
+        "payload": 2.0,
+        "manipulators": 2.0,
+        "sensors": 4.0,
+        "communication": 3.0,
+        "safety": 3.0,
+        "environmental": 3.0,
         "reach": 2.0,
-        "sensor_range": 1.0,
+        "sensor_range": 2.0,
         "battery_duration": 2.0,
-        "special_functions": 2.0,
+        "special_functions": 3.0,
         "processing_power": 1.0,
         "navigation": 2.0,
     }
@@ -305,14 +305,16 @@ def _balanced_pair(robot: CapabilityProfile, task: TaskDescription, map_size: in
     # Special functions 
     total_weight += weights["special_functions"]
     task_function_mapping = {
-        "utilities": ["precise alignment", "balance control"],
-        "debris": ["balance control", "object recognition"],
+        "utilities grip": ["precise alignment", "object recognition"],
+        "utilities bucket": ["terrain leveling", "precise alignment"],
+        "utilities weld": ["balance control", "gesture recognition"],
+        "move crate": ["precise alignment", "balance control"],
         "delivery": ["object recognition"],
-        "assembly": ["object recognition", "precise alignment"],
-        "excavate": [ "terrain leveling", "precise alignment"],
-        "item elevation": ["precise alignment", "balance control"],
-        "lay bricks": ["object recognition", "precise alignment"],
-        "scaffold": ["precise alignment", "balance control"],
+        "assembly": ["gesture recognition"],
+        "excavate": [ "terrain leveling"],
+        "item elevation": ["precise alignment"],
+        "lay bricks": ["precise alignment"],
+        "scaffold": ["balance control"],
     }
     required_functions = task_function_mapping[task.task_type]
     matched_special_functions = sum(special in robot.special_functions for special in required_functions)
@@ -341,7 +343,7 @@ def _balanced_pair(robot: CapabilityProfile, task: TaskDescription, map_size: in
         final_score = score / total_weight
         # ---- Proximity ---- #
         if map_size and map_size > 0:
-            final_score *= 1.0 / (1.0 + distance_to_task / map_size)   # in (0, 1]
+            final_score *= 2.0 / (1.0 + distance_to_task / map_size)   # in (0, 1]
     else:
         final_score = 0.0
 
@@ -376,16 +378,16 @@ def _loose_pair(robot: CapabilityProfile, task: TaskDescription, map_size: int) 
     total_weight = 0.0  # for normalization
 
     weights = {
-        "payload": 3.0,
-        "manipulators": 4.0,
-        "sensors": 3.0,
-        "communication": 0.5,
-        "safety": 1.0,
-        "environmental": 1.0,
+        "payload": 2.0,
+        "manipulators": 2.0,
+        "sensors": 4.0,
+        "communication": 3.0,
+        "safety": 3.0,
+        "environmental": 3.0,
         "reach": 2.0,
-        "sensor_range": 1.0,
+        "sensor_range": 2.0,
         "battery_duration": 2.0,
-        "special_functions": 2.0,
+        "special_functions": 3.0,
         "processing_power": 1.0,
         "navigation": 2.0,
     }
@@ -464,14 +466,16 @@ def _loose_pair(robot: CapabilityProfile, task: TaskDescription, map_size: int) 
     # Special functions 
     total_weight += weights["special_functions"]
     task_function_mapping = {
-        "utilities": ["precise alignment", "balance control"],
-        "debris": ["balance control", "object recognition"],
+        "utilities grip": ["precise alignment", "object recognition"],
+        "utilities bucket": ["terrain leveling", "precise alignment"],
+        "utilities weld": ["balance control", "gesture recognition"],
+        "move crate": ["precise alignment", "balance control"],
         "delivery": ["object recognition"],
-        "assembly": ["object recognition", "precise alignment"],
-        "excavate": [ "terrain leveling", "precise alignment"],
-        "item elevation": ["precise alignment", "balance control"],
-        "lay bricks": ["object recognition", "precise alignment"],
-        "scaffold": ["precise alignment", "balance control"],
+        "assembly": ["gesture recognition"],
+        "excavate": [ "terrain leveling"],
+        "item elevation": ["precise alignment"],
+        "lay bricks": ["precise alignment"],
+        "scaffold": ["balance control"],
     }
     required_functions = task_function_mapping[task.task_type]
     matched_special_functions = sum(special in robot.special_functions for special in required_functions)
@@ -500,7 +504,7 @@ def _loose_pair(robot: CapabilityProfile, task: TaskDescription, map_size: int) 
         final_score = score / total_weight
         # ---- Proximity ---- #
         if map_size and map_size > 0:
-            final_score *= 1.0 / (1.0 + distance_to_task / map_size)   # in (0, 1]
+            final_score *= 2.0 / (1.0 + distance_to_task / map_size)   # in (0, 1]
     else:
         final_score = 0.0
 
@@ -535,16 +539,16 @@ def _strict_pair(robot: CapabilityProfile, task: TaskDescription, map_size: int)
     total_weight = 0.0
 
     weights = {
-        "payload": 3.0,
-        "manipulators": 4.0,
-        "sensors": 3.0,
-        "communication": 0.5,
-        "safety": 1.0,
-        "environmental": 1.0,
+        "payload": 2.0,
+        "manipulators": 2.0,
+        "sensors": 4.0,
+        "communication": 3.0,
+        "safety": 3.0,
+        "environmental": 3.0,
         "reach": 2.0,
-        "sensor_range": 1.0,
+        "sensor_range": 2.0,
         "battery_duration": 2.0,
-        "special_functions": 2.0,
+        "special_functions": 3.0,
         "processing_power": 1.0,
         "navigation": 2.0,
     }
@@ -635,14 +639,16 @@ def _strict_pair(robot: CapabilityProfile, task: TaskDescription, map_size: int)
     # ---- Special functions ---- #
     total_weight += weights["special_functions"]
     task_function_mapping = {
-        "utilities": ["precise alignment", "balance control"],
-        "debris": ["balance control", "object recognition"],
+        "utilities grip": ["precise alignment", "object recognition"],
+        "utilities bucket": ["terrain leveling", "precise alignment"],
+        "utilities weld": ["balance control", "gesture recognition"],
+        "move crate": ["precise alignment", "balance control"],
         "delivery": ["object recognition"],
-        "assembly": ["object recognition", "precise alignment"],
-        "excavate": [ "terrain leveling", "precise alignment"],
-        "item elevation": ["precise alignment", "balance control"],
-        "lay bricks": ["object recognition", "precise alignment"],
-        "scaffold": ["precise alignment", "balance control"],
+        "assembly": ["gesture recognition"],
+        "excavate": [ "terrain leveling"],
+        "item elevation": ["precise alignment"],
+        "lay bricks": ["precise alignment"],
+        "scaffold": ["balance control"],
     }
     required_functions = task_function_mapping[task.task_type]
     matched_special_functions = sum(special in robot.special_functions for special in required_functions)
@@ -671,7 +677,7 @@ def _strict_pair(robot: CapabilityProfile, task: TaskDescription, map_size: int)
         final_score = score / total_weight
         # ---- Proximity ---- #
         if map_size and map_size > 0:
-            final_score *= 1.0 / (1.0 + distance_to_task / map_size)   # in (0, 1]
+            final_score *= 2.0 / (1.0 + distance_to_task / map_size)   # in (0, 1]
     else:
         final_score = 0.0
 
@@ -1019,6 +1025,21 @@ def _parse_output_matrix_bypass(
 
 
 def build_name_only_prompt(robots_json: str, tasks_json: str) -> str:
+    """
+    Build the "name-only" LLM prompt that asks the model to score each robot
+    against each task using only the task's name (and optional nl_description),
+    with no access to the full capability profile.
+
+    Parameters:
+        robots_json: JSON string of the minimal robot views (id, mobility,
+            manipulators, payload, reach, sensors, etc.).
+        tasks_json: JSON string of the minimal task views (id, task_type, and
+            optional nl_description / strict_profile_name).
+
+    Returns:
+        A formatted prompt string ending with the strict OUTPUT-matrix format
+        the parser in _parse_output_matrix expects.
+    """
     return f"""
 You score robot–task suitability using ONLY each task's name and a short description (if provided).
 Infer typical requirements from the task name (and description), then score how suitable each robot is.

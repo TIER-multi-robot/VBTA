@@ -1,12 +1,13 @@
 
 /.ipynb_checkpoints
 __pycache__/
-# MAPF_benchmark_maps/
+MAPF_benchmark_maps/
 .venv/
 expressions.txt
 Processed_Benchmarks/
 *.txt
 *.yaml
+*.md
 cbs_test.ipynb
 git-filter-repo
 hvbta/io/results/
@@ -18,4 +19,10 @@ hvbta/io/*
 *.prof
 unused/*
 todo
-CSV_COLUMNS.md
+*.env
+local-claude.ps1
+glm-claude.ps1
+body.json
+Modelfile
+local_claude.ps1
+opencode.json

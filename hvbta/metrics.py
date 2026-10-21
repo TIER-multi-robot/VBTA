@@ -215,6 +215,31 @@ def calculate_robustness_metrics(scores: List[float]) -> dict:
     }
 
 def compare_matrices(M_llm: np.ndarray, M_rule: np.ndarray) -> dict:
+    """
+    Compare two suitability matrices element-wise to measure agreement between
+    an LLM-derived matrix and a rule-based reference matrix.
+
+    Both matrices must share the same shape, interpreted as (R robots, T tasks).
+    The comparison spans four dimensions: calibration, ranking, decisions, and
+    feasibility agreement.
+
+    Parameters:
+        M_llm: Suitability matrix produced by the LLM, shape (R, T).
+        M_rule: Reference suitability matrix from rule-based scoring, shape (R, T).
+
+    Returns:
+        Dictionary with:
+        - mae: Mean absolute error between the flattened matrices.
+        - rmse: Root mean squared error between the flattened matrices.
+        - bias: Mean signed difference (M_llm - M_rule); positive => LLM overestimates.
+        - pearson: Pearson correlation between the flattened matrices.
+        - rho_per_task: Mean Spearman rank correlation across tasks (per-task robot rankings).
+        - rho_per_robot: Mean Spearman rank correlation across robots (per-robot task rankings).
+        - top1: Fraction of tasks where the top-ranked robot agrees.
+        - hungarian_jaccard: Jaccard index between the optimal assignment pairs (Hungarian).
+        - efficiency: LLM's assignment total under M_rule, relative to the rule-based optimum.
+        - feasability_agree: Fraction of cells whose feasibility (above eps=0.05) agrees.
+    """
     R, T = M_rule.shape
     flat_llm, flat_rule = M_llm.ravel(), M_rule.ravel()
 

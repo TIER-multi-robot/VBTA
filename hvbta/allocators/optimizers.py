@@ -3,6 +3,7 @@ import numpy as np
 from typing import List, Tuple, Callable
 import pulp
 import time
+import heapq
 from hvbta.models import CapabilityProfile, TaskDescription
 from .assignments import generate_random_assignments
 from hvbta.suitability import calculate_suitability_matrix, calculate_total_suitability
@@ -12,6 +13,25 @@ def suitability_all_zero(suitability_matrix):
     return all(value == 0 for row in suitability_matrix for value in row)
 
 def jv_task_allocation(matrix):
+    """
+    Solves the task allocation problem using the Jonker-Volgenant (JV) algorithm
+    via `scipy.optimize.linear_sum_assignment`, which finds the optimal one-to-one
+    assignment that maximizes total suitability.
+
+    Since `linear_sum_assignment` solves the minimum-cost assignment problem, the
+    suitability matrix is converted to a cost matrix by subtracting each score
+    from the maximum value in the matrix (`max_val - matrix`). Pairs with a zero
+    suitability score are dropped from the result, so only meaningful (positive)
+    assignments are returned.
+
+    Parameters:
+        matrix: A 2D array-like where the element at [i][j] represents the
+                suitability score of robot i for task j.
+
+    Returns:
+        assignment: A list of (robot, task) index pairs representing the optimal
+                    allocation, excluding any pairs with a zero suitability score.
+    """
     matrix = np.array(matrix)
     max_val = np.max(matrix)
     
@@ -507,3 +527,218 @@ def reassign_robots_to_tasks_randomly_with_method(
     per_agent_scores = [0.0] * len(assigned_pairs)
 
     return filtered_best_assignments, total_scores, length, per_agent_scores
+
+
+# ===========================================================================
+# Murty's K-best assignment algorithm
+# ===========================================================================
+# Generates the K-best assignments for a bipartite matching problem by
+# repeatedly excluding one pair from the optimal solution and re-solving.
+# Each alternative differs from the optimal by at least one robot-task pair.
+#
+# Used as a baseline that gives optimization methods the same alternative-
+# generation capability as voting's candidate pool, so the replan-on-failure
+# comparison is fair: both methods have alternatives, but Murty's alternatives
+# are near-optimal perturbations (differ by ~1 pair) while voting's are
+# random samples (differ by many pairs).
+
+def murtys_k_best_assignments(suitability_matrix, k=5):
+    """
+    Find the K-best assignments using Murty's algorithm.
+
+    Returns a list of (assignment, score) tuples sorted by descending score.
+    Each assignment is a list of (robot_idx, task_idx) pairs.
+    """
+    matrix = np.array(suitability_matrix, dtype=float)
+    n_robots, n_tasks = matrix.shape
+
+    # Handle zero-suitability: all pairs are equally bad
+    if np.max(matrix) == 0:
+        return []
+
+    # Convert to cost matrix for scipy (minimization)
+    max_val = np.max(matrix)
+    cost = max_val - matrix
+
+    # Find the optimal assignment
+    row_ind, col_ind = linear_sum_assignment(cost)
+    best_assignment = [(int(r), int(c)) for r, c in zip(row_ind, col_ind) if matrix[r, c] > 0]
+    best_score = sum(matrix[r, c] for r, c in best_assignment)
+
+    if not best_assignment or k <= 1:
+        return [(best_assignment, best_score)]
+
+    # Use a max-heap (negate scores for Python's min-heap)
+    # Each entry: (-score, counter, assignment, excluded_pairs)
+    counter = 0
+    heap = [(-best_score, counter, best_assignment, set())]
+    counter += 1
+
+    results = []
+    seen = set()  # result dedup only — prevents the same assignment appearing twice
+
+    while heap and len(results) < k:
+        neg_score, _, assignment, excluded = heapq.heappop(heap)
+        score = -neg_score
+
+        # Deduplicate RESULTS by frozenset of pairs — only exact duplicates
+        # are filtered. Near-identical assignments (differing by 1 pair) are
+        # kept, since they are the whole point of Murty's (near-optimal
+        # perturbations for replan-on-failure).
+        key = frozenset(assignment)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append((assignment, score))
+
+        if len(results) >= k:
+            break
+
+        # Branch: for each pair in the current assignment, exclude it and
+        # re-solve to get the best assignment that doesn't include that pair.
+        # No branch deduplication — allow re-exploration of branches that
+        # may lead to different results. The result dedup above handles
+        # any duplicates in the output.
+        for pair in assignment:
+            new_excluded = excluded | {pair}
+
+            # Create modified cost matrix with excluded pairs set to infinity
+            modified_cost = cost.copy()
+            for (r, c) in new_excluded:
+                modified_cost[r, c] = 1e9
+
+            # Re-solve
+            try:
+                row_ind2, col_ind2 = linear_sum_assignment(modified_cost)
+                alt_assignment = [(int(r), int(c)) for r, c in zip(row_ind2, col_ind2)
+                                  if matrix[r, c] > 0 and (r, c) not in new_excluded]
+                alt_score = sum(matrix[r, c] for r, c in alt_assignment)
+
+                if alt_assignment and alt_score > 0:
+                    alt_key = frozenset(alt_assignment)
+                    if alt_key not in seen:
+                        heapq.heappush(heap, (-alt_score, counter, alt_assignment, new_excluded))
+                        counter += 1
+            except Exception:
+                continue
+
+    return results
+
+
+def murtys_task_allocation(matrix):
+    """
+    Allocation method interface (same as jv_task_allocation).
+    Returns the best (optimal) assignment only.
+    """
+    results = murtys_k_best_assignments(matrix, k=1)
+    if results:
+        return results[0][0]
+    return []
+
+
+def reassign_robots_to_tasks_with_murtys(
+        robots, tasks, num_candidates, voting_method, suitability_source,
+        unassigned_robots, unassigned_tasks, allocation_method,
+        start_positions, goal_positions, map_size,
+        k_alternatives=5, murtys_alternatives_out=None,
+        inertia_threshold=0.1):
+    """
+    Reassign using Murty's K-best algorithm. Same interface as
+    reassign_robots_to_tasks_with_method, but also populates
+    murtys_alternatives_out with the K-best assignments (as ID-pair lists)
+    for the replan-on-failure mechanism.
+
+    murtys_alternatives_out: mutable list that will be populated with
+        alternative assignments as [(robot_id, task_id), ...] lists.
+        Index 0 = winner (already applied), indices 1+ = alternatives.
+    """
+    urobots = [robot for robot in robots if not robot.assigned]
+    utasks = [task for task in tasks if not task.assigned]
+
+    if not urobots or not utasks:
+        return {}, unassigned_robots, unassigned_tasks, 0.0, 0.0, []
+
+    # Get suitability matrix
+    if isinstance(suitability_source, tuple) and len(suitability_source) == 3:
+        full_matrix, robot_id_to_idx, task_id_to_idx = suitability_source
+        suitability_matrix = extract_submatrix(full_matrix, urobots, utasks, robot_id_to_idx, task_id_to_idx)
+        use_matrix_lookup = True
+    else:
+        suitability_matrix = suitability_source(urobots, utasks, map_size=map_size)
+        suitability_matrix = np.clip(suitability_matrix, 0.0, 1.0)
+        use_matrix_lookup = False
+
+    if suitability_all_zero(suitability_matrix):
+        print("All suitability scores are zero, randomly assigning tasks to robots.")
+        output, score, length, per_agent_scores = reassign_robots_to_tasks_randomly_with_method(
+            robots, tasks, num_candidates, unassigned_robots, unassigned_tasks)
+        assigned_pairs = output[0]
+        unassigned_robots = [urobots[i].robot_id for i in output[1]] if output[1] else []
+        unassigned_tasks = [utasks[j].task_id for j in output[2]] if output[2] else []
+        return_assignments = {}
+        for (robot_idx, task_idx) in assigned_pairs:
+            r = urobots[robot_idx]
+            t = utasks[task_idx]
+            r.current_task = t
+            r.tasks_attempted += 1
+            t.assigned_robot = r
+            r.assigned = True
+            t.assigned = True
+            r.current_task_suitability = 0.0
+            t.current_suitability = 0.0
+            start_positions[r.robot_id] = r.location
+            goal_positions[r.robot_id] = t.location
+            return_assignments[r.robot_id] = t.task_id
+        return return_assignments, unassigned_robots, unassigned_tasks, score, length, per_agent_scores
+
+    # Generate K-best assignments
+    start_time = time.perf_counter_ns()
+    k_best = murtys_k_best_assignments(suitability_matrix, k=k_alternatives)
+    end_time = time.perf_counter_ns()
+    length = (end_time - start_time) / 1000.0
+
+    if not k_best:
+        return {}, unassigned_robots, unassigned_tasks, 0.0, length, []
+
+    # Apply the best assignment
+    best_assignment, best_score = k_best[0]
+    print(f"Best assignment in optimization (Murty's) {best_assignment}")
+
+    return_assignments = {}
+    assigned_robots_set = set()
+    assigned_tasks_set = set()
+
+    for (robot_idx, task_idx) in best_assignment:
+        pair_score = suitability_matrix[robot_idx][task_idx]
+        r = urobots[robot_idx]
+        t = utasks[task_idx]
+        r.current_task = t
+        r.tasks_attempted += 1
+        t.assigned_robot = r
+        r.assigned = True
+        t.assigned = True
+        r.current_task_suitability = pair_score
+        t.current_suitability = pair_score
+        start_positions[r.robot_id] = r.location
+        goal_positions[r.robot_id] = t.location
+        return_assignments[r.robot_id] = t.task_id
+        assigned_robots_set.add(robot_idx)
+        assigned_tasks_set.add(task_idx)
+
+    unassigned_robots = [urobots[i].robot_id for i in range(len(urobots)) if i not in assigned_robots_set]
+    unassigned_tasks = [utasks[j].task_id for j in range(len(utasks)) if j not in assigned_tasks_set]
+
+    # Populate alternatives for replan-on-failure
+    if murtys_alternatives_out is not None:
+        for alt_assignment, alt_score in k_best[1:]:  # skip index 0 (winner)
+            # Convert local indices to robot/task IDs
+            id_pairs = [(urobots[r].robot_id, utasks[t].task_id) for r, t in alt_assignment]
+            murtys_alternatives_out.append(id_pairs)
+
+    # Per-agent scores
+    per_agent_scores = [float(r.current_task_suitability) for r in robots if r.assigned and r.current_task]
+
+    print(f"Reassign Score: {best_score}, Reassign Length: {length}")
+    print(f"  Murty's generated {len(k_best)} alternatives ({len(k_best)-1} available for replan)")
+
+    return return_assignments, unassigned_robots, unassigned_tasks, best_score, length, per_agent_scores

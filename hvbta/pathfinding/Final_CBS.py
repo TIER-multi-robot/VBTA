@@ -3,6 +3,20 @@ import sys
 sys.path.insert(0, '../')
 import argparse
 import yaml
+import time
+
+# Default CBS wall-clock timeout (seconds). Literature conventions:
+#   - 300s : the de facto standard for STATIC MAPF benchmarking (Stern et al.
+#            2019; Sharon et al. 2015; Felner et al. 2018 -- the Moving AI
+#            benchmark convention).
+#   - 1-10s: typical for lifelong/online replanning (Li et al. 2021), where the
+#            planner is called many times per run and a single hang would
+#            stall the whole sweep.
+# 30s is a middle ground for this sim: long enough to solve the vast majority
+# of standard instances (CBS solves most under 30s) while keeping a failed
+# replan call from hanging the run. Override per-call via CBS.search(time_limit=)
+# or via cbs_planner.plan(..., time_limit=...).
+CBS_TIME_LIMIT_S = 30.0
 from math import fabs
 from itertools import combinations
 from copy import deepcopy
@@ -454,8 +468,15 @@ class CBS(object):
         # self.open_set = set()
         self.open_set = []
         self.closed_set = set()
-    def search(self):
-        """Perform CBS search"""
+    def search(self, time_limit=CBS_TIME_LIMIT_S):
+        """Perform CBS search.
+
+        time_limit: wall-clock seconds before the high-level search gives up
+            and returns {} (failure). 0 or None disables the timeout. Default
+            is the module-level CBS_TIME_LIMIT_S (30s). See that constant's
+            comment for the literature rationale.
+        """
+        start_time = time.time()
         start = HighLevelNode()
         # print(f"\n\n\n COMPUTING INITIAL SOLUTION\n\n\n")
         start.constraint_dict = {}
@@ -480,7 +501,17 @@ class CBS(object):
 
         # Search open_set starting with the lowest cost nodes first, adding them to closed_set as we go
         while self.open_set:
-            # print(f"\n\n\n EXPANDING HIGH LEVEL NODE {count} \n\n\n")
+            # Wall-clock timeout. Checked once per high-level node expansion;
+            # the low-level A* (compute_solution) is bounded by the graph, so a
+            # single iteration can't blow past the deadline by more than one
+            # A* call. On timeout return {} (the same shape the no-initial-
+            # solution branch returns at line 487) so cbs_planner.plan maps it
+            # to None -> (0.0, False) cleanly.
+            if time_limit and (time.time() - start_time) > time_limit:
+                print(f"CBS timed out after {time.time() - start_time:.1f}s "
+                      f"({len(self.closed_set)} high-level nodes expanded).")
+                return {}
+            print(f"\n\n\n EXPANDING HIGH LEVEL NODE {count} \n\n\n")
             # compares nodes based on cost of their solutions (uses __lt__ in HighLevelNode)
             # P = min(self.open_set)
             # self.open_set -= {P}

@@ -19,7 +19,7 @@ from hvbta.metrics import (
     calculate_inequality_metrics,
     calculate_robustness_metrics
 )
-from hvbta.pathfinding.CBS import load_map, create_obstacle_list, build_cbs_agents
+from hvbta.pathfinding.CBS_helper import load_map, create_obstacle_list, build_cbs_agents
 from hvbta.allocators.misc_assignment import add_new_tasks, add_new_robots, remove_random_robots
 import hvbta.generation as G
 from hvbta.models import CapabilityProfile, TaskDescription

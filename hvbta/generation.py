@@ -1,7 +1,7 @@
 import numpy as np
 import random
 from typing import List
-from hvbta.pathfinding.CBS import get_random_free_position
+from hvbta.pathfinding.CBS_helper import get_random_free_position
 from . import config as C
 from .models import (CapabilityProfile, TaskDescription, AutonomyLevel, TaskTypes, 
                      Priorities, PerformanceMetrics)
@@ -25,14 +25,17 @@ def get_unique_task_location(tasks, grid, occupied_locations=None, max_attempts=
     Args:
         tasks: List of existing TaskDescription objects to check against.
         grid: The grid representing the environment, used to find free positions.
-        occupied_locations: Ignored for the overlap check (kept for backward-compat); only
-            other-task locations are forbidden.
+        occupied_locations: Set of (row, col) locations to avoid (in addition to
+            existing task locations). Used by build_event_schedule to prevent
+            dynamically added tasks from spawning at the same cell as existing tasks.
         max_attempts: Maximum number of attempts before giving up.
 
     Returns:
         location: A unique (x, y, z) location tuple for the new task.
     """
     task_locations = {task.location for task in tasks}
+    if occupied_locations:
+        task_locations |= set(occupied_locations)
     location = get_random_free_position(grid, task_locations)
     attempts = 0
     while any(np.allclose(location, occ_loc) for occ_loc in task_locations):
@@ -192,7 +195,7 @@ def generate_random_robot_profile_strict(robot_id: str, grid: List[List[int]], o
         payload_capacity=float(p["payload_capacity"]),
         reach=float(p["reach"]),
         # battery_life=float(p["battery_life"]),
-        battery_life=max(500, round(random.uniform(HYPOTENUSE, HYPOTENUSE*10), 1)), # takes into account the size of the map
+        battery_life=max(float(p["battery_life"]), round(random.uniform(HYPOTENUSE, HYPOTENUSE*5), 1)),
         size=tuple(p["size"]),
         environmental_resistance=list(p["environmental_resistance"]),
         sensors=list(p["sensors"]),
@@ -223,23 +226,62 @@ def generate_random_task_description_strict(task_id: str, grid: List[List[int]],
     else: 
         p = STRICT_TASK_PROFILES[choice]
 
+    # For the 4 shared (multi-robot) task types, randomly pick one from each
+    # pair of soft-score attributes so that sometimes one compatible robot
+    # scores higher and sometimes the other does. This creates genuine
+    # assignment-choice diversity where voting's candidate pool can explore
+    # different tradeoffs.
+    shared_task_overrides = {
+        "utilities grip": {
+            "sensors_needed": [["GPS", "camera", "ultrasonic"], ["GPS", "camera", "proximity"]],
+            "communication_requirements": [["Radio", "5G"], ["Radio", "Wi-Fi"]],
+            "environmental_conditions": [["cold-resistant", "dustproof"], ["cold-resistant", "heat-resistant"]],
+            "safety_protocols": [["overload protection", "overheat protection"], ["overload protection", "obstacle detection"]],
+        },
+        "utilities bucket": {
+            "sensors_needed": [["magnetometer", "camera", "LiDAR"], ["magnetometer", "camera", "proximity"]],
+            "communication_requirements": [["Radio", "Wi-Fi"], ["Radio", "Bluetooth"]],
+            "environmental_conditions": [["heat-resistant", "dustproof"], ["heat-resistant", "weatherproof"]],
+            "safety_protocols": [["overheat protection", "fall detection"], ["overheat protection", "obstacle detection"]],
+        },
+        "utilities weld": {
+            "sensors_needed": [["proximity", "LiDAR", "camera"], ["proximity", "LiDAR", "ultrasonic"]],
+            "communication_requirements": [["Radio", "Wi-Fi"], ["4G", "Bluetooth"]],
+            "environmental_conditions": [["shock-resistant", "wind-resistant"], ["shock-resistant", "heat-resistant"]],
+            "safety_protocols": [["fall detection", "collision avoidance"], ["fall detection", "overheat protection"]],
+        },
+        "move crate": {
+            "sensors_needed": [["LiDAR", "camera", "proximity"], ["LiDAR", "camera", "ultrasonic"]],
+            "communication_requirements": [["Radio", "Wi-Fi"], ["5G", "Bluetooth"]],
+            "environmental_conditions": [["shock-resistant", "wind-resistant"], ["shock-resistant", "dustproof"]],
+            "safety_protocols": [["fall detection", "collision avoidance"], ["fall detection", "overload protection"]],
+        },
+    }
+
+    overrides = shared_task_overrides.get(p["task_type"], {})
+    sensors_needed = random.choice(overrides["sensors_needed"]) if "sensors_needed" in overrides else list(p.get("sensors_needed"))
+    communication_requirements = random.choice(overrides["communication_requirements"]) if "communication_requirements" in overrides else list(p.get("communication_requirements", []))
+    environmental_conditions = random.choice(overrides["environmental_conditions"]) if "environmental_conditions" in overrides else list(p.get("environmental_conditions", []))
+    safety_protocols = random.choice(overrides["safety_protocols"]) if "safety_protocols" in overrides else list(p.get("safety_protocols", []))
+
     return TaskDescription(
         task_id=task_id,
         task_type=p["task_type"],
         objective=f"Perform {p['task_type']} task",
-        priority_level=p["priority_level"],
+        # priority_level=p["priority_level"],
+        priority_level=random.choices(list(Priorities), weights=[30, 30, 20, 20])[0].value,
         reward=float(p["reward"]),
         difficulty=float(p["difficulty"]),
         location=get_unique_task_location(tasks, grid, occupied_locations),
         navigation_constraints=list(p.get("navigation_constraints", [])),
         required_capabilities=p.get("required_capabilities", {}),  # list of strings
         time_window=(f"{random.randint(8, 17)}:00", f"{random.randint(18, 23)}:00"),
-        environmental_conditions=list(p.get("environmental_conditions", [])),
+        environmental_conditions=environmental_conditions,
         dependencies=[],
-        sensors_needed=list(p.get("sensors_needed")),
+        sensors_needed=sensors_needed,
         manipulators_needed=list(p.get("manipulators_needed")),
-        communication_requirements=[c for c in p.get("communication_requirements", []) if c in C.COMM_PROTOCOLS],
-        safety_protocols=list(p.get("safety_protocols", [])),
+        communication_requirements=[c for c in communication_requirements if c in C.COMM_PROTOCOLS],
+        safety_protocols=safety_protocols,
         performance_metrics=p.get("performance_metric", "completion rate"),
         success_criteria="Task completed within time window",
         assigned_robot=None,

@@ -9,7 +9,6 @@ import datetime
 from collections import deque
 from typing import List
 
-from hvbta.pathfinding.Final_CBS import CBS, Environment
 from hvbta.simulation.timestep import simulate_time_step
 import hvbta.allocators.voting as V
 import hvbta.allocators.optimizers as O
@@ -20,12 +19,36 @@ from hvbta.metrics import (
     calculate_inequality_metrics,
     calculate_robustness_metrics,
 )
-from hvbta.pathfinding.CBS import load_map, create_obstacle_list, build_cbs_agents
+from hvbta.pathfinding.CBS_helper import load_map, create_obstacle_list
+from hvbta.pathfinding.MAPF_wrapper import run_planner
 from hvbta.allocators.misc_assignment import (
     add_new_tasks, add_new_robots, remove_random_robots, remove_random_tasks,
     remove_task_by_id, remove_robot_by_id,
 )
 from hvbta.models import CapabilityProfile, TaskDescription
+
+
+# ---------------------------------------------------------------------------
+# Named regimes (TODO Part 2 Phase 1). Replaces the four independent rate knobs
+# with a single `scenario` selector so the sweep is tractable and tables are
+# readable. Every method + planner in a (map, robots, tasks, nc, sm, rep,
+# scenario) group replays the SAME event schedule; the scenario sets the four
+# rates that build that schedule.
+#
+# These are HYPOTHESES tuned to a 10-robot / 10-task baseline. The overload
+# rate must exceed the measured completion capacity or it isn't overload; the
+# calm rate must be low enough to sit near-static. Adjust after Phase 0 data.
+# ---------------------------------------------------------------------------
+REGIMES = {
+    "calm":       dict(task_arrival_rate=0.10, task_cancellation_rate=0.01,
+                       robot_arrival_rate=0.01, robot_departure_rate=0.01),
+    "task_churn": dict(task_arrival_rate=0.15, task_cancellation_rate=0.08,
+                       robot_arrival_rate=0.01, robot_departure_rate=0.01),
+    "fleet_churn":dict(task_arrival_rate=0.05, task_cancellation_rate=0.02,
+                       robot_arrival_rate=0.15, robot_departure_rate=0.15),
+    "overload":   dict(task_arrival_rate=0.60, task_cancellation_rate=0.02,
+                       robot_arrival_rate=0.03, robot_departure_rate=0.03),
+    }
 
 
 def compute_all_fairness_metrics(scores):
@@ -61,6 +84,32 @@ def suitability_all_zero(suitability_matrix):
     return all(value == 0 for row in suitability_matrix for value in row)
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: Event-exposure-based horizon. Walks the pre-materialized schedule
+# accumulating scheduled events; returns the step at which the running total
+# first reaches K. This makes cross-regime comparison fair: every regime sees
+# a comparable NUMBER OF EVENTS, not a comparable number of steps.
+# ---------------------------------------------------------------------------
+def horizon_for_event_count(schedule, K):
+    """Return the step index at which cumulative scheduled events reach K.
+
+    Events counted per entry: len(add_tasks) + len(add_robots) +
+    len(remove_robot_ids) + len(remove_task_ids). Returns len(schedule) if K
+    is never reached (the schedule is long enough that all events fire).
+    """
+    total = 0
+    for i, entry in enumerate(schedule):
+        total += (
+            len(entry["add_tasks"])
+            + len(entry["add_robots"])
+            + len(entry["remove_robot_ids"])
+            + len(entry["remove_task_ids"])
+        )
+        if total >= K:
+            return i + 1
+    return len(schedule)
+
+
 def state_check(robots: List[CapabilityProfile], unassigned_robots: List[str], unassigned_tasks: List[str]):
     """State signature for deciding whether to re-plan."""
     active, goals = [], []
@@ -74,76 +123,6 @@ def state_check(robots: List[CapabilityProfile], unassigned_robots: List[str], u
         tuple(sorted(unassigned_robots)),
         tuple(sorted(unassigned_tasks)),
     )
-
-
-def run_cbs(robots, start_positions, goal_positions, map_dict):
-    """
-    Plan all assigned-robot paths jointly with CBS.
-
-    Unassigned robots are added as stationary CBS agents (start == goal == current
-    location). This lets CBS route the moving robots around them; otherwise CBS
-    would happily plan paths straight through an idle robot's cell, causing
-    undetected physical collisions.
-
-    Writes resulting paths back onto each robot's `current_path` and
-    `remaining_distance`. Returns (avg_moving_path_length, cbs_succeeded). The
-    success flag lets the outer loop drain pending event timestamps for
-    adaptation-latency accounting only on real CBS resolution, not on failure.
-    """
-    if not start_positions or not goal_positions:
-        # No mover agents to plan for; treat as trivial success so pending
-        # event latencies are still measured against "the next moment CBS
-        # was invoked and did not fail."
-        return 0.0, True
-
-    # Augment with stationary agents for unassigned robots so CBS sees them as blockers.
-    aug_starts = dict(start_positions)
-    aug_goals = dict(goal_positions)
-    stationary_ids = set()
-    for r in robots:
-        if r.robot_id in aug_starts:
-            continue  # already planned as a mover
-        if getattr(r, "location", None) is None:
-            continue
-        aug_starts[r.robot_id] = r.location
-        aug_goals[r.robot_id] = r.location
-        stationary_ids.add(r.robot_id)
-
-    agents = build_cbs_agents(robots, aug_starts, aug_goals)
-    if not agents:
-        return 0.0, True
-
-    # duplicate-start guard - CBS rejects this anyway, but fail fast and informative
-    start_locations = [a['start'] for a in agents]
-    if len(start_locations) != len(set(start_locations)):
-        print("ERROR: Duplicate start locations in agent list. Skipping CBS.")
-        return 0.0, False
-
-    env = Environment(
-        dimension=map_dict['dimension'],
-        agents=agents,
-        obstacles=map_dict['obstacles'],
-    )
-    res = CBS(env).search()
-    if not res:
-        print("CBS failed to find a plan under current constraints.")
-        return 0.0, False
-
-    solution, _nodes_expanded, _conflicts = res
-    id_to_index = {r.robot_id: idx for idx, r in enumerate(robots)}
-    valid_lengths = []
-    for robot_id, schedule in solution.items():
-        if robot_id not in id_to_index:
-            continue
-        r = robots[id_to_index[robot_id]]
-        # Skip stationary blockers - do not overwrite their (empty) current_path with the trivial wait schedule.
-        if robot_id in stationary_ids:
-            continue
-        r.current_path = [(p['x'], p['y']) for p in schedule]
-        r.remaining_distance = max(0, len(schedule) - 1)
-        if len(schedule) > 1:
-            valid_lengths.append(len(schedule) - 1)
-    return (float(np.mean(valid_lengths)) if valid_lengths else 0.0), True
 
 
 def _with_seeded_random(seed, fn, *args, **kwargs):
@@ -212,6 +191,12 @@ def build_event_schedule(
     ev_rng = random.Random(seed)
     shadow_robot_ids = [r.robot_id for r in initial_robots]
     shadow_task_ids = [t.task_id for t in initial_tasks]
+    # Track occupied locations for dynamically added tasks/robots so they
+    # don't overlap with each other. Without this, two tasks can spawn at
+    # the same cell, giving two robots the same goal — an unsolvable MAPF
+    # instance that causes the planner to time out.
+    occupied_task_locs = set(t.location for t in initial_tasks)
+    occupied_robot_locs = set(r.location for r in initial_robots)
     next_robot_id = len(initial_robots) + 1
     next_task_id = len(initial_tasks) + 1
 
@@ -232,10 +217,12 @@ def build_event_schedule(
                 next_task_id += 1
                 gen_seed = ev_rng.randint(0, 2**32 - 1)
                 # Strict-only generation; the *_generation_strict flags are vestigial.
+                # Pass occupied_task_locs so new tasks don't overlap existing ones.
                 new_t = _with_seeded_random(
                     gen_seed,
-                    G.generate_random_task_description_strict, tid, grid, set(), [],
+                    G.generate_random_task_description_strict, tid, grid, occupied_task_locs, [],
                 )
+                occupied_task_locs.add(new_t.location)
                 entry["add_tasks"].append(new_t)
                 shadow_task_ids.append(tid)
 
@@ -248,8 +235,9 @@ def build_event_schedule(
                 gen_seed = ev_rng.randint(0, 2**32 - 1)
                 new_r = _with_seeded_random(
                     gen_seed,
-                    G.generate_random_robot_profile_strict, rid, grid, set(),
+                    G.generate_random_robot_profile_strict, rid, grid, occupied_robot_locs,
                 )
+                occupied_robot_locs.add(new_r.location)
                 entry["add_robots"].append(new_r)
                 shadow_robot_ids.append(rid)
 
@@ -375,7 +363,17 @@ def main_simulation(
         # When provided, dynamic events are replayed from this schedule instead of
         # drawn from the random-rate gates. Enables fair cross-method comparison
         # within a (rep, sm) group.
-        event_schedule: list = None):
+        event_schedule: list = None,
+        # MAPF planner selector ("cbs" | "pp" | "pibt" | "lacam"). Routes through
+        # MAPF_wrapper.run_planner so the outer loop is untouched. Default "cbs"
+        # during the refactor so partial progress never breaks a run.
+        planner: str = "lacam",
+        # Phase 4 CSV-provenance fields, passed through from the sweep so the
+        # row is self-describing. These are constant per run, not computed
+        # inside the sim — they're just threaded to the return tuple.
+        scenario: str = "",
+        scheduled_event_count: int = 0,
+        horizon_binding_term: str = ""):
     print(f"SUITABILITY METHOD: {suitability_method}")
 
     voting_methods = {
@@ -391,6 +389,7 @@ def main_simulation(
         O.ssia_task_allocation: "SSIA",
         O.ilp_task_allocation: "ILP",
         O.jv_task_allocation: "JV",
+        O.murtys_task_allocation: "Murty's K-Best",
     }
     voting_method_name = voting_methods.get(voting_method, "Unknown Method")
     optimization_method_name = optimization_methods.get(voting_method, "Unknown Method")
@@ -412,10 +411,18 @@ def main_simulation(
     # completed_per_step: one entry per elapsed timestep with # of task completions
     #     that step. Mean = throughput; variance = burstiness.
     # pending_event_steps: FIFO of timesteps at which a dynamic event fired without
-    #     a subsequent successful CBS resolution yet. Drained when run_cbs succeeds.
+    #     a subsequent successful PLANNER resolution yet. Drained when run_planner succeeds.
     # adaptation_latencies: timesteps elapsed between each drained event and the
     #     replan that resolved it.
     completed_per_step = []
+    # Phase 0 diagnostics: per-timestep task-pool and fleet-size logs. Used to
+    # diagnose the regime (steady state vs. overload) and to confirm the
+    # fleet-size random walk isn't drifting when arrival == departure rate.
+    # Surfaced via a single print at run end so a pilot run's stdout can be
+    # scraped for plotting without shifting the metric return tuple (CSV
+    # plumbing for these is deferred to Phase 4).
+    task_pool_size_per_step = []
+    fleet_size_per_step = []
     pending_event_steps = []
     adaptation_latencies = []
     # Urgency accounting. At each replan tick we record:
@@ -428,6 +435,18 @@ def main_simulation(
     # ("none urgent, no pressure") ... ("all urgent, high pressure").
     percentage_urgent_per_replan = []
     robot_pressure_per_replan = []
+    # Count of planner failures (ok=False) across the entire run. This
+    # measures how often the MAPF planner couldn't find a plan, which
+    # is the key metric for the planner-allocation interaction (replan-
+    # on-failure tries alternatives before accepting stale paths).
+    plan_failure_count = 0
+    # Total count of alternative assignments tried during replan-on-failure
+    # across the entire run. Each retry attempt (whether it succeeds or fails)
+    # increments this. Used to report the ratio of alternatives tried to
+    # failures, showing how many alternatives each method attempts before
+    # recovering or accepting stale paths.
+    alternatives_tried = 0
+    murtys_alternatives = []
     # Warm-start seed for the next voting replan. Persists across the loop as
     # a list of (robot_id, task_id) tuples (ID-based so it survives adds /
     # removes / completions). Updated after every successful voting replan.
@@ -496,7 +515,7 @@ def main_simulation(
     start_positions = {r.robot_id: r.location for r in robots if r.assigned and r.current_task}
     goal_positions = {r.robot_id: r.current_task.location for r in robots if r.assigned and r.current_task}
 
-    avg_path_length, _ = run_cbs(robots, start_positions, goal_positions, map_dict)
+    avg_path_length, _ = run_planner(planner, robots, start_positions, goal_positions, map_dict)
 
     # create the initial state
     previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
@@ -518,19 +537,34 @@ def main_simulation(
         )
         # Per-step throughput signal (used for mean + variance at end).
         completed_per_step.append(completed_this_step)
+        # Phase 0: log pool/fleet size every timestep, right after the step.
+        task_pool_size_per_step.append(len(tasks))
+        fleet_size_per_step.append(len(robots))
 
-        # First moment len(tasks) hits 0: record it so variable-length
-        # normalized metrics (throughput = success / completion_step) work.
+        # Record the first moment the task pool hits 0 — useful METRIC even
+        # when we don't terminate (the pool may refill from future arrivals).
+        # Captured whether or not the sim breaks here.
         if len(tasks) == 0 and all_tasks_completed_at_step is None:
             all_tasks_completed_at_step = time_step + 1
-            print(f"All tasks completed at time step {time_step + 1}!")
+
+        # Termination: pool empty AND no future task arrivals in the schedule.
+        # This prevents the sim from ending lifelong runs early when future
+        # arrivals would refill the pool — the confound the event schedule
+        # exists to remove. Under overload the pool never empties, so this
+        # never fires and the run goes to max_time_steps (correct).
+        no_future_tasks = (
+            event_schedule is None
+            or all(len(e["add_tasks"]) == 0 for e in event_schedule[time_step + 1:])
+        )
+        if len(tasks) == 0 and no_future_tasks:
+            print(f"All tasks completed at time step {time_step + 1} (no future arrivals).")
             total_time_steps = time_step + 1
-            break  # variable-length exit; comment out to run full horizon
+            break
 
         # update events with any completed tasks this timestep
         events["completed_tasks"] += completed_this_step
         # set the replan_cbs flag
-        should_replan_cbs = completed_this_step > 0
+        should_replan_paths = completed_this_step > 0
 
         # Snapshot pool sizes so we can measure add/remove churn from the dynamic
         # block below. Combined with completions, this feeds the adaptive
@@ -592,7 +626,7 @@ def main_simulation(
                 if cancelled_here:
                     pending_event_steps.append(time_step)
         else:
-            # legacy random-rate path (unchanged from prior implementation)
+            # legacy random-rate path (unchanged from prior implementation) NOT USED, MUST USE SCHEDULE FOR FAIR COMPARISON
             if add_tasks and random.random() < task_arrival_rate:
                 print(f"ADDING NEW TASKS AT TIME STEP {time_step + 1}")
                 n = random.randint(1, max(1, tasks_to_add))
@@ -683,7 +717,7 @@ def main_simulation(
             ):
                 should_replan = True
         if should_replan:
-            should_replan_cbs = True
+            should_replan_paths = True
 
         if should_replan:
             # ---- urgency + pressure snapshot for this replan ----
@@ -789,12 +823,24 @@ def main_simulation(
             
             # assign with optimization
             elif voting_method in optimization_methods:
-                print(f"REASSIGNING WITH OPTIMIZATION METHOD: {optimization_method_name}")
-                total_reassignments += 1
-                _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = O.reassign_robots_to_tasks_with_method(
-                    robots, tasks, num_candidates, voting_method, suitability_source,
-                    unassigned_robots, unassigned_tasks, voting_method, start_positions, goal_positions, HYPOTENUSE,
-                )
+                # Murty's uses a special reassign function that generates
+                # K-best alternatives for the replan-on-failure mechanism.
+                if voting_method == O.murtys_task_allocation:
+                    print(f"REASSIGNING WITH OPTIMIZATION METHOD: Murty's K-Best")
+                    total_reassignments += 1
+                    murtys_alternatives.clear()
+                    _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = O.reassign_robots_to_tasks_with_murtys(
+                        robots, tasks, num_candidates, voting_method, suitability_source,
+                        unassigned_robots, unassigned_tasks, voting_method, start_positions, goal_positions, HYPOTENUSE,
+                        k_alternatives=10, murtys_alternatives_out=murtys_alternatives,
+                    )
+                else:
+                    print(f"REASSIGNING WITH OPTIMIZATION METHOD: {optimization_method_name}")
+                    total_reassignments += 1
+                    _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = O.reassign_robots_to_tasks_with_method(
+                        robots, tasks, num_candidates, voting_method, suitability_source,
+                        unassigned_robots, unassigned_tasks, voting_method, start_positions, goal_positions, HYPOTENUSE,
+                    )
                 if reassign_per_agent_scores:
                     reassignment_jains_indices.append(calculate_jains_index(reassign_per_agent_scores))
                     reassignment_fairness_metrics.append(compute_all_fairness_metrics(reassign_per_agent_scores))
@@ -825,18 +871,154 @@ def main_simulation(
                     goal_positions.pop(robot.robot_id, None)
 
         # Record any task that is currently assigned - this is the "attempted" set.
-        # We do this every timestep (cheap) so cancellations of never-attempted tasks
-        # do not incorrectly count them.
+        # We do this every timestep (cheap) so cancellations of never-attempted
+        # tasks do not incorrectly count them.
         for t in tasks:
             if t.assigned:
                 tasks_ever_assigned.add(t.task_id)
 
-        # rerun cbs if needed, update state, and clear events
-        if should_replan_cbs and start_positions and goal_positions:
-            print("\nRERUNNING CBS\n")
-            new_len, cbs_ok = run_cbs(robots, start_positions, goal_positions, map_dict)
+        # rerun planner if needed, update state, and clear events.
+        # On planner failure, try alternative assignments from the voting
+        # candidate pool (for voting methods) or a perturbed re-solve (for
+        # optimization methods). Cap at MAX_REPLAN_RETRIES alternatives; if
+        # all fail, accept stale paths (no freeze — the stale paths are from
+        # the last successful replan and may have minor collision risk, but
+        # freezing would lose progress entirely).
+        MAX_REPLAN_RETRIES = 10
+        if should_replan_paths and start_positions and goal_positions:
+             # Debug: check for duplicate starts/goals before calling planner
+            # start_vals = list(start_positions.values())
+            # goal_vals = list(goal_positions.values())
+            # dup_starts = len(start_vals) - len(set(start_vals))
+            # dup_goals = len(goal_vals) - len(set(goal_vals))
+            # if dup_starts or dup_goals:
+            #     print(f"  [DEBUG] {len(start_positions)} agents, {dup_starts} dup starts, {dup_goals} dup goals")
+            print("\nRERUNNING PLANNER\n")
+            new_len, planner_okay = run_planner(planner, robots, start_positions, goal_positions, map_dict)
             avg_path_length = new_len or avg_path_length
-            if cbs_ok and pending_event_steps:
+
+            if not planner_okay:
+                plan_failure_count += 1
+
+            # ---- Replanning on plan failure ----
+            if not planner_okay:
+                # Collect alternative assignments to try.
+                alternatives = []
+                if voting_method in voting_methods and top_k_out_ids:
+                    # voting: top_k_out_ids has the ranked candidates from
+                    # this round (index 0 = winner, already tried). The rest
+                    # are alternatives.
+                    for cand in top_k_out_ids[1:]:
+                        alternatives.append(cand)
+
+                # Also try the hall-of-fame cache (older candidates that
+                # survived from previous rounds).
+                if voting_method in voting_methods and candidate_cache:
+                    for cand in candidate_cache:
+                        if cand not in alternatives:
+                            alternatives.append(cand)
+
+                # For Murty's: use the K-best alternatives generated during
+                # the assignment. These are near-optimal perturbations that
+                # differ from the winner by ~1 pair.
+                if voting_method == O.murtys_task_allocation and murtys_alternatives:
+                    for cand in murtys_alternatives:
+                        alternatives.append(cand)
+
+                # For standard optimization (CBBA/SSIA/ILP/JV): re-solve with
+                # a shuffled unassigned list (perturbation). These optimizers
+                # are deterministic, so perturbation may produce the same
+                # solution — this is a known limitation documented in the paper.
+                if voting_method in optimization_methods and voting_method != O.murtys_task_allocation:
+                    for _ in range(MAX_REPLAN_RETRIES):
+                        alternatives.append("PERTURB")
+
+                print(f"  {len(alternatives)} alternatives available for replan (cap={MAX_REPLAN_RETRIES})")
+
+                # Try each alternative: unassign current pairs, apply the
+                # alternative, update positions, retry planner.
+                retried = 0
+                while not planner_okay and retried < min(len(alternatives), MAX_REPLAN_RETRIES):
+                    alt = alternatives[retried]
+                    retried += 1
+                    alternatives_tried += 1
+                    print(f"  PLANNER FAILED — trying alternative assignment {retried}/{min(len(alternatives), MAX_REPLAN_RETRIES)}")
+
+                    # Unassign all currently-assigned pairs that were set
+                    # by this replan (i.e. all robots that have a task
+                    # assigned). We need to be careful not to unassign
+                    # robots that were already assigned BEFORE this replan
+                    # tick — but in practice, reassign_robots_to_tasks only
+                    # touches unassigned robots, so all current assignments
+                    # were either pre-existing (untouched) or just set.
+                    # We unassign ALL assigned robots that have a task,
+                    # then re-apply the alternative. This is safe because
+                    # the alternative covers the same robots/tasks.
+                    from hvbta.allocators.misc_assignment import unassign_task_from_robot as _unassign
+                    for r in robots:
+                        if r.assigned and r.current_task:
+                            t = r.current_task
+                            _unassign(r, t, unassigned_robots, unassigned_tasks)
+
+                    # Apply the alternative assignment.
+                    if alt == "PERTURB":
+                        # Re-solve with optimization (shuffled order)
+                        import random as _rng
+                        _rng.shuffle(unassigned_robots)
+                        _rng.shuffle(unassigned_tasks)
+                        _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = O.reassign_robots_to_tasks_with_method(
+                            robots, tasks, num_candidates, voting_method, suitability_source,
+                            unassigned_robots, unassigned_tasks, voting_method, start_positions, goal_positions, HYPOTENUSE,
+                        )
+                        total_reassignments += 1
+                        total_reassignment_time += reassign_length
+                        cumulative_reassignment_quality += reassign_score
+                    elif isinstance(alt, list):
+                        # Voting alternative: list of (robot_id, task_id) pairs
+                        for rid, tid in alt:
+                            robot = next((r for r in robots if r.robot_id == rid), None)
+                            task = next((t for t in tasks if t.task_id == tid), None)
+                            if robot and task and not robot.assigned and not task.assigned:
+                                robot.current_task = task
+                                robot.assigned = True
+                                robot.tasks_attempted += 1
+                                task.assigned_robot = robot
+                                task.assigned = True
+                                if rid in unassigned_robots:
+                                    unassigned_robots.remove(rid)
+                                if tid in unassigned_tasks:
+                                    unassigned_tasks.remove(tid)
+                                # Use matrix lookup for suitability
+                                if isinstance(suitability_source, tuple) and len(suitability_source) == 3:
+                                    full_matrix, r_idx_map, t_idx_map = suitability_source
+                                    pair_score = float(full_matrix[r_idx_map[rid], t_idx_map[tid]])
+                                else:
+                                    pair_score = float(suitability_source([robot], [task], map_size=HYPOTENUSE)[0, 0])
+                                robot.current_task_suitability = pair_score
+                                task.current_suitability = pair_score
+
+                    # Update positions for the new assignment.
+                    for robot in robots:
+                        if robot.assigned and robot.current_task:
+                            start_positions[robot.robot_id] = tuple(robot.location)
+                            goal_positions[robot.robot_id] = tuple(robot.current_task.location)
+                        else:
+                            start_positions.pop(robot.robot_id, None)
+                            goal_positions.pop(robot.robot_id, None)
+
+                    # Retry planner.
+                    if start_positions and goal_positions:
+                        new_len, planner_okay = run_planner(planner, robots, start_positions, goal_positions, map_dict)
+                        avg_path_length = new_len or avg_path_length
+                        if not planner_okay:
+                            plan_failure_count += 1
+                        if planner_okay:
+                            print(f"  ALTERNATIVE {retried} SUCCEEDED — new plan accepted.")
+
+                if not planner_okay:
+                    print("  ALL ALTERNATIVES FAILED — accepting stale paths.")
+
+            if planner_okay and pending_event_steps:
                 # Adaptation latency: elapsed timesteps from each event to this
                 # successful resolution. Drain the queue.
                 for ev_step in pending_event_steps:
@@ -866,7 +1048,9 @@ def main_simulation(
     adaptation_latency_mean = float(np.mean(adaptation_latencies)) if adaptation_latencies else 0.0
     adaptation_latency_max = float(max(adaptation_latencies)) if adaptation_latencies else 0.0
     task_success_counts = [r.tasks_successful for r in robots]
+    task_attempted_counts = [r.tasks_attempted for r in robots]
     workload_variance = float(np.var(task_success_counts)) if task_success_counts else 0.0
+    attempted_workload_variance = float(np.var(task_attempted_counts)) if task_attempted_counts else 0.0
     # Urgency + pressure summaries. Bucketing key for downstream analysis:
     #   "none urgent, no pressure"    -> Percentage_Urgent_Mean == 0 AND Robot_Pressure_Fraction == 0
     #   "some urgent, no pressure"    -> Percentage_Urgent_Mean > 0  AND Robot_Pressure_Fraction == 0
@@ -883,11 +1067,32 @@ def main_simulation(
           f"Throughput: mean={throughput_mean:.3f}/step var={throughput_var:.3f}, "
           f"Adaptation latency: mean={adaptation_latency_mean:.2f} max={adaptation_latency_max:.0f} (over {len(adaptation_latencies)} events), "
           f"Workload variance: {workload_variance:.3f}, "
+          f"Attempted workload variance: {attempted_workload_variance:.3f}, "
           f"Urgency mean={percentage_urgent_mean:.2%} max={percentage_urgent_max:.2%}, "
           f"Robot-pressure fraction={robot_pressure_fraction:.2%}, "
           f"Reassignment Time: {total_reassignment_time}, "
           f"Reassignment quality: {cumulative_reassignment_quality}, reassignments: {total_reassignments}, "
           f"Robots: {len(robots)}")
+
+    # Phase 0: emit the per-step pool/fleet series on a single line each so a
+    # pilot run's stdout can be scraped to plot pool size vs. timestep, measure
+    # the transient length, and check for fleet-size drift. Tagged prefixes
+    # (POOL_SERIES / FLEET_SERIES) make them easy to grep out of a log.
+    print(f"POOL_SERIES\t" + ",".join(str(n) for n in task_pool_size_per_step))
+    print(f"FLEET_SERIES\t" + ",".join(str(n) for n in fleet_size_per_step))
+
+    # Phase 4: empirical regime-classification metrics computed from the
+    # pool-size log. Mean_Task_Pool_Size = average pool size across the run.
+    # Pool_Size_Trend = mean(last-quartile) - mean(first-quartile); near 0 =>
+    # steady state, strongly positive => overload.
+    mean_task_pool_size = float(np.mean(task_pool_size_per_step)) if task_pool_size_per_step else 0.0
+    if len(task_pool_size_per_step) >= 4:
+        q = len(task_pool_size_per_step) // 4
+        first_q = float(np.mean(task_pool_size_per_step[:q]))
+        last_q = float(np.mean(task_pool_size_per_step[-q:]))
+        pool_size_trend = last_q - first_q
+    else:
+        pool_size_trend = 0.0
 
     return (
         # Section 4 - aggregate outcome (kept only)
@@ -902,11 +1107,19 @@ def main_simulation(
         throughput_mean, throughput_var,
         adaptation_latency_mean, adaptation_latency_max,
         workload_variance,
+        attempted_workload_variance,
         # Section 7 - full-schedule denominators, constant across methods in a (rep, sm) group.
         full_schedule_tasks_spawned, full_schedule_robots_max,
         # Section 8 - urgency + pressure summaries.
         percentage_urgent_mean, percentage_urgent_max, robot_pressure_fraction,
-    ) + avg_reassign_metrics[1:]  # skip first (Jains) - already exposed above
+    ) + avg_reassign_metrics[1:] + (  # skip first (Jains) - already exposed above
+        # Section 11 - empirical regime classification + horizon provenance
+        mean_task_pool_size, pool_size_trend,
+        scheduled_event_count, horizon_binding_term,
+        # Section 12 - planner failure count + alternatives tried
+        plan_failure_count,
+        alternatives_tried,
+    )
 
 
 def benchmark_simulation(
@@ -935,7 +1148,11 @@ def benchmark_simulation(
         task_cancellation_rate: float = 0.02,
         remove_tasks: bool = False,
         tasks_to_remove: int = 1,
-        event_schedule: list = None):
+        event_schedule: list = None,
+        planner: str = "lacam",
+        scenario: str = "",
+        scheduled_event_count: int = 0,
+        horizon_binding_term: str = ""):
     start_time = time.perf_counter_ns()
     output_tuple = main_simulation(
         output, robots, tasks, num_candidates, voting_method,
@@ -951,6 +1168,10 @@ def benchmark_simulation(
         remove_tasks=remove_tasks,
         tasks_to_remove=tasks_to_remove,
         event_schedule=event_schedule,
+        planner=planner,
+        scenario=scenario,
+        scheduled_event_count=scheduled_event_count,
+        horizon_binding_term=horizon_binding_term,
     )
     execution_time = time.perf_counter_ns() - start_time
     print(f"Simulation completed in {execution_time:.5f} nanoseconds.")
@@ -982,10 +1203,11 @@ if __name__ == "__main__":
     ]
     voting_names = [func_name(f) for f in voting_methods]
     optimization_methods = [
-        O.cbba_task_allocation,
-        O.ssia_task_allocation,
-        O.ilp_task_allocation,
-        O.jv_task_allocation,
+        # O.cbba_task_allocation,
+        # O.ssia_task_allocation,
+        # O.ilp_task_allocation,
+        # O.jv_task_allocation,
+        O.murtys_task_allocation,
     ]
     optimization_names = [func_name(f) for f in optimization_methods]
     # Direct-assignment methods: the LLM returns (robot_id, task_id) pairs straight up,
@@ -1004,57 +1226,120 @@ if __name__ == "__main__":
     ]
 
     small_maps = [
-        r"den201d.map", r"den202d.map", r"den404d.map", r"lak101d.map",
-        r"lak102d.map", r"lak105d.map", r"lak107d.map", r"lak108d.map",
+        r"lak105d.map", r"lak102d.map", r"lak107d.map",
     ]
     medium_maps = [
-        r"arena.map", r"den009d.map", r"den101d.map", r"den204d.map",
-        r"den207d.map", r"den403d.map", r"den405d.map", r"den407d.map",
-        r"den408d.map", r"hrt002d.map", r"isound1.map", r"lak103d.map",
-        r"lak104d.map",
+        r"arena.map", r"isound1.map", r"den204d.map",
     ]
     large_maps = [
-        r"den001d.map", r"den020d.map", r"den203d.map", r"den206d.map",
-        r"den308d.map", r"den312d.map", r"den900d.map", r"den901d.map",
-        r"den998d.map", r"hrt001d.map", r"lak106d.map", r"lak203d.map",
-        r"lak307d.map", r"ost002d.map",
+        r"lak307d.map", r"den001d.map", r"den901d.map",
     ]
-    map_paths = (
-        random.sample(small_maps, 1)
-        # + random.sample(medium_maps, 1)
-        # + random.sample(large_maps, 1)
-    )
 
-    robot_sizes = [10]
-    task_sizes = [10]
+    # ============================================================
+    # SWEEP CONFIGURATION
+    # ============================================================
+    # Two configurations below: the OLD one (flat sweep, all fleet
+    # sizes on all maps) and the NEW one (balanced pairing, fleet
+    # sizes matched to map sizes so 10-robot fleets don't end up
+    # on 193x177 maps with 200-step paths and near-zero throughput).
+    #
+    # Uncomment the one you want to run. The old config is needed
+    # to finish interrupted runs from the previous sweep.
+    # ============================================================
+
+    # --- OLD CONFIG: flat sweep (all fleet sizes on all maps) ---
+    # Uses combat.map + combat2.map (very large, very open).
+    # All robot/task sizes run on every map. This produces low
+    # completion for small fleets on large maps, but was the
+    # configuration used for the first (interrupted) sweep.
+    OLD_SWEEP_CONFIGS = [
+        (r"combat.map",  [10, 20, 30, 40, 50, 100], [10, 20, 30, 40, 50, 100]),
+        (r"combat2.map", [10, 20, 30, 40, 50, 100], [10, 20, 30, 40, 50, 100]),
+    ]
+
+    # --- NEW CONFIG: balanced pairing (fleet matched to map size) ---
+    # Small maps (~25-30 cells): 10-20 robots/tasks
+    # Medium maps (~49-66 cells): 20-30-50 robots/tasks
+    # Large maps (~84-128 cells): 50-100 robots/tasks
+    # Prevents the 10-robot-on-193x177 mismatch that tanked completion.
+    NEW_SWEEP_CONFIGS = [
+        # Small maps
+        (r"lak105d.map", [10, 20], [10, 20]),
+        (r"lak102d.map", [10, 20], [10, 20]),
+        (r"lak107d.map", [10, 20], [10, 20]),
+        # Medium maps
+        (r"arena.map",   [20, 30, 50], [20, 30, 50]),
+        (r"isound1.map", [20, 30, 50], [20, 30, 50]),
+        (r"den204d.map", [20, 30, 50], [20, 30, 50]),
+        # Large maps — higher fleet sizes so robots can actually
+        # cover the map and complete tasks within the horizon
+        (r"lak307d.map", [50, 75, 100], [50, 75, 100]),
+        (r"den001d.map", [50, 75, 100], [50, 75, 100]),
+        (r"den901d.map", [50, 75, 100], [50, 75, 100]),
+    ]
+
+    # --- CONSTRAINED CONFIG: small high-obstacle maps ---
+    # Tests whether constrained environments (tight corridors, dead-ends)
+    # change the voting-vs-optimization balance. These maps have 55-66%
+    # obstacles, forcing agents through narrow passages where planner
+    # failures are more likely and the replan-on-failure mechanism
+    # matters more. Fleet sizes kept small so paths are short enough
+    # for tasks to actually complete.
+    CONSTRAINED_SWEEP_CONFIGS = [
+        (r"lak101d.map", [10, 20], [10, 20]),           # 31x30, 66% obs, 318 free
+        (r"den404d.map", [10, 20], [10, 20]),           # 34x28, 62% obs, 358 free
+        (r"hrt002d.map", [10, 20, 30], [10, 20, 30]),   # 50x49, 69% obs, 754 free
+        (r"den009d.map", [10, 20, 30], [10, 20, 30]),   # 34x50, 41% obs, 1003 free
+        (r"den101d.map", [10, 20, 30], [10, 20, 30]),   # 41x73, 55% obs, 1360 free
+    ]
+
+    # A sweep to break PP and force replanning to occur
+    # show the utility of the voting replanning module.
+    # Uses small highly-constrained maps (60-70% obstacles) where PP
+    # is likely to fail on some instances. Fleet sizes kept small because
+    # PP's 10-restart multi-restart is expensive on failures.
+    HYPER_CONSTRAINED_CONFIGS = [
+        (r"hrt003d.map", [10, 15], [10, 15]),            # 50x49, 70% obs, 747 free
+        (r"lak103c.map", [10, 15], [10, 15]),            # 49x49, 65% obs, 850 free
+        (r"lak108c.map", [10, 15], [10, 15]),            # 26x27, 60% obs, 279 free
+    ]
+
+    # Uncomment ONE of the following lines:
+    # sweep_configs = OLD_SWEEP_CONFIGS        # finish interrupted first run
+    # sweep_configs = CONSTRAINED_SWEEP_CONFIGS  # constrained maps test
+    # sweep_configs = NEW_SWEEP_CONFIGS        # balanced pairing for clean results
+    sweep_configs = HYPER_CONSTRAINED_CONFIGS
+    # ============================================================
+
+    map_dir = r"MAPF_benchmark_maps"
+
     Run_ID = 1
-    num_repetitions = 1
+    num_repetitions = 3
     add_tasks = True
     add_robots = True
     remove_robots = True
-    tasks_to_add = 1
+    tasks_to_add = 2
     robots_to_add = 1
     robots_to_remove = 1
     robot_generation_strict = True
     task_generation_strict = True
-    task_arrival_rate = 0.05
-    robot_arrival_rate = 0.02
-    robot_departure_rate = 0.02
-    task_cancellation_rate = 0.02
     remove_tasks = True
     tasks_to_remove = 1
-    map_dir = r"MAPF_benchmark_maps"
+    PLANNER = ["pp"]
+    TARGET_EVENT_COUNT_K = 125
+    TRANSIENT_FLOOR = 200
 
-    dir_path = os.path.join('hvbta', 'io', 'results')
+    # NOTE: swap between the directories for the new and old parameter sweep configurations
+    dir_path = os.path.join('hvbta', 'io', 'results', 'hyper-constrained')
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     os.makedirs(dir_path, exist_ok=True)
-    full_paths = [os.path.join(map_dir, m) for m in map_paths]
 
-    for map_file in full_paths:
+    for map_file_name, robot_sizes, task_sizes in sweep_configs:
+        map_file = os.path.join(map_dir, map_file_name)
         grid = load_map(map_file)
         HYPOTENUSE = (len(grid) ** 2 + len(grid[0]) ** 2) ** 0.5
         dims = (len(grid), len(grid[0]))
-        map_size = "Small" if dims[0] < 40 and dims[1] < 40 else "Medium" if dims[0] < 75 and dims[1] < 75 else "Large"
+        map_size = "Small" if HYPOTENUSE < 55 else "Medium" if HYPOTENUSE < 105 else "Large"
         obstacles = create_obstacle_list(grid)
         map_dict = {'dimension': dims, 'obstacles': obstacles}
 
@@ -1068,7 +1353,7 @@ if __name__ == "__main__":
 
             writer.writerow([
                 # Row identity
-                'Run ID', 'Method', 'Suitability Method',
+                'Run ID', 'Method', 'Suitability Method', 'Planner',
                 'Num Robots', 'Num Tasks', 'Num Candidates',
                 # Initial allocation quality
                 'Total Score', 'Mean_Assignment_Suitability', 'Planning_Time_us',
@@ -1083,15 +1368,28 @@ if __name__ == "__main__":
                 # Primary comparative metrics
                 'Throughput_Mean', 'Throughput_Var',
                 'Adaptation_Latency_Mean', 'Adaptation_Latency_Max',
-                'Workload_Variance',
+                'Workload_Variance', 'Attempted_Workload_Variance',
                 # Full-schedule denominators, constant across methods in a (rep, sm) group.
                 'Full_Schedule_Tasks_Spawned', 'Full_Schedule_Robots_Max',
                 # Urgency + pressure bucketing keys.
                 'Percentage_Urgent_Mean', 'Percentage_Urgent_Max', 'Robot_Pressure_Fraction',
                 # Reassignment fairness (trimmed to 3 canonical values; Jains already exposed above)
                 'Avg_Reass_Gini', 'Avg_Reass_Median', 'Avg_Reass_IQR',
-                # Overhead + config
-                'Execution Time', 'Map Size',
+                # Empirical regime classification (computed per run from pool-size log)
+                'Mean_Task_Pool_Size', 'Pool_Size_Trend',
+                # Horizon provenance (so the horizon choice is auditable)
+                'Scheduled_Event_Count', 'Horizon_Binding_Term',
+                # Planner failure count (how often the MAPF planner returned ok=False)
+                'Plan_Failure_Count',
+                # Total alternative assignments tried during replan-on-failure
+                'Alternatives_Tried',
+                # Overhead
+                'Execution Time',
+                # Config covariates (constant per run)
+                'Scenario', 'Task_Arrival_Rate', 'Task_Cancellation_Rate',
+                'Robot_Arrival_Rate', 'Robot_Departure_Rate',
+                # Map size
+                'Map Size',
             ])
             profiles_w.writerow([
                 'Run_ID', 'Map', 'Num Robots', 'Num Tasks',
@@ -1102,152 +1400,212 @@ if __name__ == "__main__":
                 print(f"\n\n\nSTARTING SIMULATION FOR {num_robots} ROBOTS")
                 for num_tasks in task_sizes:
                     print(f"\n\n\nSTARTING SIMULATION FOR {num_tasks} TASKS")
-                    candidate_sizes = [50]
-                    workload = max(1.0, num_tasks / num_robots)
-                    extender = 1.5 if workload > 10 else 1.2 if workload > 5 else 1.0
-                    max_time_steps = max(200, int(HYPOTENUSE * 1.5 * extender))
+                    # Candidate pool scales with problem size.
+                    nc = max(num_robots, num_tasks) * 6
+                    for algo in PLANNER:
+                        print(f"\n\n\nSTARTING SIMULATION WITH {algo} PLANNER")
+                        workload = max(1.0, num_tasks / num_robots)
+                        extender = 1.5 if workload > 10 else 1.2 if workload > 5 else 1.0
+                        travel_floor = int(HYPOTENUSE * 1.5 * extender)
 
-                    for nc in candidate_sizes:
-                        for sm in suitability_methods:
-                            sm_name = func_name(sm)
-                            for rep in range(num_repetitions):
-                                print(f"\n\n\nSTARTING SIMULATION REPETITION {rep+1}/{num_repetitions}")
-                                voting_outputs = []
-                                assignment_infos = []
+                        for scenario_name, regime in REGIMES.items():
+                            print(f"\n\n\nSTARTING SCENARIO: {scenario_name}")
+                            task_arrival_rate = regime["task_arrival_rate"]
+                            task_cancellation_rate = regime["task_cancellation_rate"]
+                            robot_arrival_rate = regime["robot_arrival_rate"]
+                            robot_departure_rate = regime["robot_departure_rate"]
 
-                                # Spawn rule: robots may not overlap each other, tasks may not overlap
-                                # each other, but a robot and a task may share a cell.
-                                robot_locs = set()
-                                robots = []
-                                # Strict-only generation (see todo item).
-                                for idx in range(num_robots):
-                                    r = G.generate_random_robot_profile_strict(f"R{idx+1}", grid, robot_locs)
-                                    robots.append(r)
-                                    robot_locs.add(r.location)
-                                robot_profiles = [r.strict_profile_name for r in robots]
+                            for sm in suitability_methods:
+                                sm_name = func_name(sm)
+                                for rep in range(num_repetitions):
+                                    print(f"\n\n\nSTARTING SIMULATION REPETITION {rep+1}/{num_repetitions}")
+                                    voting_outputs = []
+                                    assignment_infos = []
 
-                                task_locs = set()
-                                tasks = []
-                                for idx in range(num_tasks):
-                                    t = G.generate_random_task_description_strict(f"T{idx+1}", grid, task_locs, [])
-                                    tasks.append(t)
-                                    task_locs.add(t.location)
-                                task_profiles = [t.strict_profile_name for t in tasks]
+                                    # Spawn rule: robots may not overlap each other, tasks may not overlap
+                                    # each other, but a robot and a task may share a cell.
+                                    robot_locs = set()
+                                    robots = []
+                                    # Strict-only generation (see todo item).
+                                    for idx in range(num_robots):
+                                        r = G.generate_random_robot_profile_strict(f"R{idx+1}", grid, robot_locs)
+                                        robots.append(r)
+                                        robot_locs.add(r.location)
+                                    robot_profiles = [r.strict_profile_name for r in robots]
 
-                                # Pre-build one deterministic event schedule per (map, num_robots,
-                                # num_tasks, nc, sm, rep). Every method in this group replays the
-                                # same schedule so their comparisons are fair.
-                                schedule_seed = hash(
-                                    (os.path.basename(map_file), num_robots, num_tasks, nc, sm_name, rep)
-                                ) & 0xFFFFFFFF
-                                event_schedule = build_event_schedule(
-                                    robots, tasks, grid, max_time_steps,
-                                    add_tasks=add_tasks,
-                                    add_robots=add_robots,
-                                    remove_robots_flag=remove_robots,
-                                    remove_tasks_flag=remove_tasks,
-                                    task_arrival_rate=task_arrival_rate,
-                                    robot_arrival_rate=robot_arrival_rate,
-                                    robot_departure_rate=robot_departure_rate,
-                                    task_cancellation_rate=task_cancellation_rate,
-                                    tasks_to_add=tasks_to_add,
-                                    robots_to_add=robots_to_add,
-                                    robots_to_remove=robots_to_remove,
-                                    tasks_to_remove=tasks_to_remove,
-                                    robot_generation_strict=robot_generation_strict,
-                                    task_generation_strict=task_generation_strict,
-                                    seed=schedule_seed,
-                                )
+                                    task_locs = set()
+                                    tasks = []
+                                    for idx in range(num_tasks):
+                                        t = G.generate_random_task_description_strict(f"T{idx+1}", grid, task_locs, [])
+                                        tasks.append(t)
+                                        task_locs.add(t.location)
+                                    task_profiles = [t.strict_profile_name for t in tasks]
 
-                                if getattr(sm, "_is_llm_batch", False):
-                                    result = sm(robots, tasks)
-                                    # LLM scorers return (matrix, parse_failed); unwrap so the
-                                    # matrix is what flows through to llm_cache and downstream
-                                    # indexing in reassign_robots_to_tasks_direct.
-                                    suitability_matrix = result[0] if isinstance(result, tuple) else result
-                                else:
-                                    suitability_matrix = S.calculate_suitability_matrix(robots, tasks, sm, HYPOTENUSE)
+                                    # Pre-build one deterministic event schedule per
+                                    # (map, num_robots, num_tasks, nc, sm, rep, scenario).
+                                    # Every method + planner in this group replays the SAME schedule
+                                    # so their comparisons are fair. Uses zlib.adler32 (stable across
+                                    # runs) instead of hash() (which is per-process-randomized in
+                                    # Python 3 unless PYTHONHASHSEED is fixed).
+                                    import zlib
+                                    seed_tuple = (
+                                        os.path.basename(map_file), num_robots, num_tasks,
+                                        nc, sm_name, rep, scenario_name
+                                    )
+                                    schedule_seed = zlib.adler32(
+                                        repr(seed_tuple).encode()
+                                    ) & 0xFFFFFFFF
 
-                                if robot_generation_strict and task_generation_strict:
-                                    profiles_w.writerow([
-                                        Run_ID, os.path.basename(map_file),
-                                        num_robots, num_tasks, sm_name,
-                                        json.dumps(robot_profiles), json.dumps(task_profiles),
-                                    ])
-
-                                # Direct LLM assignment is independent of the matrix; time it and
-                                # score its chosen pairs against the rule-based matrix for parity
-                                # with voting/optimization rows.
-                                direct_outputs = []
-                                for d_fn, d_name in zip(direct_methods, direct_names):
-                                    d_start = time.perf_counter_ns()
-                                    out, parse_failed = d_fn(robots, tasks)
-                                    d_length = (time.perf_counter_ns() - d_start) / 1000.0
-                                    if parse_failed:
-                                        print(f"[{d_name}] parse failed - empty assignment fallback")
-                                    pairs = out[0]
-                                    per_agent_direct = [float(suitability_matrix[r][t]) for (r, t) in pairs] if not isinstance(suitability_matrix, tuple) else [0.0] * len(pairs)
-                                    d_score = sum(per_agent_direct)
-                                    initial_jains = _record_assignment(assignment_infos, Run_ID, d_name, sm_name, num_robots, num_tasks, nc, d_score, d_length, per_agent_direct)
-                                    direct_outputs.append((out, initial_jains))
-
-                                if suitability_all_zero(suitability_matrix):
-                                    # voting - random fallback
-                                    for method_fn, method_name in zip(voting_methods, voting_names):
-                                        output, score, length, per_agent = V.assign_tasks_randomly(robots, tasks, suitability_matrix, nc)
-                                        initial_jains = _record_assignment(assignment_infos, Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                        voting_outputs.append((output, initial_jains))
-                                    # optimization - random fallback
-                                    opt_outputs = []
-                                    for opt_fn, opt_name in zip(optimization_methods, optimization_names):
-                                        out, score, length, per_agent = O.assign_tasks_with_method_randomly(opt_fn, suitability_matrix, nc)
-                                        initial_jains = _record_assignment(assignment_infos, Run_ID, opt_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                        opt_outputs.append((out, initial_jains))
-                                    outputs = voting_outputs + opt_outputs + direct_outputs
-                                else:
-                                    # voting - normal
-                                    for method_fn, method_name in zip(voting_methods, voting_names):
-                                        output, score, length, per_agent = V.assign_tasks_with_voting(robots, tasks, suitability_matrix, nc, method_fn)
-                                        initial_jains = _record_assignment(assignment_infos, Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                        voting_outputs.append((output, initial_jains))
-                                    # optimization - normal
-                                    opt_outputs = []
-                                    for opt_fn, opt_name in zip(optimization_methods, optimization_names):
-                                        out, score, length, per_agent = O.assign_tasks_with_method(opt_fn, suitability_matrix)
-                                        initial_jains = _record_assignment(assignment_infos, Run_ID, opt_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                        opt_outputs.append((out, initial_jains))
-                                    outputs = voting_outputs + opt_outputs + direct_outputs
-
-                                for idx, (out_tuple, meth) in enumerate(zip(outputs, all_methods)):
-                                    out, initial_jains = out_tuple
-                                    output_tuple = benchmark_simulation(
-                                        output=out, 
-                                        robots=copy.deepcopy(robots), 
-                                        tasks=copy.deepcopy(tasks),
-                                        num_candidates=nc, 
-                                        voting_method=meth, 
-                                        grid=grid, 
-                                        map_dict=map_dict, 
-                                        suitability_method=sm, 
-                                        suitability_matrix=suitability_matrix, 
-                                        max_time_steps=max_time_steps, 
-                                        add_tasks=add_tasks, 
-                                        add_robots=add_robots, 
-                                        remove_robots=remove_robots,
-                                        tasks_to_add=tasks_to_add, 
-                                        robots_to_add=robots_to_add, 
-                                        robots_to_remove=robots_to_remove,
-                                        robot_generation_strict=robot_generation_strict, 
-                                        task_generation_strict=task_generation_strict,
-                                        initial_jains_index=initial_jains, 
+                                    # Phase 2: build-long → compute-horizon → truncate.
+                                    # Build the schedule to a generous provisional length first.
+                                    provisional_steps = max(TRANSIENT_FLOOR, int(HYPOTENUSE * 3))
+                                    event_schedule = build_event_schedule(
+                                        robots, tasks, grid, provisional_steps,
+                                        add_tasks=add_tasks,
+                                        add_robots=add_robots,
+                                        remove_robots_flag=remove_robots,
+                                        remove_tasks_flag=remove_tasks,
                                         task_arrival_rate=task_arrival_rate,
-                                        robot_arrival_rate=robot_arrival_rate, 
+                                        robot_arrival_rate=robot_arrival_rate,
                                         robot_departure_rate=robot_departure_rate,
                                         task_cancellation_rate=task_cancellation_rate,
-                                        remove_tasks=remove_tasks,
+                                        tasks_to_add=tasks_to_add,
+                                        robots_to_add=robots_to_add,
+                                        robots_to_remove=robots_to_remove,
                                         tasks_to_remove=tasks_to_remove,
-                                        event_schedule=event_schedule,
+                                        robot_generation_strict=robot_generation_strict,
+                                        task_generation_strict=task_generation_strict,
+                                        seed=schedule_seed,
                                     )
-                                    row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [Run_ID, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0]
-                                    writer.writerow(row_prefix + list(output_tuple) + [map_size])
-                                Run_ID += 1
+
+                                    # Compute the real horizon as the max of three floors.
+                                    event_horizon = horizon_for_event_count(
+                                        event_schedule, TARGET_EVENT_COUNT_K
+                                    )
+                                    max_time_steps = max(
+                                        TRANSIENT_FLOOR,
+                                        event_horizon,
+                                        travel_floor,
+                                    )
+                                    # Truncate the schedule to the real horizon.
+                                    event_schedule = event_schedule[:max_time_steps]
+
+                                    # Record which floor bound the horizon (for CSV provenance).
+                                    horizon_binding_term = (
+                                        "transient" if TRANSIENT_FLOOR >= event_horizon
+                                        and TRANSIENT_FLOOR >= travel_floor
+                                        else "events" if event_horizon >= travel_floor
+                                        else "travel"
+                                    )
+                                    # Count scheduled events actually in the truncated schedule.
+                                    scheduled_event_count = sum(
+                                        len(e["add_tasks"]) + len(e["add_robots"])
+                                        + len(e["remove_robot_ids"]) + len(e["remove_task_ids"])
+                                        for e in event_schedule
+                                    )
+
+                                    if getattr(sm, "_is_llm_batch", False):
+                                        result = sm(robots, tasks)
+                                        # LLM scorers return (matrix, parse_failed); unwrap so the
+                                        # matrix is what flows through to llm_cache and downstream
+                                        # indexing in reassign_robots_to_tasks_direct.
+                                        suitability_matrix = result[0] if isinstance(result, tuple) else result
+                                    else:
+                                        suitability_matrix = S.calculate_suitability_matrix(robots, tasks, sm, HYPOTENUSE)
+
+                                    if robot_generation_strict and task_generation_strict:
+                                        profiles_w.writerow([
+                                            Run_ID, os.path.basename(map_file),
+                                            num_robots, num_tasks, sm_name,
+                                            json.dumps(robot_profiles), json.dumps(task_profiles),
+                                        ])
+
+                                    # Direct LLM assignment is independent of the matrix; time it and
+                                    # score its chosen pairs against the rule-based matrix for parity
+                                    # with voting/optimization rows.
+                                    direct_outputs = []
+                                    for d_fn, d_name in zip(direct_methods, direct_names):
+                                        d_start = time.perf_counter_ns()
+                                        out, parse_failed = d_fn(robots, tasks)
+                                        d_length = (time.perf_counter_ns() - d_start) / 1000.0
+                                        if parse_failed:
+                                            print(f"[{d_name}] parse failed - empty assignment fallback")
+                                        pairs = out[0]
+                                        per_agent_direct = [float(suitability_matrix[r][t]) for (r, t) in pairs] if not isinstance(suitability_matrix, tuple) else [0.0] * len(pairs)
+                                        d_score = sum(per_agent_direct)
+                                        initial_jains = _record_assignment(assignment_infos, Run_ID, d_name, sm_name, num_robots, num_tasks, nc, d_score, d_length, per_agent_direct)
+                                        direct_outputs.append((out, initial_jains))
+
+                                    if suitability_all_zero(suitability_matrix):
+                                        # voting - random fallback
+                                        for method_fn, method_name in zip(voting_methods, voting_names):
+                                            output, score, length, per_agent = V.assign_tasks_randomly(robots, tasks, suitability_matrix, nc)
+                                            initial_jains = _record_assignment(assignment_infos, Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
+                                            voting_outputs.append((output, initial_jains))
+                                        # optimization - random fallback
+                                        opt_outputs = []
+                                        for opt_fn, opt_name in zip(optimization_methods, optimization_names):
+                                            out, score, length, per_agent = O.assign_tasks_with_method_randomly(opt_fn, suitability_matrix, nc)
+                                            initial_jains = _record_assignment(assignment_infos, Run_ID, opt_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
+                                            opt_outputs.append((out, initial_jains))
+                                        outputs = voting_outputs + opt_outputs + direct_outputs
+                                    else:
+                                        # voting - normal
+                                        for method_fn, method_name in zip(voting_methods, voting_names):
+                                            output, score, length, per_agent = V.assign_tasks_with_voting(robots, tasks, suitability_matrix, nc, method_fn)
+                                            initial_jains = _record_assignment(assignment_infos, Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
+                                            voting_outputs.append((output, initial_jains))
+                                        # optimization - normal
+                                        opt_outputs = []
+                                        for opt_fn, opt_name in zip(optimization_methods, optimization_names):
+                                            out, score, length, per_agent = O.assign_tasks_with_method(opt_fn, suitability_matrix)
+                                            initial_jains = _record_assignment(assignment_infos, Run_ID, opt_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
+                                            opt_outputs.append((out, initial_jains))
+                                        outputs = voting_outputs + opt_outputs + direct_outputs
+
+                                    for idx, (out_tuple, meth) in enumerate(zip(outputs, all_methods)):
+                                        out, initial_jains = out_tuple
+                                        output_tuple = benchmark_simulation(
+                                            output=out, 
+                                            robots=copy.deepcopy(robots), 
+                                            tasks=copy.deepcopy(tasks),
+                                            num_candidates=nc, 
+                                            voting_method=meth, 
+                                            grid=grid, 
+                                            map_dict=map_dict, 
+                                            suitability_method=sm, 
+                                            suitability_matrix=suitability_matrix, 
+                                            max_time_steps=max_time_steps, 
+                                            add_tasks=add_tasks, 
+                                            add_robots=add_robots, 
+                                            remove_robots=remove_robots,
+                                            tasks_to_add=tasks_to_add, 
+                                            robots_to_add=robots_to_add, 
+                                            robots_to_remove=robots_to_remove,
+                                            robot_generation_strict=robot_generation_strict, 
+                                            task_generation_strict=task_generation_strict,
+                                            initial_jains_index=initial_jains, 
+                                            task_arrival_rate=task_arrival_rate,
+                                            robot_arrival_rate=robot_arrival_rate, 
+                                            robot_departure_rate=robot_departure_rate,
+                                            task_cancellation_rate=task_cancellation_rate,
+                                            remove_tasks=remove_tasks,
+                                            tasks_to_remove=tasks_to_remove,
+                                            event_schedule=event_schedule,
+                                            planner=algo,
+                                            scenario=scenario_name,
+                                            scheduled_event_count=scheduled_event_count,
+                                            horizon_binding_term=horizon_binding_term,
+                                        )
+                                        row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [Run_ID, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0]
+                                        # Inject the planner name at the CSV's 'Planner' column slot
+                                        # (after Run ID / Method / Suitability Method, before Num Robots).
+                                        row_prefix = [row_prefix[0], row_prefix[1], row_prefix[2], algo] + row_prefix[3:]
+                                        # Config covariates + provenance, appended before the map_size suffix.
+                                        config_suffix = [
+                                            scenario_name,
+                                            task_arrival_rate, task_cancellation_rate,
+                                            robot_arrival_rate, robot_departure_rate,
+                                        ]
+                                        writer.writerow(row_prefix + list(output_tuple) + config_suffix + [map_size])
+                                    Run_ID += 1
