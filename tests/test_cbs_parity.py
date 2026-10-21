@@ -222,31 +222,36 @@ def test_parity_opposite_swap_no_idle():
 
 
 # ---------------------------------------------------------------------------
-# Invariant 2: COLLISION-FREE W.R.T. IDLE CELLS on with-idle instances.
+# Invariant 2: ASSIGNED blockers are avoided; UNASSIGNED idle robots are NOT
+# pinned (they can get out of the way). This matches the fix in
+# planner_common._prepare_agents: only robots with assigned=True AND a current
+# task are pinned as stationary blockers.
 # ---------------------------------------------------------------------------
 def test_idle_blocker_never_occupied_by_movers():
+    # R3 IS assigned with a task — it's a stationary blocker (start==goal).
     r1 = Robot("R1", (0, 2), assigned=True, current_task="T1")
     r2 = Robot("R2", (4, 2), assigned=True, current_task="T2")
-    r3 = Robot("R3", (2, 2), assigned=False, current_task=None)  # idle blocker
+    r3 = Robot("R3", (2, 2), assigned=True, current_task="T3")  # pinned blocker
     robots = [r1, r2, r3]
     start_positions = {"R1": (0, 2), "R2": (4, 2)}
     goal_positions = {"R1": (4, 2), "R2": (0, 2)}
 
     (_, robots_new, _, _, _, new_ok) = _run_both(
         robots, start_positions, goal_positions, _empty_grid(5, 5))
-    assert new_ok is True, "new cbs_planner failed on a with-idle fixture"
+    assert new_ok is True, "new cbs_planner failed on a with-blocker fixture"
 
     blocker_cell = (2, 2)
     for r in robots_new:
-        if r.assigned:
+        if r.assigned and r.robot_id != "R3":
             assert blocker_cell not in r.current_path, (
-                f"mover {r.robot_id} path passes through idle blocker's cell "
+                f"mover {r.robot_id} path passes through blocker's cell "
                 f"{blocker_cell}: {r.current_path}")
 
 
 def test_idle_blocker_path_left_empty():
+    # R2 is assigned with a task at (2,2) — it's a pinned blocker.
     r1 = Robot("R1", (0, 0), assigned=True, current_task="T1")
-    r2 = Robot("R2", (2, 2), assigned=False, current_task=None)  # idle blocker
+    r2 = Robot("R2", (2, 2), assigned=True, current_task="T2")  # pinned blocker
     robots = [r1, r2]
     start_positions = {"R1": (0, 0)}
     goal_positions = {"R1": (4, 4)}

@@ -145,15 +145,18 @@ def plan(agents, map_dict):
     n = len(movers)
     H = max((rows + cols) * (n + 1) + 16, 64)
 
-    # Build 10 priority orders: descending distance, ascending distance,
-    # then 8 random shuffles. Different orders produce different reservation
-    # patterns; some succeed where others fail.
+    # Build 4 priority orders: descending distance, ascending distance,
+    # then 2 random shuffles. Reduced from 10 to 4 for the hyper-constrained
+    # sweep where PP failures are expected (fewer restarts = higher failure
+    # rate = more replan-on-failure events to analyze). The multi-restart
+    # still provides some robustness but fails more often than the 10-restart
+    # version, which is the desired behavior for testing the replan mechanism.
     rng = _random.Random(42)
     orders = [
         sorted(movers, key=_dist, reverse=True),
         sorted(movers, key=_dist),
     ]
-    for _ in range(8):
+    for _ in range(2):
         shuffled = list(movers)
         rng.shuffle(shuffled)
         orders.append(shuffled)

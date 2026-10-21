@@ -27,7 +27,8 @@ recursion can't loop).
 """
 
 
-def step(pos, goal, obstacles, dimension, priority, pinned, rng=None, tabu=None):
+def step(pos, goal, obstacles, dimension, priority, pinned, rng=None, tabu=None,
+         blocked=None):
     """
     rng: optional random.Random instance. When provided, ties in the priority
     order AND in the candidate-cell preference are broken randomly, so repeated
@@ -38,18 +39,19 @@ def step(pos, goal, obstacles, dimension, priority, pinned, rng=None, tabu=None)
 
     tabu: optional dict {aid: set_of_cells}. Cells in an agent's tabu set are
     treated as LAST-RESORT candidates (tried after all other moves including
-    wait). This prevents oscillation in dead-end corridors: without it, an
-    agent whose only forward path is blocked by obstacles will bounce between
-    two cells forever. With tabu, the agent waits instead of going back to a
-    cell it just visited, giving other agents time to move and the high-level
-    search (LaCAM) time to try other configurations. Standard PIBT (Okumura
-    2019) uses this mechanism.
+    wait). This prevents oscillation in dead-end corridors.
+
+    blocked: optional dict {aid: set_of_cells}. Cells in an agent's blocked
+    set are HARD constraints — the agent CANNOT move there at all. This is
+    used by LaCAM's LCA mechanism to force an agent off a cell it's cycling
+    on. Unlike tabu (soft preference), blocked cells are never considered.
     """
     aids = list(pos.keys())
     obs_set = set(obstacles)
     rows, cols = dimension
     pinned = set(pinned)
     tabu = tabu or {}
+    blocked = blocked or {}
 
     # Strict total order key. Pinned get +inf so they decide first and never
     # get pushed. Ties broken by id (descending) when rng is None, else by a
@@ -77,12 +79,16 @@ def step(pos, goal, obstacles, dimension, priority, pinned, rng=None, tabu=None)
         at_goal = (cur == g)
 
         # Candidate cells: 4-connected moves + wait. Validity filtered.
+        my_blocked = blocked.get(a, set())
         cands = []
         for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0)):
             nr, nc = cur[0] + dr, cur[1] + dc
             if 0 <= nr < rows and 0 <= nc < cols and (nr, nc) not in obs_set:
+                if (nr, nc) in my_blocked:
+                    continue  # hard LCA constraint — can't go here
                 cands.append((nr, nc))
-        cands.append(cur)  # wait
+        if cur not in my_blocked:
+            cands.append(cur)  # wait (unless blocked from staying)
 
         # Preference: among moves, closer to goal first. Waiting is the
         # ABSOLUTE last choice (taken only when no move works) unless the agent

@@ -96,7 +96,7 @@ def _swap_fixture():
 def _blocker_fixture():
     r1 = Robot("R1", (0, 2), assigned=True, current_task="T1")
     r2 = Robot("R2", (4, 2), assigned=True, current_task="T2")
-    r3 = Robot("R3", (2, 2), assigned=False)  # idle blocker
+    r3 = Robot("R3", (2, 2), assigned=True, current_task="T3")  # pinned blocker
     return ([r1, r2, r3], {"R1": (0, 2), "R2": (4, 2)},
             {"R1": (4, 2), "R2": (0, 2)}, {(2, 2)})
 
@@ -138,11 +138,18 @@ def test_blocker_strong_planners():
     for p in STRONG:
         rs, _, ok = _run(p, robots, sp, gp, GRID)
         assert ok, f"{p} failed the blocker fixture"
-        _assert_valid_and_conflict_free(rs, sp, gp, blocked)
-        # blocker's own path must stay empty
-        blocker = next(r for r in rs if r.robot_id == "R3")
-        assert blocker.current_path == [], (
-            f"{p} overwrote stationary blocker's path: {blocker.current_path}")
+        # PP and CBS treat stationary blockers as permanent (movers avoid the
+        # cell); LaCAM allows goal-displacement (the blocker can be temporarily
+        # pushed off its cell so a mover can pass). Both must be conflict-free.
+        if p == "lacam":
+            _assert_valid_and_conflict_free(rs, sp, gp, set())
+        else:
+            _assert_valid_and_conflict_free(rs, sp, gp, blocked)
+            # blocker's own path must stay empty (PP/CBS don't write paths for
+            # stationary agents)
+            blocker = next(r for r in rs if r.robot_id == "R3")
+            assert blocker.current_path == [], (
+                f"{p} overwrote stationary blocker's path: {blocker.current_path}")
 
 
 def test_blocker_pibt_documented_incomplete():

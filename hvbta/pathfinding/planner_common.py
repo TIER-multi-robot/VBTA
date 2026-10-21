@@ -12,6 +12,12 @@ def _prepare_agents(robots, start_positions, goal_positions):
             should occupy space this round -- movers (from start/goal_positions)
             plus idle robots pinned as start==goal blockers, exactly as run_cbs
             augments them so the planner routes movers around idle robots.
+
+    Only robots that are ASSIGNED and working on a task are pinned as stationary
+    blockers. Unassigned (idle) robots are NOT pinned — they should be able to
+    get out of the way of movers. Pinning idle robots can disconnect the graph
+    and cause the planner to fail when an idle robot is sitting in a corridor
+    or choke point that a mover needs to pass through.
     """
     if not start_positions or not goal_positions:
         return None, None  # caller returns (0.0, True): nothing to plan
@@ -23,6 +29,11 @@ def _prepare_agents(robots, start_positions, goal_positions):
         if r.robot_id in aug_starts:
             continue
         if getattr(r, "location", None) is None:
+            continue
+        # Only pin robots that are actively working on a task — they have a
+        # goal and are in transit or working. Idle robots (no task) should
+        # not be blockers; they can be pushed out of the way by movers.
+        if not (getattr(r, "assigned", False) and getattr(r, "current_task", None) is not None):
             continue
         aug_starts[r.robot_id] = r.location
         aug_goals[r.robot_id] = r.location

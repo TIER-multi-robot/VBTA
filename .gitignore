@@ -1,7 +1,7 @@
 
 /.ipynb_checkpoints
 __pycache__/
-# MAPF_benchmark_maps/
+MAPF_benchmark_maps/
 .venv/
 expressions.txt
 Processed_Benchmarks/

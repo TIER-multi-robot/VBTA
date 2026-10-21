@@ -72,9 +72,17 @@ def run_native(plan_fn, robots, start_positions, goal_positions, map_dict):
     """
     agents, stationary_ids = _prepare_agents(robots, start_positions, goal_positions)
     if agents is None:
-        # nothing to plan -- mirrors old run_cbs's trivial-success branch so
-        # pending event latencies still get measured against "next moment
-        # planner did not fail."
+        if start_positions and goal_positions:
+            # Non-empty input but _prepare_agents returned None
+            # -> duplicate start positions detected (two robots at the same
+            # cell after stale-path movement without collision checking).
+            # This is a FAILURE, not trivial success. Return (0.0, False)
+            # so plan_failure_count is incremented, the replan-on-failure
+            # mechanism triggers (trying alternative assignments that may
+            # give the robots different goals and separate them), and
+            # pending_event_steps is NOT drained.
+            return 0.0, False
+        # genuinely nothing to plan (empty start_positions)
         return 0.0, True
 
     paths = plan_fn(agents, map_dict)
