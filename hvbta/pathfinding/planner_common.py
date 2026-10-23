@@ -56,6 +56,17 @@ def _write_paths_back(robots, paths, stationary_ids):
     paths: {robot_id: [(x, y), ...]}  full path including the start cell.
     Writes current_path / remaining_distance, skipping stationary blockers,
     and returns the mean path length over MOVING agents (matches run_cbs).
+
+    Engines that return whole solutions (LaCAM, PIBT-stepwise) pad every
+    agent's path to the solution makespan: an agent that reaches its goal
+    early gets trailing goal-cell waits. Writing that padding as
+    remaining_distance makes an agent standing ON its goal still appear to
+    be 40+ steps from "arriving", and frequent replans (fleet churn) reset
+    the padding before it elapses - so the agent never registers as
+    arrived, never works, and tasks never complete. Strip trailing waits
+    so the path ends the moment the agent settles on its final cell.
+    Mid-route waits (genuine blocking) are preserved; only the tail of
+    consecutive repeats of the final cell is removed.
     """
     id_to_index = {r.robot_id: i for i, r in enumerate(robots)}
     valid_lengths = []
@@ -64,11 +75,14 @@ def _write_paths_back(robots, paths, stationary_ids):
             continue
         if rid in stationary_ids:
             continue  # don't clobber a blocker's (empty) path with a wait schedule
+        p = [(x, y) for (x, y) in path]
+        while len(p) > 1 and p[-1] == p[-2]:
+            p.pop()
         r = robots[id_to_index[rid]]
-        r.current_path = [(x, y) for (x, y) in path]
-        r.remaining_distance = max(0, len(path) - 1)
-        if len(path) > 1:
-            valid_lengths.append(len(path) - 1)
+        r.current_path = p
+        r.remaining_distance = max(0, len(p) - 1)
+        if len(p) > 1:
+            valid_lengths.append(len(p) - 1)
     return float(np.mean(valid_lengths)) if valid_lengths else 0.0
 
 

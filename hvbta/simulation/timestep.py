@@ -16,7 +16,10 @@ def simulate_time_step(
     goal_positions: dict,
     time_step: float = 1.0,
     total_reward: float = 0.0,
-    total_success: int = 0
+    total_success: int = 0,
+    po_state=None,
+    current_tick: int = None,
+    pending_event_steps: List[int] = None
 ) -> Tuple[int, int, float, int]:
     """
     Simulates a single time step, updating robot positions, task progress, and handling failures.
@@ -26,6 +29,14 @@ def simulate_time_step(
         tasks: List of all tasks.
         time_step: The time increment for the simulation step.
         total_reward: Accumulated reward from successfully completed tasks.
+        po_state: Optional PartialObservabilityState (partial-observability
+            experiment). When provided, robot arrivals reveal task masks and
+            run the execution-time feasibility check; mis-assignments free
+            the robot and raise a replan event. Default None = no-op.
+        current_tick: Current loop timestep (only used by po_state for
+            event bookkeeping).
+        pending_event_steps: The main loop's pending-event FIFO (only used
+            by po_state to raise replan events on mis-assignment).
 
     Returns:
         (tasks_completed, count, total_reward, total_success): A count of unassigned robots and the updated total reward.
@@ -46,16 +57,29 @@ def simulate_time_step(
                 occupied_locations.add(next_position)
                 robot.current_path.pop(0)
                 robot.remaining_distance = max(0, len(robot.current_path) - 1)
+                if po_state is not None:
+                    po_state.on_move(robot)
 
                 if robot.remaining_distance <= 1:
                     robot.remaining_distance = 0
 
                 if robot.battery_life == 0:
+                    if po_state is not None:
+                        po_state.on_unassign(robot)
                     unassign_task_from_robot(robot, task, unassigned_robots=unassigned_robots, unassigned_tasks=unassigned_tasks)
                     continue
 
             # at task location -> work on it
             if robot.remaining_distance == 0:
+                # Partial-observability arrival hook: reveal the task's mask
+                # (once) and run balanced's hard-fail checks against the TRUE
+                # attributes. A mis-assignment frees the robot, returns the
+                # task to the pool unmasked, and raises a replan event.
+                if po_state is not None and po_state.handle_arrival(
+                        robot, task, unassigned_robots, unassigned_tasks,
+                        current_tick, pending_event_steps):
+                    continue
+
                 required_caps = getattr(task, "required_capabilities", None) or []
                 payload_required = None
                 for req in required_caps:
@@ -108,6 +132,8 @@ def simulate_time_step(
                         task.time_left = task.time_to_complete
                     else:
                         task.time_to_complete = task.time_left
+                    if po_state is not None:
+                        po_state.on_unassign(robot)
                     unassign_task_from_robot(
                         robot, task,
                         unassigned_robots=unassigned_robots,
@@ -120,12 +146,16 @@ def simulate_time_step(
                         matched_safety = sum(safety in robot.safety_features for safety in task.safety_protocols)
                         safety_score = matched_safety / max(1, len(task.safety_protocols))
                         if safety_score < 0.75 and (random.random() > 0.75):
+                            if po_state is not None:
+                                po_state.on_unassign(robot)
                             unassign_task_from_robot(
                                 robot, task,
                                 unassigned_robots=unassigned_robots,
                                 unassigned_tasks=unassigned_tasks,
                             )
                     else:
+                        if po_state is not None:
+                            po_state.on_unassign(robot)
                         unassign_task_from_robot(
                             robot, task,
                             unassigned_robots=unassigned_robots,
@@ -154,6 +184,11 @@ def simulate_time_step(
                     task.navigation_constraints or [],
                 )
                 if nav_score == 0.0:
+                    if po_state is not None:
+                        # Pre-existing navigation drop: count it, don't
+                        # change the behavior (spec §6.5).
+                        po_state.record_nav_drop(robot)
+                        po_state.on_unassign(robot)
                     unassign_task_from_robot(
                         robot, task,
                         unassigned_robots=unassigned_robots,

@@ -2,8 +2,46 @@ import time, numpy as np
 from typing import List, Tuple, Callable
 from .assignments import generate_random_assignments, generate_high_suitability_assignments
 from hvbta.models import CapabilityProfile, TaskDescription
-from hvbta.suitability import calculate_total_suitability, check_zero_suitability, calculate_suitability_matrix, apply_priority_weights
+from hvbta.suitability import calculate_total_suitability, calculate_suitability_matrix, apply_priority_weights
 from .misc_assignment import extract_submatrix
+
+
+def _filter_zero_pairs(candidate, suitability_matrix):
+    """
+    Drop every pair whose RAW (unweighted) suitability is 0 from a candidate
+    assignment. Dropped robots/tasks go to the candidate's unassigned lists.
+
+    Returns the fixed (pairs, unassigned_robots, unassigned_tasks) candidate,
+    or None when no pair survives (candidate is empty after filtering).
+
+    Applied to EVERY candidate before it enters the pool - generated,
+    warm-start seed, and hall-of-fame alike - so that:
+      - voting rules never rank (and never execute) a zero-score pair,
+        matching Murty's (a zero pair is an infeasible pairing that would
+        just travel and mis-fire at arrival);
+      - the executed candidate is always the voting rule's actual winner
+        (assignment_ranking[0]), not the first zero-free candidate;
+      - coverage bias (Borda ranking zero pairs above unassigned robots,
+        MJ ignoring unassigned voters) can no longer elect all-zero
+        candidates.
+    """
+    pairs, unr, unt = candidate
+    kept_pairs = []
+    dropped_robots = set()
+    dropped_tasks = set()
+    for r, t in pairs:
+        if suitability_matrix[r][t] > 0:
+            kept_pairs.append((int(r), int(t)))
+        else:
+            dropped_robots.add(int(r))
+            dropped_tasks.add(int(t))
+    if not kept_pairs:
+        return None
+    if not dropped_robots:
+        return (kept_pairs, list(unr or []), list(unt or []))
+    new_unr = sorted(set(unr or []) | dropped_robots)
+    new_unt = sorted(set(unt or []) | dropped_tasks)
+    return (kept_pairs, new_unr, new_unt)
 
 def suitability_all_zero(suitability_matrix):
     return all(value == 0 for row in suitability_matrix for value in row)
@@ -339,6 +377,12 @@ def assign_tasks_with_voting(
     #   3. Diversity filter rejects candidates whose pair-overlap with any
     #      already-accepted candidate exceeds diversity_threshold (bounded
     #      retry loop; degrades gracefully in tiny state spaces).
+    # Every candidate (seed, hall-of-fame, generated) is filtered through
+    # _filter_zero_pairs FIRST: zero-score (infeasible) pairs are dropped
+    # before ranking, with the dropped robots/tasks moved to the candidate's
+    # unassigned lists. Candidates that are empty after filtering are not
+    # added. This re-scores the warm-start / hall-of-fame entries against
+    # the CURRENT matrix (no stored scores).
     full_pool = []
     if seed_assignment:
         seed_pairs = [(int(r), int(t)) for r, t in seed_assignment]
@@ -346,16 +390,22 @@ def assign_tasks_with_voting(
         seed_task_ids = {t for _, t in seed_pairs}
         seed_unr = [r for r in range(num_robots) if r not in seed_robot_ids]
         seed_unt = [t for t in range(num_tasks) if t not in seed_task_ids]
-        full_pool.append((seed_pairs, seed_unr, seed_unt))
+        seed_cand = _filter_zero_pairs((seed_pairs, seed_unr, seed_unt), suitability_matrix)
+        if seed_cand is not None:
+            full_pool.append(seed_cand)
 
     # Hall-of-fame extras (already validated/translated by the caller). Add as
     # many as fit; they earned their place so they bypass the diversity filter,
     # but they DO seed accepted_pair_sets so generated candidates avoid them.
+    # Zero-score pairs are dropped by the same filter.
     if extra_candidates:
         for cand in extra_candidates:
             if len(full_pool) >= num_candidates:
                 break
-            full_pool.append(cand)
+            fixed = _filter_zero_pairs(cand, suitability_matrix)
+            if fixed is None:
+                continue
+            full_pool.append(fixed)
 
     diversity_active = diversity_threshold is not None and diversity_threshold < 1.0
     accepted_pair_sets = [set(c[0]) for c in full_pool]
@@ -371,14 +421,15 @@ def assign_tasks_with_voting(
         for candidate in batch:
             if len(full_pool) >= num_candidates:
                 break
+            fixed = _filter_zero_pairs(candidate, suitability_matrix)
+            if fixed is None:
+                continue
             if not diversity_active:
-                full_pool.append(candidate)
+                full_pool.append(fixed)
                 continue
-            new_pairs = set(candidate[0])
-            if not new_pairs:
-                full_pool.append(candidate)
-                accepted_pair_sets.append(new_pairs)
-                continue
+            # Overlap is computed on the FILTERED pairs (never empty here -
+            # _filter_zero_pairs returns None for empty candidates).
+            new_pairs = set(fixed[0])
             too_similar = False
             for accepted in accepted_pair_sets:
                 if not accepted:
@@ -388,22 +439,33 @@ def assign_tasks_with_voting(
                     too_similar = True
                     break
             if not too_similar:
-                full_pool.append(candidate)
+                full_pool.append(fixed)
                 accepted_pair_sets.append(new_pairs)
 
     # If the retry cap was hit before we filled the pool, we still proceed
-    # with what we have (>= 1 candidate). Voting rules handle any pool size.
+    # with what we have. If ZERO-PAIR FILTERING emptied the entire pool
+    # (every candidate's pairs were all infeasible), assign NOTHING this
+    # round - same behavior as Murty's on an all-infeasible matrix. Voting
+    # must never execute a zero-score pair.
+    if not full_pool:
+        length = (time.perf_counter_ns() - start) / 1000.0
+        empty = ([], list(range(num_robots)), list(range(num_tasks)))
+        print(f"Best assignment in voting {empty} (pool empty after zero-pair filter)")
+        return empty, 0.0, length, []
 
     # Anytime accumulation over the pre-generated pool. When neither budget is
     # set the loop consumes the whole pool identically to the old flow.
+    # NOTE: the score_threshold check averages over FILTERED pairs only
+    # (zero pairs are already dropped), so with the same threshold the
+    # anytime termination now fires EARLIER/more often than before the
+    # zero-pair filter.
     random_assignments = []
     for one in full_pool:
         random_assignments.append(one)
 
         if score_threshold is not None:
             # Cheap per-candidate score = mean-per-pair suitability across
-            # every pair in the candidate (zeros pull it down, penalizing
-            # candidates with many unusable assignments). Because per-pair
+            # every FILTERED pair in the candidate. Because per-pair
             # suitability is clamped to [0, 1] at every scorer, this mean is
             # in [0, 1] too - a threshold of 0.7 means "candidate averages
             # 0.7 suitability per pair" and is tunable across runs.
@@ -419,14 +481,17 @@ def assign_tasks_with_voting(
                 break
 
     # Priority-weighted view for voting ranking ONLY. Everything else in this
-    # function (anytime score_threshold above, zero-detection below, best_score
-    # reporting) stays on the raw matrix to preserve [0, 1] semantics and cross-
-    # run comparability of reported scores. The weighted matrix may have entries
+    # function (anytime score_threshold above, best_score reporting) stays
+    # on the raw matrix to preserve [0, 1] semantics and cross-run
+    # comparability of reported scores. The weighted matrix may have entries
     # up to 2.0 (urgent factor), which is fine for internal ranking but would
     # inflate reported metrics.
     priority_weighted_matrix = apply_priority_weights(suitability_matrix, tasks)
 
-    # Run the voting rule on whatever pool we accumulated (>= 1 candidate).
+    # Every candidate was zero-pair-filtered before entering the pool, so no
+    # candidate contains a zero-score pair and no post-hoc zero handling is
+    # needed: the executed candidate is the voting rule's actual winner,
+    # assignment_ranking[0].
     total_scores, assignment_ranking = voting_method(random_assignments, priority_weighted_matrix)
     end = time.perf_counter_ns()
     length = (end - start) / 1000.0
@@ -436,51 +501,16 @@ def assign_tasks_with_voting(
         for rank_idx in assignment_ranking[:top_k]:
             top_k_out.append(random_assignments[rank_idx])
 
-    best_ranking = 0
-    # check for zero suitability in the best assignment and move to the next best if so
-    while(check_zero_suitability(random_assignments[assignment_ranking[best_ranking]][0], suitability_matrix) and best_ranking < len(assignment_ranking)-1):
-        best_ranking += 1
-    if best_ranking == len(random_assignments) - 1:
-        best_ranking = 0
-
-    best_assignment = random_assignments[assignment_ranking[best_ranking]]
+    best_assignment = random_assignments[assignment_ranking[0]]
     assigned_pairs = list(best_assignment[0])
     unassigned_robots = list(best_assignment[1] or [])
     unassigned_tasks = list(best_assignment[2] or [])
-
-    has_positive = any(suitability_matrix[r][t] > 0 for r, t in assigned_pairs)
-    if has_positive:
-        kept_pairs = []
-        for r, t in assigned_pairs:
-            if suitability_matrix[r][t] > 0:
-                kept_pairs.append((r, t))
-            else:
-                if r not in unassigned_robots:
-                    unassigned_robots.append(r)
-                if t not in unassigned_tasks:
-                    unassigned_tasks.append(t)
-        assigned_pairs = kept_pairs
-    else:
-        # All pairs scored 0 – keep the random assignment so the simulator has work to do.
-        if best_assignment[1] is None:
-            assigned_ids = {r for r, _ in assigned_pairs}
-            unassigned_robots = [idx for idx in range(num_robots) if idx not in assigned_ids]
-        if best_assignment[2] is None:
-            assigned_task_ids = {t for _, t in assigned_pairs}
-            unassigned_tasks = [idx for idx in range(num_tasks) if idx not in assigned_task_ids]
 
     filtered_best_assignments = (
         assigned_pairs,
         unassigned_robots,
         unassigned_tasks,
     )
-    # filtered_best_assignments = ([],[],[])
-    # for robot_id, task_id in best_assignment[0]:
-    #         if suitability_matrix[robot_id][task_id] == 0:
-    #             filtered_best_assignments[1].append(robot_id)
-    #             filtered_best_assignments[2].append(task_id)
-    #         else:
-    #             filtered_best_assignments[0].append((robot_id, task_id))
     print(f"Best assignment in voting {filtered_best_assignments}")
 
     best_score = calculate_total_suitability(filtered_best_assignments[0], suitability_matrix)

@@ -28,3 +28,6 @@ body.json
 Modelfile
 local_claude.ps1
 opencode.json
+.vscode/
+*.log
+paper/

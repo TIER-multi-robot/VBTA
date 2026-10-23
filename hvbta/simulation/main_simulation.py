@@ -1,5 +1,7 @@
 import time
 import random
+import glob
+import re
 import numpy as np
 import csv
 import os
@@ -23,9 +25,10 @@ from hvbta.pathfinding.CBS_helper import load_map, create_obstacle_list
 from hvbta.pathfinding.MAPF_wrapper import run_planner
 from hvbta.allocators.misc_assignment import (
     add_new_tasks, add_new_robots, remove_random_robots, remove_random_tasks,
-    remove_task_by_id, remove_robot_by_id,
+    remove_task_by_id, remove_robot_by_id, unassign_task_from_robot,
 )
 from hvbta.models import CapabilityProfile, TaskDescription
+from hvbta.partial_observability import PartialObservabilityState
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +367,21 @@ def main_simulation(
         # drawn from the random-rate gates. Enables fair cross-method comparison
         # within a (rep, sm) group.
         event_schedule: list = None,
+        # Partial-observability experiment (see partial_observability_experiment.md).
+        # mask_level: "none" / "low" / "high" - activates the masked-view allocator
+        #   + execution-time feasibility check. None (default) disables the
+        #   machinery entirely (legacy behavior; PO CSV columns get sentinels).
+        # mask_policy: "optimistic" / "pessimistic" (only meaningful when
+        #   mask_level is "low"/"high").
+        # schedule_seed: the group's schedule seed (zlib.adler32 of the group
+        #   key). Masks are derived from it + task_id, so it must be passed for
+        #   masks to be reproducible.
+        mask_level: str = None,
+        mask_policy: str = None,
+        schedule_seed: int = None,
+        # Optional path for the per-run PO diagnostic JSON (masks, per-field
+        # mis-assignment breakdown). Only written when mask_level is set.
+        po_diag_path: str = None,
         # MAPF planner selector ("cbs" | "pp" | "pibt" | "lacam"). Routes through
         # MAPF_wrapper.run_planner so the outer loop is untouched. Default "cbs"
         # during the refactor so partial progress never breaks a run.
@@ -446,6 +464,9 @@ def main_simulation(
     # failures, showing how many alternatives each method attempts before
     # recovering or accepting stale paths.
     alternatives_tried = 0
+    # Invariant-check accumulator: ticks where some robot is assigned to a
+    # task but has an empty current_path (can neither move nor work).
+    stuck_assigned_robot_ticks = 0
     murtys_alternatives = []
     # Warm-start seed for the next voting replan. Persists across the loop as
     # a list of (robot_id, task_id) tuples (ID-based so it survives adds /
@@ -498,11 +519,27 @@ def main_simulation(
 
     occupied_positions = set(r.location for r in robots)
 
+    # Partial-observability state. Active whenever mask_level is set
+    # (including "none", which runs the execution-time feasibility check
+    # with no masked attributes - the required control condition).
+    po = None
+    if mask_level is not None:
+        po = PartialObservabilityState(schedule_seed, mask_level, mask_policy)
+
     # apply initial assignment
     assigned_pairs = output[0]
     for robot_idx, task_idx in assigned_pairs:
         r = robots[robot_idx]
         t = tasks[task_idx]
+        if po is not None:
+            # Record the masked-view pair score (allocator's own view) so
+            # note_round's Masked_View_Suitability is correct for the initial
+            # assignment too, then scrub zero-suitability pairs (PO never
+            # executes a pairing the allocator itself scored 0 - spec §6.3).
+            r.current_task_suitability = float(
+                po.masked_scorer(suitability_method)([r], [t], map_size=HYPOTENUSE)[0, 0])
+            if float(r.current_task_suitability) == 0.0:
+                continue
         r.current_task = t
         r.assigned = True
         r.tasks_attempted = 1
@@ -514,6 +551,11 @@ def main_simulation(
     unassigned_robots = [r.robot_id for r in robots if not r.assigned]
     start_positions = {r.robot_id: r.location for r in robots if r.assigned and r.current_task}
     goal_positions = {r.robot_id: r.current_task.location for r in robots if r.assigned and r.current_task}
+
+    if po is not None:
+        # The initial assignment counts as the first allocation round for the
+        # true-vs-masked suitability metrics.
+        po.note_round(robots, HYPOTENUSE)
 
     avg_path_length, _ = run_planner(planner, robots, start_positions, goal_positions, map_dict)
 
@@ -534,6 +576,7 @@ def main_simulation(
             robots, tasks, unassigned_robots, unassigned_tasks,
             suitability_method, occupied_positions, start_positions,
             goal_positions, 1.0, total_reward, total_success,
+            po_state=po, current_tick=time_step, pending_event_steps=pending_event_steps,
         )
         # Per-step throughput signal (used for mean + variance at end).
         completed_per_step.append(completed_this_step)
@@ -758,10 +801,36 @@ def main_simulation(
                 # use the updated cache as suitability source if LLM is suitibility method
                 suitability_source = (llm_cache["matrix"], llm_cache["robot_id_to_idx"], llm_cache["task_id_to_idx"])
             else:
-                suitability_source = suitability_method
+                # PO: wrap the scorer so the allocator only ever scores masked
+                # views. Every allocator decision (candidate generation,
+                # voting, Murty's, stealing, warm-start) flows through this
+                # call, so true values of masked fields never reach them.
+                if po is not None:
+                    suitability_source = po.masked_scorer(suitability_method)
+                else:
+                    suitability_source = suitability_method
+
+            # PO no-bounce guard (spec §6.3/§6.4): when the unassigned x
+            # unassigned submatrix is all zero, the allocators' legacy random
+            # fallback would assign infeasible pairs (zero hard-fail-checked
+            # suitability), which then mis-fire at arrival and bounce forever.
+            # When PO is active, skip the allocation instead - infeasible-for-
+            # all tasks starve (that's what Masked_Starvation_Count measures)
+            # instead of churning robots. Non-PO runs keep the legacy path.
+            po_all_zero = False
+            if po is not None:
+                _ur = [r for r in robots if not r.assigned]
+                _ut = [t for t in tasks if not t.assigned]
+                if _ur and _ut:
+                    _m = np.asarray(suitability_source(_ur, _ut, map_size=HYPOTENUSE))
+                    po_all_zero = not np.any(_m > 0)
+                if po_all_zero:
+                    # Counted per tick in the All_Zero_Skip_Ticks column (no
+                    # per-tick print - too noisy at sweep scale).
+                    po.all_zero_skip_ticks += 1
 
             # assign with voting
-            if voting_method in voting_methods:
+            if not po_all_zero and voting_method in voting_methods:
                 # Anytime pressure: any urgent unassigned task or a new-robot
                 # event this tick triggers a tight budget so voting bails on
                 # the first good-enough candidate.
@@ -822,7 +891,7 @@ def main_simulation(
                         candidate_cache = candidate_cache[-HALL_OF_FAME_MAX:]
             
             # assign with optimization
-            elif voting_method in optimization_methods:
+            elif not po_all_zero and voting_method in optimization_methods:
                 # Murty's uses a special reassign function that generates
                 # K-best alternatives for the replan-on-failure mechanism.
                 if voting_method == O.murtys_task_allocation:
@@ -846,7 +915,7 @@ def main_simulation(
                     reassignment_fairness_metrics.append(compute_all_fairness_metrics(reassign_per_agent_scores))
 
             # assign with direct LLM (bypass the matrix)
-            elif getattr(voting_method, "_is_llm_direct", False):
+            elif not po_all_zero and getattr(voting_method, "_is_llm_direct", False):
                 print("REASSIGNING WITH DIRECT LLM ASSIGNMENT")
                 total_reassignments += 1
                 _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = reassign_robots_to_tasks_direct(
@@ -860,6 +929,29 @@ def main_simulation(
                     reassignment_fairness_metrics.append(compute_all_fairness_metrics(reassign_per_agent_scores))
             total_reassignment_time += reassign_length
             cumulative_reassignment_quality += reassign_score
+
+            if po is not None:
+                # PO safety net (spec §6.3/§6.4): never execute a pair the
+                # allocator itself scored 0. Voting's internal all-zero-
+                # candidate fallback can apply infeasible pairs; scrub them
+                # here so they never travel and mis-fire at arrival. The
+                # scrub uses the allocator's own view (masked under PO), so
+                # optimistic masking still lets genuinely-misjudged pairs
+                # through - those are the experiment's mis-assignments.
+                for r in robots:
+                    if (r.assigned and r.current_task is not None
+                            and (r.current_task_suitability is None
+                                 or float(r.current_task_suitability) == 0.0)):
+                        unassign_task_from_robot(
+                            r, r.current_task,
+                            unassigned_robots=unassigned_robots,
+                            unassigned_tasks=unassigned_tasks,
+                        )
+
+            if po is not None and not po_all_zero:
+                # Post-allocation snapshot of true-vs-masked suitability over
+                # the currently assigned pairs.
+                po.note_round(robots, HYPOTENUSE)
 
             # update location dicts
             for robot in robots:
@@ -877,6 +969,11 @@ def main_simulation(
             if t.assigned:
                 tasks_ever_assigned.add(t.task_id)
 
+        if po is not None:
+            # End-of-tick PO bookkeeping: assignment-change detection (travel
+            # resets, recovery-latency closeout) and masked-wait accumulation.
+            po.end_of_tick(robots, tasks, tasks_ever_assigned, time_step)
+
         # rerun planner if needed, update state, and clear events.
         # On planner failure, try alternative assignments from the voting
         # candidate pool (for voting methods) or a perturbed re-solve (for
@@ -885,6 +982,8 @@ def main_simulation(
         # the last successful replan and may have minor collision risk, but
         # freezing would lose progress entirely).
         MAX_REPLAN_RETRIES = 10
+        # None = planner not called this tick; True/False = outcome.
+        planner_okay = None
         if should_replan_paths and start_positions and goal_positions:
              # Debug: check for duplicate starts/goals before calling planner
             # start_vals = list(start_positions.values())
@@ -997,6 +1096,22 @@ def main_simulation(
                                 robot.current_task_suitability = pair_score
                                 task.current_suitability = pair_score
 
+                    # PO: alternatives are applied without a suitability filter,
+                    # so scrub zero-suitability pairs here too - PO never
+                    # executes a pairing the allocator itself scored 0 (the
+                    # regular post-allocation scrub runs before this replan-
+                    # on-failure section, so it misses these).
+                    if po is not None:
+                        for r in robots:
+                            if (r.assigned and r.current_task is not None
+                                    and (r.current_task_suitability is None
+                                         or float(r.current_task_suitability) == 0.0)):
+                                unassign_task_from_robot(
+                                    r, r.current_task,
+                                    unassigned_robots=unassigned_robots,
+                                    unassigned_tasks=unassigned_tasks,
+                                )
+
                     # Update positions for the new assignment.
                     for robot in robots:
                         if robot.assigned and robot.current_task:
@@ -1026,6 +1141,20 @@ def main_simulation(
                 pending_event_steps.clear()
             previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
             events = {k: 0 for k in events}
+
+        # Invariant check: a robot with an assigned task and an EMPTY
+        # current_path after a SUCCESSFUL plan call is stuck - it can
+        # neither move nor work. Counted per tick in
+        # Stuck_Assigned_Robot_Ticks; must be 0. (Ticks after planner
+        # FAILURES legitimately leave newly-assigned robots pathless -
+        # the documented accept-stale-paths behavior - so they are not
+        # counted; verified empirically that no stuck robot survives a
+        # successful plan call.)
+        if planner_okay:
+            stuck_assigned_robot_ticks += sum(
+                1 for r in robots
+                if r.assigned and r.current_task is not None and not r.current_path
+            )
 
     task_completion_fraction = total_success / total_tasks if total_tasks else 0.0
     attempted_completion_rate = total_success / len(tasks_ever_assigned) if tasks_ever_assigned else 0.0
@@ -1094,6 +1223,40 @@ def main_simulation(
     else:
         pool_size_trend = 0.0
 
+    # Partial-observability outcome metrics (spec §7). Sentinels when the
+    # machinery is inactive: counts 0, rates/means -1.
+    if po is not None:
+        po_metrics = po.finalize(tasks, tasks_ever_assigned)
+        if po_diag_path:
+            po.dump_diagnostics(
+                po_diag_path,
+                scenario=scenario,
+                planner=planner,
+                mask_level=mask_level,
+                mask_policy=mask_policy,
+            )
+    else:
+        po_metrics = {
+            "mis_assignment_count": 0,
+            "mis_assignment_rate": -1.0,
+            "wasted_travel_steps": 0,
+            "wasted_travel_fraction": -1.0,
+            "masked_starvation_count": 0,
+            "mean_masked_wait": -1.0,
+            "reveal_events": 0,
+            "recovery_latency_mean": -1.0,
+            "true_assignment_suitability": -1.0,
+            "masked_view_suitability": -1.0,
+            "nav_drop_count": 0,
+            "nav_drop_wasted_travel": 0,
+            "all_zero_skip_ticks": 0,
+        }
+
+    # Tasks spawned but never assigned to any robot, regardless of masking -
+    # the capacity baseline Masked_Starvation_Count must be compared against
+    # (spec §3a: ~45 tasks are never attempted even at Mask_Level=none).
+    never_attempted_count = total_tasks - len(tasks_ever_assigned)
+
     return (
         # Section 4 - aggregate outcome (kept only)
         task_completion_fraction,
@@ -1119,6 +1282,25 @@ def main_simulation(
         # Section 12 - planner failure count + alternatives tried
         plan_failure_count,
         alternatives_tried,
+        # Section 15 - partial-observability outcome metrics (spec §7).
+        # Order matches the CSV header; -1 marks N/A (PO machinery inactive
+        # or empty denominators).
+        po_metrics["mis_assignment_count"],
+        po_metrics["mis_assignment_rate"],
+        po_metrics["wasted_travel_steps"],
+        po_metrics["wasted_travel_fraction"],
+        po_metrics["masked_starvation_count"],
+        po_metrics["mean_masked_wait"],
+        po_metrics["reveal_events"],
+        po_metrics["recovery_latency_mean"],
+        po_metrics["true_assignment_suitability"],
+        po_metrics["masked_view_suitability"],
+        po_metrics["nav_drop_count"],
+        po_metrics["nav_drop_wasted_travel"],
+        # Section 15b - PO baseline + invariant diagnostics
+        never_attempted_count,
+        po_metrics.get("all_zero_skip_ticks", 0),
+        stuck_assigned_robot_ticks,
     )
 
 
@@ -1149,6 +1331,10 @@ def benchmark_simulation(
         remove_tasks: bool = False,
         tasks_to_remove: int = 1,
         event_schedule: list = None,
+        mask_level: str = None,
+        mask_policy: str = None,
+        schedule_seed: int = None,
+        po_diag_path: str = None,
         planner: str = "lacam",
         scenario: str = "",
         scheduled_event_count: int = 0,
@@ -1168,6 +1354,10 @@ def benchmark_simulation(
         remove_tasks=remove_tasks,
         tasks_to_remove=tasks_to_remove,
         event_schedule=event_schedule,
+        mask_level=mask_level,
+        mask_policy=mask_policy,
+        schedule_seed=schedule_seed,
+        po_diag_path=po_diag_path,
         planner=planner,
         scenario=scenario,
         scheduled_event_count=scheduled_event_count,
@@ -1190,6 +1380,63 @@ def _record_assignment(assignment_infos, run_id, method_name, sm_name, num_robot
          mean_assignment_suitability, planning_time_us] + list(metrics)
     )
     return metrics[0]  # initial jains
+
+
+def _scan_completed_runs(dir_path):
+    """
+    Resume support: scan the output directory's simulation CSVs for runs
+    that are already on disk so an interrupted sweep continues instead of
+    restarting. Rows are written (and flushed) per completed run, so a
+    killed process leaves a valid prefix.
+
+    Returns ({group_key: completed_row_count}, total_rows) where a
+    group_key is (map, num_robots, num_tasks, planner, scenario,
+    suitability_method, mask_level, mask_policy, method). Legacy files
+    without the Mask_* columns are treated as mask_level/policy = None.
+    Truncated trailing rows (mid-write kill) are dropped and the file
+    is rewritten cleanly.
+    """
+    counts = {}
+    total = 0
+    for path in sorted(glob.glob(os.path.join(dir_path, '*simulation*.csv'))):
+        base = os.path.basename(path)
+        m = re.search(r'_simulation_(.+)\.csv$', base)
+        if not m:
+            continue
+        map_name = m.group(1)
+        try:
+            with open(path, newline='', encoding='utf-8') as f:
+                rows = list(csv.reader(f))
+        except OSError:
+            continue
+        if not rows:
+            continue
+        header, body = rows[0], rows[1:]
+        idx = {name: i for i, name in enumerate(header)}
+        need = ('Method', 'Suitability Method', 'Planner', 'Num Robots', 'Num Tasks', 'Scenario')
+        if any(n not in idx for n in need):
+            continue
+        mi, si, pi = idx['Method'], idx['Suitability Method'], idx['Planner']
+        ri, ti, ci = idx['Num Robots'], idx['Num Tasks'], idx['Scenario']
+        li, yi = idx.get('Mask_Level'), idx.get('Mask_Policy')
+        complete = [r for r in body if len(r) == len(header)]
+        dropped = len(body) - len(complete)
+        if dropped:
+            print(f"RESUME: dropping {dropped} truncated row(s) from {base}")
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                w.writerow(header)
+                w.writerows(complete)
+        for r in complete:
+            try:
+                ml = (r[li] or None) if li is not None else None
+                mp = (r[yi] or None) if yi is not None else None
+                key = (map_name, int(r[ri]), int(r[ti]), r[pi], r[ci], r[si], ml, mp, r[mi])
+            except (ValueError, IndexError):
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            total += 1
+    return counts, total
 
 
 if __name__ == "__main__":
@@ -1218,6 +1465,10 @@ if __name__ == "__main__":
     ]
     direct_names = [func_name(f) for f in direct_methods]
     all_methods = voting_methods + optimization_methods + direct_methods
+    # Pretty display names keyed by function object - used for CSV rows and
+    # for the resume-skip key so it matches what's on disk exactly.
+    method_pretty = {fn: name for fn, name in
+                     zip(all_methods, voting_names + optimization_names + direct_names)}
     suitability_methods = [
         S.evaluate_suitability_balanced,
         # S.evaluate_suitability_loose,
@@ -1304,16 +1555,34 @@ if __name__ == "__main__":
         (r"lak108c.map", [10, 15], [10, 15]),            # 26x27, 60% obs, 279 free
     ]
 
+    # --- PO CONFIG: partially-observable task requirements ---
+    # Spec: partial_observability_experiment.md. Uses the maps_balanced2
+    # configuration (NEW_SWEEP_CONFIGS) with LaCAM fixed, all 6 voting
+    # methods + Murty's K-Best, balanced suitability only, and the 5 mask
+    # conditions (none / low-opt / low-pess / high-opt / high-pess).
+    # The mask condition is NOT part of the schedule seed, so all 5
+    # conditions replay identical schedules (spec §5).
+    PO_EXPERIMENT = True
+    # P1 pilot: zero-pair voting fix only (ablation vs
+    # pilot_po_pre_zero_pair_fix). Same config/seeds as the pre-fix pilot.
+    PO_SWEEP_CONFIGS = [(r"lak102d.map", [10, 20], [10, 20])]
+    # Every run writes to a NEW directory - never into an existing one.
+    # Fresh dir => the resume scanner finds no completed rows => nothing
+    # is skipped, every config re-runs (per agent instructions §0.4).
+    PO_OUTPUT_DIRNAME = "pilot_po_P1_zero_pair_fix"
+    from hvbta.partial_observability import PO_CONDITIONS, MASK_COUNTS
+
     # Uncomment ONE of the following lines:
     # sweep_configs = OLD_SWEEP_CONFIGS        # finish interrupted first run
     # sweep_configs = CONSTRAINED_SWEEP_CONFIGS  # constrained maps test
     # sweep_configs = NEW_SWEEP_CONFIGS        # balanced pairing for clean results
     sweep_configs = HYPER_CONSTRAINED_CONFIGS
+    if PO_EXPERIMENT:
+        sweep_configs = PO_SWEEP_CONFIGS
     # ============================================================
 
     map_dir = r"MAPF_benchmark_maps"
 
-    Run_ID = 1
     num_repetitions = 3
     add_tasks = True
     add_robots = True
@@ -1325,13 +1594,28 @@ if __name__ == "__main__":
     task_generation_strict = True
     remove_tasks = True
     tasks_to_remove = 1
-    PLANNER = ["pp"]
+    # PO runs fix LaCAM (spec §8); everything else keeps the configured planner.
+    PLANNER = ["lacam"] if PO_EXPERIMENT else ["pp"]
     TARGET_EVENT_COUNT_K = 125
     TRANSIENT_FLOOR = 200
 
-    # NOTE: swap between the directories for the new and old parameter sweep configurations
-    dir_path = os.path.join('hvbta', 'io', 'results', 'hyper-constrained')
+    # NOTE: every run writes to a fresh PO_OUTPUT_DIRNAME; never an existing
+    # results directory (agent instructions §0.3).
+    dir_path = os.path.join('hvbta', 'io', 'results',
+                            PO_OUTPUT_DIRNAME if PO_EXPERIMENT else 'hyper-constrained')
+    po_diag_dir = os.path.join(dir_path, 'po_diagnostics')
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    # Resume support: an interrupted sweep re-launch continues from where it
+    # stopped instead of restarting (rows are matched on the full group key
+    # plus rep count). Run_ID continues past every row already on disk so
+    # IDs never collide across old and new result files. Must run AFTER
+    # dir_path is chosen.
+    resume_counts, resume_rows = _scan_completed_runs(dir_path)
+    Run_ID = resume_rows + 1
+    if resume_rows:
+        print(f"RESUME: {resume_rows} completed run row(s) found in {dir_path} "
+              f"across {len(resume_counts)} group key(s) - completed runs will be skipped.")
     os.makedirs(dir_path, exist_ok=True)
 
     for map_file_name, robot_sizes, task_sizes in sweep_configs:
@@ -1383,11 +1667,23 @@ if __name__ == "__main__":
                 'Plan_Failure_Count',
                 # Total alternative assignments tried during replan-on-failure
                 'Alternatives_Tried',
+                # Partial-observability outcome metrics (spec §7); -1 marks N/A
+                # (PO machinery inactive or empty denominators)
+                'Mis_Assignment_Count', 'Mis_Assignment_Rate',
+                'Wasted_Travel_Steps', 'Wasted_Travel_Fraction',
+                'Masked_Starvation_Count', 'Mean_Masked_Wait', 'Reveal_Events',
+                'Mis_Assignment_Recovery_Latency',
+                'True_Assignment_Suitability', 'Masked_View_Suitability',
+                'Nav_Drop_Count', 'Nav_Drop_Wasted_Travel',
+                # PO baseline + invariant diagnostics
+                'Never_Attempted_Count', 'All_Zero_Skip_Ticks', 'Stuck_Assigned_Robot_Ticks',
                 # Overhead
                 'Execution Time',
                 # Config covariates (constant per run)
                 'Scenario', 'Task_Arrival_Rate', 'Task_Cancellation_Rate',
                 'Robot_Arrival_Rate', 'Robot_Departure_Rate',
+                # Partial-observability config covariates (spec §7)
+                'Mask_Level', 'Mask_Count', 'Mask_Policy',
                 # Map size
                 'Map Size',
             ])
@@ -1504,15 +1800,6 @@ if __name__ == "__main__":
                                         for e in event_schedule
                                     )
 
-                                    if getattr(sm, "_is_llm_batch", False):
-                                        result = sm(robots, tasks)
-                                        # LLM scorers return (matrix, parse_failed); unwrap so the
-                                        # matrix is what flows through to llm_cache and downstream
-                                        # indexing in reassign_robots_to_tasks_direct.
-                                        suitability_matrix = result[0] if isinstance(result, tuple) else result
-                                    else:
-                                        suitability_matrix = S.calculate_suitability_matrix(robots, tasks, sm, HYPOTENUSE)
-
                                     if robot_generation_strict and task_generation_strict:
                                         profiles_w.writerow([
                                             Run_ID, os.path.basename(map_file),
@@ -1520,92 +1807,179 @@ if __name__ == "__main__":
                                             json.dumps(robot_profiles), json.dumps(task_profiles),
                                         ])
 
-                                    # Direct LLM assignment is independent of the matrix; time it and
-                                    # score its chosen pairs against the rule-based matrix for parity
-                                    # with voting/optimization rows.
-                                    direct_outputs = []
-                                    for d_fn, d_name in zip(direct_methods, direct_names):
-                                        d_start = time.perf_counter_ns()
-                                        out, parse_failed = d_fn(robots, tasks)
-                                        d_length = (time.perf_counter_ns() - d_start) / 1000.0
-                                        if parse_failed:
-                                            print(f"[{d_name}] parse failed - empty assignment fallback")
-                                        pairs = out[0]
-                                        per_agent_direct = [float(suitability_matrix[r][t]) for (r, t) in pairs] if not isinstance(suitability_matrix, tuple) else [0.0] * len(pairs)
-                                        d_score = sum(per_agent_direct)
-                                        initial_jains = _record_assignment(assignment_infos, Run_ID, d_name, sm_name, num_robots, num_tasks, nc, d_score, d_length, per_agent_direct)
-                                        direct_outputs.append((out, initial_jains))
-
-                                    if suitability_all_zero(suitability_matrix):
-                                        # voting - random fallback
-                                        for method_fn, method_name in zip(voting_methods, voting_names):
-                                            output, score, length, per_agent = V.assign_tasks_randomly(robots, tasks, suitability_matrix, nc)
-                                            initial_jains = _record_assignment(assignment_infos, Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                            voting_outputs.append((output, initial_jains))
-                                        # optimization - random fallback
-                                        opt_outputs = []
-                                        for opt_fn, opt_name in zip(optimization_methods, optimization_names):
-                                            out, score, length, per_agent = O.assign_tasks_with_method_randomly(opt_fn, suitability_matrix, nc)
-                                            initial_jains = _record_assignment(assignment_infos, Run_ID, opt_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                            opt_outputs.append((out, initial_jains))
-                                        outputs = voting_outputs + opt_outputs + direct_outputs
-                                    else:
-                                        # voting - normal
-                                        for method_fn, method_name in zip(voting_methods, voting_names):
-                                            output, score, length, per_agent = V.assign_tasks_with_voting(robots, tasks, suitability_matrix, nc, method_fn)
-                                            initial_jains = _record_assignment(assignment_infos, Run_ID, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                            voting_outputs.append((output, initial_jains))
-                                        # optimization - normal
-                                        opt_outputs = []
-                                        for opt_fn, opt_name in zip(optimization_methods, optimization_names):
-                                            out, score, length, per_agent = O.assign_tasks_with_method(opt_fn, suitability_matrix)
-                                            initial_jains = _record_assignment(assignment_infos, Run_ID, opt_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                            opt_outputs.append((out, initial_jains))
-                                        outputs = voting_outputs + opt_outputs + direct_outputs
-
-                                    for idx, (out_tuple, meth) in enumerate(zip(outputs, all_methods)):
-                                        out, initial_jains = out_tuple
-                                        output_tuple = benchmark_simulation(
-                                            output=out, 
-                                            robots=copy.deepcopy(robots), 
-                                            tasks=copy.deepcopy(tasks),
-                                            num_candidates=nc, 
-                                            voting_method=meth, 
-                                            grid=grid, 
-                                            map_dict=map_dict, 
-                                            suitability_method=sm, 
-                                            suitability_matrix=suitability_matrix, 
-                                            max_time_steps=max_time_steps, 
-                                            add_tasks=add_tasks, 
-                                            add_robots=add_robots, 
-                                            remove_robots=remove_robots,
-                                            tasks_to_add=tasks_to_add, 
-                                            robots_to_add=robots_to_add, 
-                                            robots_to_remove=robots_to_remove,
-                                            robot_generation_strict=robot_generation_strict, 
-                                            task_generation_strict=task_generation_strict,
-                                            initial_jains_index=initial_jains, 
-                                            task_arrival_rate=task_arrival_rate,
-                                            robot_arrival_rate=robot_arrival_rate, 
-                                            robot_departure_rate=robot_departure_rate,
-                                            task_cancellation_rate=task_cancellation_rate,
-                                            remove_tasks=remove_tasks,
-                                            tasks_to_remove=tasks_to_remove,
-                                            event_schedule=event_schedule,
-                                            planner=algo,
-                                            scenario=scenario_name,
-                                            scheduled_event_count=scheduled_event_count,
-                                            horizon_binding_term=horizon_binding_term,
+                                    # Partial-observability conditions (spec §8). The
+                                    # condition loop sits INSIDE the rep loop so all 5
+                                    # conditions replay the identical schedule and masks
+                                    # (mask level/policy are not in the schedule seed).
+                                    # When PO_EXPERIMENT is off there is a single legacy
+                                    # condition and the PO machinery stays disabled.
+                                    for mask_level, mask_policy in (PO_CONDITIONS if PO_EXPERIMENT else ((None, None),)):
+                                        # Resume: skip the whole condition (initial matrix +
+                                        # assignments + all method runs) when every method for
+                                        # this rep is already on disk.
+                                        if resume_counts and all(
+                                            resume_counts.get(
+                                                (os.path.basename(map_file), num_robots, num_tasks,
+                                                 algo, scenario_name, sm_name, mask_level, mask_policy, _n), 0) > rep
+                                            for _n in (voting_names + optimization_names + direct_names)
+                                        ):
+                                            continue
+                                        po_cond = (
+                                            PartialObservabilityState(schedule_seed, mask_level, mask_policy)
+                                            if PO_EXPERIMENT else None
                                         )
-                                        row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [Run_ID, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0]
-                                        # Inject the planner name at the CSV's 'Planner' column slot
-                                        # (after Run ID / Method / Suitability Method, before Num Robots).
-                                        row_prefix = [row_prefix[0], row_prefix[1], row_prefix[2], algo] + row_prefix[3:]
-                                        # Config covariates + provenance, appended before the map_size suffix.
-                                        config_suffix = [
-                                            scenario_name,
-                                            task_arrival_rate, task_cancellation_rate,
-                                            robot_arrival_rate, robot_departure_rate,
-                                        ]
-                                        writer.writerow(row_prefix + list(output_tuple) + config_suffix + [map_size])
-                                    Run_ID += 1
+                                        sm_for_matrix = po_cond.masked_scorer(sm) if po_cond is not None else sm
+
+                                        voting_outputs = []
+                                        assignment_infos = []
+
+                                        if getattr(sm, "_is_llm_batch", False):
+                                            result = sm(robots, tasks)
+                                            # LLM scorers return (matrix, parse_failed); unwrap so the
+                                            # matrix is what flows through to llm_cache and downstream
+                                            # indexing in reassign_robots_to_tasks_direct.
+                                            suitability_matrix = result[0] if isinstance(result, tuple) else result
+                                        else:
+                                            # PO: the initial allocation is also an allocator
+                                            # decision, so it scores the masked views too.
+                                            suitability_matrix = S.calculate_suitability_matrix(robots, tasks, sm_for_matrix, HYPOTENUSE)
+
+                                        # PO: report the initial Total Score /
+                                        # Mean_Assignment_Suitability on TRUE attributes
+                                        # (spec §7 - masked-view scores would inflate quality
+                                        # under optimistic masking). Non-PO path unchanged.
+                                        def _record_initial(run_id, method_name, out, score, length, per_agent):
+                                            if po_cond is None or not out:
+                                                return _record_assignment(assignment_infos, run_id, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
+                                            pairs = out[0] if isinstance(out, tuple) else out
+                                            true_per_agent = [
+                                                S._balanced_pair(robots[r], tasks[t], map_size=HYPOTENUSE)
+                                                for r, t in pairs
+                                            ]
+                                            return _record_assignment(assignment_infos, run_id, method_name, sm_name, num_robots, num_tasks, nc, sum(true_per_agent), length, true_per_agent)
+
+                                        # Direct LLM assignment is independent of the matrix; time it and
+                                        # score its chosen pairs against the rule-based matrix for parity
+                                        # with voting/optimization rows.
+                                        direct_outputs = []
+                                        for d_fn, d_name in zip(direct_methods, direct_names):
+                                            d_start = time.perf_counter_ns()
+                                            out, parse_failed = d_fn(robots, tasks)
+                                            d_length = (time.perf_counter_ns() - d_start) / 1000.0
+                                            if parse_failed:
+                                                print(f"[{d_name}] parse failed - empty assignment fallback")
+                                            pairs = out[0]
+                                            per_agent_direct = [float(suitability_matrix[r][t]) for (r, t) in pairs] if not isinstance(suitability_matrix, tuple) else [0.0] * len(pairs)
+                                            d_score = sum(per_agent_direct)
+                                            initial_jains = _record_initial(Run_ID, d_name, out, d_score, d_length, per_agent_direct)
+                                            direct_outputs.append((out, initial_jains))
+
+                                        if suitability_all_zero(suitability_matrix):
+                                            if PO_EXPERIMENT:
+                                                # PO no-bounce guard (spec §6.3): never randomly
+                                                # assign infeasible pairs. Empty initial assignment;
+                                                # the first replan tick handles whatever is feasible.
+                                                empty_out = ([], list(range(len(robots))), list(range(len(tasks))))
+                                                # Record a proper 13-item assignment row per method
+                                                # so the CSV row prefix stays aligned.
+                                                for _n in (voting_names + optimization_names + direct_names):
+                                                    _record_initial(Run_ID, _n, empty_out, 0.0, 0.0, [])
+                                                outputs = [(empty_out, 0.0)] * len(all_methods)
+                                            else:
+                                                # voting - random fallback
+                                                for method_fn, method_name in zip(voting_methods, voting_names):
+                                                    output, score, length, per_agent = V.assign_tasks_randomly(robots, tasks, suitability_matrix, nc)
+                                                    initial_jains = _record_initial(Run_ID, method_name, output, score, length, per_agent)
+                                                    voting_outputs.append((output, initial_jains))
+                                                # optimization - random fallback
+                                                opt_outputs = []
+                                                for opt_fn, opt_name in zip(optimization_methods, optimization_names):
+                                                    out, score, length, per_agent = O.assign_tasks_with_method_randomly(opt_fn, suitability_matrix, nc)
+                                                    initial_jains = _record_initial(Run_ID, opt_name, out, score, length, per_agent)
+                                                    opt_outputs.append((out, initial_jains))
+                                                outputs = voting_outputs + opt_outputs + direct_outputs
+                                        else:
+                                            # voting - normal
+                                            for method_fn, method_name in zip(voting_methods, voting_names):
+                                                output, score, length, per_agent = V.assign_tasks_with_voting(robots, tasks, suitability_matrix, nc, method_fn)
+                                                initial_jains = _record_initial(Run_ID, method_name, output, score, length, per_agent)
+                                                voting_outputs.append((output, initial_jains))
+                                            # optimization - normal
+                                            opt_outputs = []
+                                            for opt_fn, opt_name in zip(optimization_methods, optimization_names):
+                                                out, score, length, per_agent = O.assign_tasks_with_method(opt_fn, suitability_matrix)
+                                                initial_jains = _record_initial(Run_ID, opt_name, out, score, length, per_agent)
+                                                opt_outputs.append((out, initial_jains))
+                                            outputs = voting_outputs + opt_outputs + direct_outputs
+
+                                        for idx, (out_tuple, meth) in enumerate(zip(outputs, all_methods)):
+                                            out, initial_jains = out_tuple
+                                            # Resume: skip this individual run when its rep is
+                                            # already on disk (count > rep, 0-indexed).
+                                            if resume_counts.get(
+                                                    (os.path.basename(map_file), num_robots, num_tasks,
+                                                     algo, scenario_name, sm_name, mask_level, mask_policy,
+                                                     method_pretty[meth]), 0) > rep:
+                                                print(f"RESUME: skipping completed run "
+                                                      f"{method_pretty[meth]} (map={os.path.basename(map_file)}, "
+                                                      f"robots={num_robots}, scenario={scenario_name}, rep={rep}, "
+                                                      f"mask={mask_level}/{mask_policy})")
+                                                continue
+                                            po_diag_path = (
+                                                os.path.join(po_diag_dir, f"run{Run_ID}_{func_name(meth)}.json")
+                                                if PO_EXPERIMENT else None
+                                            )
+                                            output_tuple = benchmark_simulation(
+                                                output=out, 
+                                                robots=copy.deepcopy(robots), 
+                                                tasks=copy.deepcopy(tasks),
+                                                num_candidates=nc, 
+                                                voting_method=meth, 
+                                                grid=grid, 
+                                                map_dict=map_dict, 
+                                                suitability_method=sm, 
+                                                suitability_matrix=suitability_matrix, 
+                                                max_time_steps=max_time_steps, 
+                                                add_tasks=add_tasks, 
+                                                add_robots=add_robots, 
+                                                remove_robots=remove_robots,
+                                                tasks_to_add=tasks_to_add, 
+                                                robots_to_add=robots_to_add, 
+                                                robots_to_remove=robots_to_remove,
+                                                robot_generation_strict=robot_generation_strict, 
+                                                task_generation_strict=task_generation_strict,
+                                                initial_jains_index=initial_jains, 
+                                                task_arrival_rate=task_arrival_rate,
+                                                robot_arrival_rate=robot_arrival_rate, 
+                                                robot_departure_rate=robot_departure_rate,
+                                                task_cancellation_rate=task_cancellation_rate,
+                                                remove_tasks=remove_tasks,
+                                                tasks_to_remove=tasks_to_remove,
+                                                event_schedule=event_schedule,
+                                                mask_level=mask_level,
+                                                mask_policy=mask_policy,
+                                                schedule_seed=schedule_seed,
+                                                po_diag_path=po_diag_path,
+                                                planner=algo,
+                                                scenario=scenario_name,
+                                                scheduled_event_count=scheduled_event_count,
+                                                horizon_binding_term=horizon_binding_term,
+                                            )
+                                            row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [Run_ID, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0, 0, 0, 0]
+                                            # Inject the planner name at the CSV's 'Planner' column slot
+                                            # (after Run ID / Method / Suitability Method, before Num Robots).
+                                            row_prefix = [row_prefix[0], row_prefix[1], row_prefix[2], algo] + row_prefix[3:]
+                                            # Config covariates + provenance, appended before the map_size suffix.
+                                            config_suffix = [
+                                                scenario_name,
+                                                task_arrival_rate, task_cancellation_rate,
+                                                robot_arrival_rate, robot_departure_rate,
+                                                mask_level if PO_EXPERIMENT else "",
+                                                MASK_COUNTS.get(mask_level, -1) if PO_EXPERIMENT else -1,
+                                                mask_policy if PO_EXPERIMENT else "",
+                                            ]
+                                            writer.writerow(row_prefix + list(output_tuple) + config_suffix + [map_size])
+                                            # Flush per row so an interrupted sweep keeps every
+                                            # completed run on disk for the resume scanner.
+                                            file.flush()
+                                        Run_ID += 1

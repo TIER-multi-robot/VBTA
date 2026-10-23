@@ -187,6 +187,32 @@ def evaluate_suitability_balanced(
             M[i, j] = _balanced_pair(r, t, map_size=map_size)
     return M
 
+def balanced_hard_fail(robot: CapabilityProfile, task: TaskDescription, distance_to_task: float = 0.0) -> bool:
+    """
+    Balanced's hard-fail checks, factored out of _balanced_pair so that
+    allocation-time scoring and execution-time feasibility (partial-
+    observability experiment) use identical criteria.
+
+    Returns True when the pairing is infeasible:
+      - payload requirement exceeds the robot's capacity
+      - reach requirement exceeds the robot's reach
+      - task needs manipulators and the robot has none of them
+      - battery cannot cover travel to the task plus the task duration
+
+    distance_to_task is the robot's current distance to the task
+    (path length or Manhattan fallback); 0 when already at the task.
+    """
+    if robot.payload_capacity < task.required_capabilities["payload"]:
+        return True
+    if robot.reach < task.required_capabilities["reach"]:
+        return True
+    if task.manipulators_needed and not any(
+            manip in robot.manipulators for manip in task.manipulators_needed):
+        return True
+    if ((distance_to_task / robot.max_speed) + task.time_to_complete) > robot.battery_life:
+        return True
+    return False
+
 def _balanced_pair(robot: CapabilityProfile, task: TaskDescription, map_size: int) -> float:
     """
     Evaluates the suitability of a robot for a given task.
@@ -223,25 +249,30 @@ def _balanced_pair(robot: CapabilityProfile, task: TaskDescription, map_size: in
         "navigation": 2.0,
     }
 
-    # ---- Payload ---- #
+    # ---- Distance to task ----
+    # Computed up front because the hard-fail battery check and the
+    # sensor-range component both need it.
+    if robot.current_path and len(robot.current_path) > 0:
+        distance_to_task = len(robot.current_path) - 1
+    else:
+        # manhattan distance fallback if path does not exist yet
+        distance_to_task = (task.location[0] - robot.location[0]) + (task.location[1] - robot.location[1])
+
+    # ---- Hard-fail checks (shared with execution-time feasibility) ----
+    if balanced_hard_fail(robot, task, distance_to_task):
+        return 0.0
+
+    # ---- Payload ---- # (passed the hard-fail check: full credit)
     total_weight += weights["payload"]
-    if robot.payload_capacity < task.required_capabilities["payload"]:
-        return 0.0
-    else:
-        score += weights["payload"]
+    score += weights["payload"]
 
-    # ---- Reach ---- #
+    # ---- Reach ---- # (passed the hard-fail check: full credit)
     total_weight += weights["reach"]
-    if robot.reach < task.required_capabilities["reach"]:
-        return 0.0
-    else:
-        score += weights["reach"]
+    score += weights["reach"]
 
-    # ---- Manipulators ---- #
+    # ---- Manipulators ---- # (hard-fail part handled above; partial credit)
     if task.manipulators_needed:
         total_weight += weights["manipulators"]
-        if not any(manip in robot.manipulators for manip in task.manipulators_needed):
-            return 0.0
         manipulator_matched = sum(manip in robot.manipulators for manip in task.manipulators_needed)
         manipulator_score = manipulator_matched / len(task.manipulators_needed)
         score += weights["manipulators"] * manipulator_score
@@ -282,11 +313,6 @@ def _balanced_pair(robot: CapabilityProfile, task: TaskDescription, map_size: in
 
     # ---- Sensor range ---- #
     total_weight += weights["sensor_range"]
-    if robot.current_path and len(robot.current_path) > 0:
-        distance_to_task = len(robot.current_path) - 1
-    else:
-        # manhattan distance fallback if path does not exist yet
-        distance_to_task = (task.location[0] - robot.location[0]) + (task.location[1] - robot.location[1])
     if robot.sensor_range >= distance_to_task:
         sensor_range_score = 1.0
     elif robot.sensor_range >= distance_to_task / 2.0:
@@ -295,10 +321,8 @@ def _balanced_pair(robot: CapabilityProfile, task: TaskDescription, map_size: in
         sensor_range_score = 0.0
     score += weights["sensor_range"] * sensor_range_score
 
-    # ---- Battery ---- #
+    # ---- Battery ---- # (hard-fail part handled above; soft margin here)
     total_weight += weights["battery_duration"]
-    if ((distance_to_task / robot.max_speed) + task.time_to_complete) > robot.battery_life:
-        return 0.0
     battery_score = 1.0 if robot.battery_life >= 2 * ((distance_to_task / robot.max_speed) + task.time_to_complete) else 0.5
     score += weights["battery_duration"] * battery_score
 

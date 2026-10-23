@@ -708,8 +708,14 @@ def reassign_robots_to_tasks_with_murtys(
     assigned_robots_set = set()
     assigned_tasks_set = set()
 
+    # Apply the best assignment, dropping zero-score pairs individually
+    # (same rule as voting's kept_pairs filter): a pair the (masked) view
+    # scores 0 is never executed - it would just travel and mis-fire at
+    # arrival. The rest of the assignment still applies.
     for (robot_idx, task_idx) in best_assignment:
         pair_score = suitability_matrix[robot_idx][task_idx]
+        if pair_score <= 0:
+            continue
         r = urobots[robot_idx]
         t = utasks[task_idx]
         r.current_task = t
