@@ -1,0 +1,3 @@
+[submodule "lacam0"]
+	path = lacam0
+	url = https://github.com/danwein8/lacam0.git
