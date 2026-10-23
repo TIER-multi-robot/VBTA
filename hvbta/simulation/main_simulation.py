@@ -503,6 +503,14 @@ def main_simulation(
     # Invariant-check accumulator: ticks where some robot is assigned to a
     # task but has an empty current_path (can neither move nor work).
     stuck_assigned_robot_ticks = 0
+    # Ticks where allocation was skipped because the unassigned x unassigned
+    # submatrix was all zero (2.7 guard; applies to every method and PO and
+    # non-PO runs alike).
+    all_zero_skip_ticks = 0
+    # Pool diagnostics per run (2.8): V.POOL_STATS collects one dict per
+    # assign_tasks_with_voting call; aggregated into the CSV columns
+    # Threshold_Fire_Rate and Mean_Pool_Size_At_Rank at run end.
+    V.POOL_STATS = []
     murtys_alternatives = []
     # Warm-start seed for the next voting replan. Persists across the loop as
     # a list of (robot_id, task_id) tuples (ID-based so it survives adds /
@@ -846,15 +854,14 @@ def main_simulation(
                 else:
                     suitability_source = suitability_method
 
-            # PO no-bounce guard (spec §6.3/§6.4): when the unassigned x
-            # unassigned submatrix is all zero, the allocators' legacy random
-            # fallback would assign infeasible pairs (zero hard-fail-checked
-            # suitability), which then mis-fire at arrival and bounce forever.
-            # When PO is active, skip the allocation instead - infeasible-for-
-            # all tasks starve (that's what Masked_Starvation_Count measures)
-            # instead of churning robots. Non-PO runs keep the legacy path.
+            # All-zero guard (2.7): when the unassigned x unassigned submatrix
+            # is all zero, skip the allocation ENTIRELY - for voting AND
+            # Murty's, in ALL runs (PO and non-PO). The allocators' legacy
+            # random fallbacks would otherwise assign infeasible pairs (zero
+            # hard-fail-checked suitability) that mis-fire at arrival and
+            # bounce forever; infeasible-for-all tasks starve instead.
             po_all_zero = False
-            if po is not None:
+            if callable(suitability_source):
                 _ur = [r for r in robots if not r.assigned]
                 _ut = [t for t in tasks if not t.assigned]
                 if _ur and _ut:
@@ -863,7 +870,9 @@ def main_simulation(
                 if po_all_zero:
                     # Counted per tick in the All_Zero_Skip_Ticks column (no
                     # per-tick print - too noisy at sweep scale).
-                    po.all_zero_skip_ticks += 1
+                    all_zero_skip_ticks += 1
+                    if po is not None:
+                        po.all_zero_skip_ticks += 1  # mirrored in the diag JSON
 
             # assign with voting
             if not po_all_zero and voting_method in voting_methods:
@@ -889,6 +898,9 @@ def main_simulation(
                       f"{f' [warm-start seed: {len(previous_best_id_pairs)} pairs]' if previous_best_id_pairs else ''}"
                       f" [candidates: {effective_candidates}/{num_candidates}, recent_events={recent_event_count}]"
                       f"{f' [hall-of-fame: {len(candidate_cache)} cached]' if candidate_cache else ''}")
+                # 2.5: tie-break RNG seeded from schedule seed + replan index
+                # (total_reassignments before this call = the replan index).
+                voting_tie_seed = _derived_seed(schedule_seed, "ties", total_reassignments)
                 total_reassignments += 1
                 _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = V.reassign_robots_to_tasks(
                     robots, tasks, effective_candidates, voting_method, suitability_source,
@@ -1293,6 +1305,21 @@ def main_simulation(
     # (spec §3a: ~45 tasks are never attempted even at Mask_Level=none).
     never_attempted_count = total_tasks - len(tasks_ever_assigned)
 
+    # Pool diagnostics (2.8): aggregate V.POOL_STATS into the two CSV columns.
+    # Threshold_Fire_Rate = share of threshold-active calls where the anytime
+    # early termination cut the pool short; Mean_Pool_Size_At_Rank = mean
+    # ranked-pool size across all voting calls this run. -1 marks N/A (no
+    # calls - e.g. Murty's rows, or runs with no voting allocation).
+    if V.POOL_STATS:
+        _th_calls = [s for s in V.POOL_STATS if s["threshold"] is not None]
+        _fired = sum(1 for s in _th_calls if s["ranked"] < s["full"])
+        threshold_fire_rate = (_fired / len(_th_calls)) if _th_calls else -1.0
+        mean_pool_size_at_rank = float(np.mean([s["ranked"] for s in V.POOL_STATS]))
+    else:
+        threshold_fire_rate = -1.0
+        mean_pool_size_at_rank = -1.0
+    V.POOL_STATS = None
+
     return (
         # Section 4 - aggregate outcome (kept only)
         task_completion_fraction,
@@ -1335,8 +1362,11 @@ def main_simulation(
         po_metrics["nav_drop_wasted_travel"],
         # Section 15b - PO baseline + invariant diagnostics
         never_attempted_count,
-        po_metrics.get("all_zero_skip_ticks", 0),
+        all_zero_skip_ticks,
         stuck_assigned_robot_ticks,
+        # Section 15c - anytime pool diagnostics (2.8)
+        threshold_fire_rate,
+        mean_pool_size_at_rank,
     )
 
 
@@ -1609,18 +1639,39 @@ if __name__ == "__main__":
     # The mask condition is NOT part of the schedule seed, so all 5
     # conditions replay identical schedules (spec §5).
     PO_EXPERIMENT = True
-    # Seeded ablation pilots (agent instructions Step 4): same pilot config
-    # run twice with the zero-pair voting filter OFF and ON. Both use the
-    # seeded harness (Step 1) so entities, schedules, and per-method RNG
-    # streams are identical between them.
+    # P2 pilot: ALL Phase 2 fixes (2.1-2.8) incl. the coverage threshold.
+    # The threshold-off ablation (pilot_po_P2_threshold_off) isolates 2.8.
     PO_SWEEP_CONFIGS = [(r"lak102d.map", [10, 20], [10, 20])]
     # Every run writes to a NEW directory - never an existing one.
     # Fresh dir => the resume scanner finds no completed rows => nothing
     # is skipped, every config re-runs (per agent instructions §0.4).
-    PO_OUTPUT_DIRNAME = "pilot_po_P1_seeded_filter_on"
-    # voting.py zero-pair filter flag for this launch (Step 2):
+    PO_OUTPUT_DIRNAME = "pilot_po_P2_all_voting_fixes"
+    # Phase 2 flags (defaults are True; explicit here for clarity).
     V.VOTING_ZERO_PAIR_FILTER = True
+    V.VOTING_COVERAGE_THRESHOLD = True
     from hvbta.partial_observability import PO_CONDITIONS, MASK_COUNTS
+
+    # Report A collector (Phase 2 addition): record every positive balanced-
+    # suitability entry from every matrix scored during Mask_Level=none runs,
+    # bucketed per scenario, plus low-priority task tallies. The wrapper is
+    # only active during none runs; sm_name / seed derivation are untouched.
+    _suit_collector = {"active": False, "scenario": None,
+                       "positives": {}, "task_ids": {}, "low_task_ids": {}}
+
+    def _collecting_sm(robots, tasks, *, map_size=None):
+        result = S.evaluate_suitability_balanced(robots, tasks, map_size=map_size)
+        if _suit_collector["active"]:
+            scen = _suit_collector["scenario"]
+            _m = np.asarray(result)
+            _suit_collector["positives"].setdefault(scen, []).extend(_m[_m > 0].tolist())
+            seen = _suit_collector["task_ids"].setdefault(scen, set())
+            low = _suit_collector["low_task_ids"].setdefault(scen, set())
+            for _t in tasks:
+                if _t.task_id not in seen:
+                    seen.add(_t.task_id)
+                    if getattr(_t, "priority_level", "medium") == "low":
+                        low.add(_t.task_id)
+        return result
 
     # Uncomment ONE of the following lines:
     # sweep_configs = OLD_SWEEP_CONFIGS        # finish interrupted first run
@@ -1727,6 +1778,8 @@ if __name__ == "__main__":
                 'Nav_Drop_Count', 'Nav_Drop_Wasted_Travel',
                 # PO baseline + invariant diagnostics
                 'Never_Attempted_Count', 'All_Zero_Skip_Ticks', 'Stuck_Assigned_Robot_Ticks',
+                # Anytime pool diagnostics (2.8)
+                'Threshold_Fire_Rate', 'Mean_Pool_Size_At_Rank',
                 # Overhead
                 'Execution Time',
                 # Config covariates (constant per run)
@@ -1878,7 +1931,11 @@ if __name__ == "__main__":
                                             PartialObservabilityState(schedule_seed, mask_level, mask_policy)
                                             if PO_EXPERIMENT else None
                                         )
-                                        sm_for_matrix = po_cond.masked_scorer(sm) if po_cond is not None else sm
+                                        # Report A collector: active only for the true-attribute
+                                        # (Mask_Level=none) conditions.
+                                        _suit_collector["active"] = (mask_level == "none" or mask_level is None)
+                                        _suit_collector["scenario"] = scenario_name
+                                        sm_for_matrix = po_cond.masked_scorer(_collecting_sm) if po_cond is not None else _collecting_sm
 
                                         voting_outputs = []
                                         assignment_infos = []
@@ -1925,31 +1982,16 @@ if __name__ == "__main__":
                                             direct_outputs.append((out, initial_jains))
 
                                         if suitability_all_zero(suitability_matrix):
-                                            if PO_EXPERIMENT:
-                                                # PO no-bounce guard (spec §6.3): never randomly
-                                                # assign infeasible pairs. Empty initial assignment;
-                                                # the first replan tick handles whatever is feasible.
-                                                empty_out = ([], list(range(len(robots))), list(range(len(tasks))))
-                                                # Record a proper 13-item assignment row per method
-                                                # so the CSV row prefix stays aligned.
-                                                for _n in (voting_names + optimization_names + direct_names):
-                                                    _record_initial(Run_ID, _n, empty_out, 0.0, 0.0, [])
-                                                outputs = [(empty_out, 0.0)] * len(all_methods)
-                                            else:
-                                                # voting - random fallback
-                                                for method_fn, method_name in zip(voting_methods, voting_names):
-                                                    _seed_rngs(_derived_seed(schedule_seed, "initial", method_name))
-                                                    output, score, length, per_agent = V.assign_tasks_randomly(robots, tasks, suitability_matrix, nc)
-                                                    initial_jains = _record_initial(Run_ID, method_name, output, score, length, per_agent)
-                                                    voting_outputs.append((output, initial_jains))
-                                                # optimization - random fallback
-                                                opt_outputs = []
-                                                for opt_fn, opt_name in zip(optimization_methods, optimization_names):
-                                                    _seed_rngs(_derived_seed(schedule_seed, "initial", opt_name))
-                                                    out, score, length, per_agent = O.assign_tasks_with_method_randomly(opt_fn, suitability_matrix, nc)
-                                                    initial_jains = _record_initial(Run_ID, opt_name, out, score, length, per_agent)
-                                                    opt_outputs.append((out, initial_jains))
-                                                outputs = voting_outputs + opt_outputs + direct_outputs
+                                            # 2.7: skip allocation (no random fallback) for
+                                            # voting AND Murty's, in ALL runs - matching the
+                                            # main-loop guard. Empty initial assignment; the
+                                            # first replan tick handles whatever is feasible.
+                                            empty_out = ([], list(range(len(robots))), list(range(len(tasks))))
+                                            # Record a proper 13-item assignment row per method
+                                            # so the CSV row prefix stays aligned.
+                                            for _n in (voting_names + optimization_names + direct_names):
+                                                _record_initial(Run_ID, _n, empty_out, 0.0, 0.0, [])
+                                            outputs = [(empty_out, 0.0)] * len(all_methods)
                                         else:
                                             # voting - normal. Each method's initial assignment is
                                             # RNG-isolated (agent instructions Step 1.2) so one
@@ -1957,7 +1999,9 @@ if __name__ == "__main__":
                                             # another method's initial assignment.
                                             for method_fn, method_name in zip(voting_methods, voting_names):
                                                 _seed_rngs(_derived_seed(schedule_seed, "initial", method_name))
-                                                output, score, length, per_agent = V.assign_tasks_with_voting(robots, tasks, suitability_matrix, nc, method_fn)
+                                                output, score, length, per_agent = V.assign_tasks_with_voting(
+                                                    robots, tasks, suitability_matrix, nc, method_fn,
+                                                    tie_seed=_derived_seed(schedule_seed, "ties", "initial", method_name))
                                                 initial_jains = _record_initial(Run_ID, method_name, output, score, length, per_agent)
                                                 voting_outputs.append((output, initial_jains))
                                             # optimization - normal
@@ -1994,7 +2038,7 @@ if __name__ == "__main__":
                                                 voting_method=meth,
                                                 grid=grid,
                                                 map_dict=map_dict,
-                                                suitability_method=sm,
+                                                suitability_method=_collecting_sm,
                                                 suitability_matrix=suitability_matrix,
                                                 max_time_steps=max_time_steps,
                                                 add_tasks=add_tasks,
@@ -2041,3 +2085,32 @@ if __name__ == "__main__":
                                             # completed run on disk for the resume scanner.
                                             file.flush()
                                         Run_ID += 1
+
+    # ---- End-of-sweep dumps (outside the CSV writer's `with` block) ----
+    # 2.5: per-rule top-2 tie frequencies across the whole sweep.
+    _suit_collector["active"] = False
+    with open(os.path.join(dir_path, "tie_stats.json"), "w", encoding="utf-8") as f:
+        json.dump({rule: {"calls": c, "top2_ties": t} for rule, (c, t) in V.TIE_STATS.items()}, f, indent=2)
+
+    # Report A: balanced-suitability distribution over all feasible pairs
+    # scored during the none conditions, per scenario.
+    _report_a = {}
+    for scen, vals in _suit_collector["positives"].items():
+        arr = np.asarray(vals)
+        hist, _ = np.histogram(arr, bins=20, range=(0.0, 1.0))
+        pct = {p: float(np.percentile(arr, p)) for p in (1, 5, 25, 50, 75, 95)}
+        n_tasks = len(_suit_collector["task_ids"].get(scen, ()))
+        n_low = len(_suit_collector["low_task_ids"].get(scen, ()))
+        _report_a[scen] = {
+            "n_entries": int(arr.size),
+            "histogram_20_bins": [int(h) for h in hist],
+            "percentiles": pct,
+            "share_above_0.95": float(np.mean(arr > 0.95)),
+            "share_above_0.99": float(np.mean(arr > 0.99)),
+            "distinct_tasks_seen": n_tasks,
+            "low_priority_tasks": n_low,
+            "low_priority_share": (n_low / n_tasks) if n_tasks else 0.0,
+        }
+    with open(os.path.join(dir_path, "suitability_distribution.json"), "w", encoding="utf-8") as f:
+        json.dump(_report_a, f, indent=2)
+    print("SWEEP COMPLETE: tie_stats.json and suitability_distribution.json written to", dir_path)

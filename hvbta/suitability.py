@@ -773,6 +773,19 @@ PRIORITY_FACTORS = {
 }
 
 
+def priority_factors(tasks) -> NDArray[np.float64]:
+    """
+    Per-task priority factors (PRIORITY_FACTORS lookup; missing/unknown
+    levels default to 1.0). Extracted so the voting rules can weight
+    per-task contributions (Approval vote weight, MJ weighted median)
+    with exactly the same factors apply_priority_weights uses.
+    """
+    return np.array(
+        [PRIORITY_FACTORS.get(getattr(t, "priority_level", "medium"), 1.0) for t in tasks],
+        dtype=float,
+    )
+
+
 def apply_priority_weights(suitability_matrix, tasks) -> NDArray[np.float64]:
     """
     Multiply each column of the (R, T) suitability matrix by its target task's
@@ -786,10 +799,7 @@ def apply_priority_weights(suitability_matrix, tasks) -> NDArray[np.float64]:
     (anytime score_threshold, zero-detection filters) should stay on the raw
     matrix.
     """
-    factors = np.array(
-        [PRIORITY_FACTORS.get(getattr(t, "priority_level", "medium"), 1.0) for t in tasks],
-        dtype=float,
-    )
+    factors = priority_factors(tasks)
     return np.asarray(suitability_matrix, dtype=float) * factors  # broadcasts column-wise
 
 

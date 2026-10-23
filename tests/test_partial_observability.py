@@ -291,8 +291,8 @@ def test_hard_fail_uses_true_attributes_at_arrival():
 ORDER_A = ["borda", "cumulative", "murtys"]
 ORDER_B = ["murtys", "borda", "cumulative"]
 # Wall-clock timing columns in the driver's output: c1 = total_reassignment_time,
-# c45 (last) = Execution Time. Everything else must match exactly.
-TIMING_COLS = {"c1", "c45"}
+# c47 (last) = Execution Time. Everything else must match exactly.
+TIMING_COLS = {"c1", "c47"}
 
 
 def _run_driver(order, out_path):
@@ -348,6 +348,103 @@ def test_order_independence():
                 continue
             assert ra[col] == rb[col], (
                 f"order-dependence: {m} col {col}: {ra[col]!r} != {rb[col]!r}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 voting fixes (2.1-2.5, 2.8)
+# ---------------------------------------------------------------------------
+def test_approval_counts_task_index_zero():
+    """2.1: a robot assigned to local task 0 must be able to approve."""
+    from hvbta.allocators.voting import rank_assignments_approval
+    # 2 robots, 2 tasks; robot 0 assigned task 0 (index 0, falsy) with raw 0.9
+    M_raw = [[0.9, 0.2], [0.8, 0.8]]
+    cand = ([(0, 0), (1, 1)], [], [])
+    scores, ranking = rank_assignments_approval([cand], M_raw, raw_matrix=M_raw, threshold=0.5)
+    assert scores[0] == 2.0  # both approve (old code: robot 0's task-index-0 vote was dropped)
+
+
+def test_approval_weights_priority_and_uses_raw():
+    """2.2: approval compares RAW suitability; each approval counts the task's
+    priority factor (low = 0.5), not 1."""
+    from hvbta.allocators.voting import rank_assignments_approval
+    M_raw = [[0.9, 0.9]]
+    factors = np.array([0.5, 1.0])  # task 0 low, task 1 medium
+    cand_a = ([(0, 0)], [], [])  # approve low-priority task -> 0.5
+    cand_b = ([(0, 1)], [], [])  # approve medium-priority task -> 1.0
+    weighted = [[0.45, 0.9]]  # old code compared against this: task 0 could NEVER pass > 0.5
+    scores, ranking = rank_assignments_approval(
+        [cand_a, cand_b], weighted, raw_matrix=M_raw, priority_factors=factors, threshold=0.5)
+    assert scores[0] == 0.5          # raw 0.9 > 0.5 approves; weight 0.5
+    assert scores[1] == 1.0
+    assert ranking[0] == 1           # b wins
+
+
+def test_mj_unassigned_voters_grade_poor():
+    """2.3: every robot with a feasible option is a voter; unassigned voters
+    grade the candidate Poor, so 1 excellent pair no longer beats 10 good."""
+    from hvbta.allocators.voting import rank_assignments_majority_judgment
+    M_raw = [[0.9] + [0.0] * 9, [0.75] * 10]  # robot 0: only task 0 feasible; robot 1-9 via row 1
+    # candidates: a assigns only robot 0 (excellent); b assigns all 10 (good)
+    cand_a = ([(0, 0)], list(range(1, 10)), [])
+    cand_b = ([(r, 0) for r in range(10)], [], [])
+    ratings, ranking = rank_assignments_majority_judgment([cand_a, cand_b], M_raw, raw_matrix=M_raw)
+    # voters = robots with >= 1 positive option = both rows -> 2 voters
+    # cand_a: grades [Excellent, Poor] -> weighted median = Poor(0)
+    # cand_b: grades [Excellent, Good]   -> weighted median = Good(2)
+    assert ratings[0] < ratings[1]
+    assert ranking[0] == 1
+
+
+def test_borda_fractional_ties():
+    """2.4: tied candidates share the average of the Borda points their
+    positions span (not pool-order-dependent points)."""
+    from hvbta.allocators.voting import rank_assignments_borda
+    M = [[0.8, 0.8]]  # one robot, both candidates equally good
+    cand_a = ([(0, 0)], [], [])
+    cand_b = ([(0, 1)], [], [])
+    # with 2 candidates the robot ties -> each gets (1 + 0) / 2 = 0.5 points
+    scores, ranking = rank_assignments_borda([cand_a, cand_b], M)
+    assert scores[0] == scores[1] == 0.5
+
+
+def test_tie_break_seeded_and_reproducible():
+    """2.5: the same tie seed resolves ties identically; pool order stops
+    mattering."""
+    from hvbta.allocators.voting import rank_assignments_range
+    M = [[0.8, 0.8]]  # both candidates score identically
+    cand_a = ([(0, 0)], [], [])
+    cand_b = ([(0, 1)], [], [])
+    import random as _r
+    r1 = rank_assignments_range([cand_a, cand_b], M, rng=_r.Random(42))
+    r2 = rank_assignments_range([cand_a, cand_b], M, rng=_r.Random(42))
+    assert r1[1] == r2[1]
+    # tied scores detected either way
+    assert r1[0][0] == r1[0][1]
+
+
+def test_coverage_threshold_requires_min_pool():
+    """2.8: even when the first candidate would clear the threshold, the
+    ranked pool must reach MIN_POOL_BEFORE_THRESHOLD (or the full pool)."""
+    from hvbta.allocators.voting import (
+        assign_tasks_with_voting, rank_assignments_range,
+        MIN_POOL_BEFORE_THRESHOLD, POOL_STATS,
+    )
+    robots, tasks = make_robots(n=4, seed=3), make_tasks(n=4, seed=4)
+    M = evaluate_suitability_balanced(robots, tasks, map_size=100)
+    M = np.clip(M + 0.35, 0.0, 1.0)  # most pairs comfortably above 0.7
+    import hvbta.allocators.voting as _V
+    _V.POOL_STATS = []
+    try:
+        output, score, length, per = assign_tasks_with_voting(
+            robots, tasks, M, 20, rank_assignments_range,
+            score_threshold=0.7, time_budget_ms=None)
+        stats = _V.POOL_STATS
+        assert stats and stats[-1]["threshold"] == 0.7
+        min_pool = min(MIN_POOL_BEFORE_THRESHOLD, stats[-1]["full"])
+        assert stats[-1]["ranked"] >= min_pool, (
+            f"threshold fired with pool {stats[-1]['ranked']} < min {min_pool}")
+    finally:
+        _V.POOL_STATS = None
 
 
 # ---------------------------------------------------------------------------

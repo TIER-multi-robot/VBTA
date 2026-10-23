@@ -1,8 +1,12 @@
+import random
 import time, numpy as np
 from typing import List, Tuple, Callable
 from .assignments import generate_random_assignments, generate_high_suitability_assignments
 from hvbta.models import CapabilityProfile, TaskDescription
-from hvbta.suitability import calculate_total_suitability, check_zero_suitability, calculate_suitability_matrix, apply_priority_weights
+from hvbta.suitability import (
+    calculate_total_suitability, check_zero_suitability, calculate_suitability_matrix,
+    apply_priority_weights, priority_factors,
+)
 from .misc_assignment import extract_submatrix
 
 # Config flag (default True). When False, assign_tasks_with_voting behaves
@@ -11,6 +15,58 @@ from .misc_assignment import extract_submatrix
 # "keep the random assignment" all-zero else-branch. This lets pre-fix and
 # post-fix voting run from the same code with the same seeds (ablation).
 VOTING_ZERO_PAIR_FILTER = True
+
+# Config flag (default True). When False, the anytime score_threshold uses
+# the old mean-per-pair semantics (which the zero-pair filter broke: the
+# filtered mean crosses the threshold on the first candidate, so voting
+# ranked pools of size 1 under urgency). When True (2.8):
+#   - the threshold score is coverage-normalized quality: candidate total
+#     raw score divided by max_feasible = min(#robots with >=1 positive
+#     task, #tasks with >=1 positive robot) in the current matrix;
+#   - max_feasible == 0 means the threshold never fires;
+#   - the threshold may only fire after MIN_POOL_BEFORE_THRESHOLD
+#     candidates have accumulated (or the whole pool if it is smaller).
+VOTING_COVERAGE_THRESHOLD = True
+MIN_POOL_BEFORE_THRESHOLD = 5
+
+# Optional pool-diagnostics collector: set to a list to record one dict per
+# assign_tasks_with_voting call (pool size before the anytime loop, pool
+# size at ranking time, and the active threshold/budget). Used to measure
+# how often the anytime early termination fires. Inert by default.
+POOL_STATS = None
+
+# Per-rule top-2 tie counter: {rule_name: [calls, top2_ties]}. Accumulated
+# across calls; reset/read by the caller (2.5 reporting). Inert by default.
+TIE_STATS = {}
+
+
+def _tie_break_ranking(scores, rng):
+    """
+    Indices sorted by score, descending. Ties are broken by the provided RNG
+    (shuffle-then-stable-sort) so pool order (seed / hall-of-fame first) no
+    longer systematically wins ties. rng=None keeps deterministic index order
+    (the pre-2.5 behavior) for direct/legacy calls.
+    """
+    order = list(range(len(scores)))
+    if rng is not None:
+        rng.shuffle(order)
+    order.sort(key=lambda i: scores[i], reverse=True)
+    return order
+
+
+def _weighted_median(grade_weight_pairs):
+    """Priority-weighted median: smallest grade whose cumulative weight
+    reaches half the total weight (2.2 MJ)."""
+    if not grade_weight_pairs:
+        return 0
+    pairs = sorted(grade_weight_pairs, key=lambda x: x[0])
+    total = sum(w for _, w in pairs)
+    cum = 0.0
+    for v, w in pairs:
+        cum += w
+        if cum >= total / 2.0:
+            return v
+    return pairs[-1][0]
 
 
 def _filter_zero_pairs(candidate, suitability_matrix):
@@ -53,49 +109,41 @@ def _filter_zero_pairs(candidate, suitability_matrix):
 def suitability_all_zero(suitability_matrix):
     return all(value == 0 for row in suitability_matrix for value in row)
 
-def rank_assignments_range(assignments: List[List[Tuple[int, int]]], suitability_matrix: List[List[float]]) -> Tuple[List[float], List[int]]:
+def rank_assignments_range(assignments: List[List[Tuple[int, int]]], weighted_matrix: List[List[float]],
+                           raw_matrix=None, priority_factors=None, rng=None) -> Tuple[List[float], List[int]]:
     """
-    Ranks the given assignments based on their total suitability scores.
-    
-    Parameters:
-        assignments: A list of assignments, where each assignment is a list of (robot, task) pairs.
-        suitability_matrix: A 2D list where the element at [i][j] represents the suitability of robot i for task j.
-    
+    Ranks the given assignments based on their total (priority-weighted)
+    suitability scores. raw_matrix / priority_factors accepted for a uniform
+    rule signature (Range is cardinal: it only uses the weighted matrix).
+
     Returns:
-        (total_scores, ranking): A tuple where
-      1. A list of total suitability scores for each assignment.
-      2. A list of indices representing the ranking of the assignments, where the first index corresponds to the
-         assignment with the highest total score.
+        (total_scores, ranking)
     """
     total_scores = []
 
     # Calculate total suitability scores for each assignment
     for assignment in assignments:
-        total_suitability = sum(suitability_matrix[robot][task] for robot, task in assignment[0])
+        total_suitability = sum(weighted_matrix[robot][task] for robot, task in assignment[0])
         total_scores.append(total_suitability)
 
-    # Get the ranking of assignments based on the total scores (higher score is better)
-    ranking = sorted(range(len(total_scores)), key=lambda i: total_scores[i], reverse=True)
-    #***print (f"ranking: {ranking}")
+    ranking = _tie_break_ranking(total_scores, rng)
     return total_scores, ranking
 
-def rank_assignments_borda(assignments: List[List[Tuple[int, int]]], suitability_matrix: List[List[float]]) -> Tuple[List[float], List[int]]:
+def rank_assignments_borda(assignments: List[List[Tuple[int, int]]], weighted_matrix: List[List[float]],
+                           raw_matrix=None, priority_factors=None, rng=None) -> Tuple[List[float], List[int]]:
     """
-    Ranks each assignment from the perspective of each robot based on its suitability for its task in each assignment,
-    and uses the Borda count method to aggregate these rankings.
-    
-    Parameters:
-        assignments: A list of assignments, where each assignment is a list of (robot, task) pairs.
-        suitability_matrix: A 2D list where the element at [i][j] represents the suitability of robot i for task j.
-    
+    Borda count with FRACTIONAL (average-rank) tie handling (2.4): tied
+    candidates share the average of the Borda points their positions span,
+    so pool order (seed / hall-of-fame first) can no longer hand tied
+    candidates unequal points. Each robot ranks the candidates by its
+    (priority-weighted) suitability for its task; unassigned ranks lowest
+    (-1 sentinel score).
+
     Returns:
-        (borda_scores, ranked_assignments): A tuple containing:
-      1. A list of Borda scores for each assignment.
-      2. A list of indices representing the ranking of the assignments based on Borda scores, where the first index corresponds
-         to the assignment with the highest total Borda score.
+        (borda_scores, ranked_assignments)
     """
     num_assignments = len(assignments)
-    num_robots = len(suitability_matrix)
+    num_robots = len(weighted_matrix)
 
     # Initialize Borda scores for each assignment
     borda_scores = [0] * num_assignments
@@ -104,139 +152,158 @@ def rank_assignments_borda(assignments: List[List[Tuple[int, int]]], suitability
     for robot in range(num_robots):
         # Collect suitability scores for this robot across all assignments
         robot_scores = []
-        
+
         for assignment_index, assignment in enumerate(assignments):
             # Find the task assigned to this robot in the current assignment
             assigned_task = next((task for r, task in assignment[0] if r == robot), None)
-            
+
             # If the robot has no task assigned in this assignment, assign it the lowest score
             if assigned_task is None:
                 robot_scores.append((assignment_index, -1))  # Using -1 to rank unassigned lower
             else:
-                robot_scores.append((assignment_index, suitability_matrix[robot][assigned_task]))
+                robot_scores.append((assignment_index, weighted_matrix[robot][assigned_task]))
 
         # Sort robot's scores for all assignments: unassigned (score -1) at the bottom, then by suitability
         robot_scores.sort(key=lambda x: x[1], reverse=True)
 
-        # Assign Borda points based on the ranking
-        for rank, (assignment_index, _) in enumerate(robot_scores):
-            borda_points = len(robot_scores) - rank - 1  # Borda count: higher ranks get more points
-            borda_scores[assignment_index] += borda_points
+        # Fractional Borda points: candidates tied on score share the average
+        # of the points their positions span (n-1 points for first place).
+        n = len(robot_scores)
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and robot_scores[j + 1][1] == robot_scores[i][1]:
+                j += 1
+            if j > i:
+                avg_pts = sum(n - 1 - p for p in range(i, j + 1)) / (j - i + 1)
+                for k in range(i, j + 1):
+                    borda_scores[robot_scores[k][0]] += avg_pts
+            else:
+                borda_scores[robot_scores[i][0]] += n - 1 - i
+            i = j + 1
 
-    # Rank assignments based on total Borda scores (higher score is better)
-    ranked_assignments = sorted(range(num_assignments), key=lambda i: borda_scores[i], reverse=True)
+    ranked_assignments = _tie_break_ranking(borda_scores, rng)
 
     return borda_scores, ranked_assignments
 
-def rank_assignments_approval(assignments: List[List[Tuple[int, int]]], suitability_matrix: List[List[float]], threshold: float = 0.5) -> Tuple[List[int], List[int]]:
+def rank_assignments_approval(assignments: List[List[Tuple[int, int]]], weighted_matrix: List[List[float]],
+                              raw_matrix=None, priority_factors=None, rng=None, threshold: float = 0.5) -> Tuple[List[float], List[int]]:
     """
-    Uses approval voting where each robot gives 1 point to assignments where its suitability for its task is above a threshold.
-    If a robot's suitability is below the threshold or it is unassigned, it gives 0 points for that assignment.
-    
-    Parameters:
-        assignments: A list of assignments, where each assignment is a list of (robot, task) pairs.
-        suitability_matrix: A 2D list where the element at [i][j] represents the suitability of robot i for task j.
-        threshold: The suitability threshold above which a robot will approve an assignment (default is 10).
-    
+    Approval voting (2.1 + 2.2): a robot approves an assignment when its RAW
+    suitability for its task exceeds the threshold (the old code compared
+    against the priority-weighted matrix, where low-priority tasks could
+    never exceed 0.5, and `if assigned_task` dropped task index 0). Each
+    approval counts the task's priority factor instead of 1, so priority
+    adjusts vote weight rather than gating approval.
+
     Returns:
-        (approval_scores, ranked_assignments): A tuple containing:
-      1. A list of approval scores for each assignment.
-      2. A list of indices representing the ranking of the assignments based on approval scores.
+        (approval_scores, ranked_assignments)
     """
     num_assignments = len(assignments)
-    num_robots = len(suitability_matrix)
+    num_robots = len(weighted_matrix)
+    if raw_matrix is None:
+        raw_matrix = weighted_matrix
 
     # Initialize approval scores for each assignment
-    approval_scores = [0] * num_assignments
+    approval_scores = [0.0] * num_assignments
 
-    # For each robot, evaluate each assignment based on the suitability threshold
+    # For each robot, evaluate each assignment based on the raw-suitability threshold
     for robot in range(num_robots):
         for assignment_index, assignment in enumerate(assignments):
             # Find the task assigned to this robot in the current assignment
             assigned_task = next((task for r, task in assignment[0] if r == robot), None)
-            
-            # Check if robot's suitability rating for this task is above the threshold
-            if assigned_task  and suitability_matrix[robot][assigned_task] > threshold:
-                approval_scores[assignment_index] += 1  # Robot approves this assignment
 
-    # Rank assignments based on approval scores (higher score is better)
-    ranked_assignments = sorted(range(num_assignments), key=lambda i: approval_scores[i], reverse=True)
+            # 2.1: `assigned_task is not None` (task index 0 is falsy and used
+            # to be dropped). 2.2: compare RAW suitability.
+            if assigned_task is not None and raw_matrix[robot][assigned_task] > threshold:
+                weight = 1.0
+                if priority_factors is not None:
+                    weight = float(priority_factors[assigned_task])
+                approval_scores[assignment_index] += weight  # approval counts the task's priority factor
+
+    ranked_assignments = _tie_break_ranking(approval_scores, rng)
 
     return approval_scores, ranked_assignments
 
-def rank_assignments_majority_judgment(assignments: List[List[Tuple[int, int]]], suitability_matrix: List[List[float]]) -> Tuple[List[float], List[int]]:
+def rank_assignments_majority_judgment(assignments: List[List[Tuple[int, int]]], weighted_matrix: List[List[float]],
+                                       raw_matrix=None, priority_factors=None, rng=None) -> Tuple[List[float], List[int]]:
     """
-    Uses majority judgment to rank assignments based on robot suitability for assigned tasks.
-    
-    Parameters:
-        assignments: A list of assignments, where each assignment is a list of (robot, task) pairs.
-        suitability_matrix: A 2D list where the element at [i][j] represents the suitability of robot i for task j.
-    
+    Majority Judgment (2.2 + 2.3):
+      - Grades are computed from RAW suitability (the old code graded the
+        priority-weighted matrix, capping low-priority tasks at Fair).
+      - Every robot with at least one positive-score task in the current
+        matrix is a VOTER; a voter that is unassigned in a candidate grades
+        it Poor (the old median-over-assigned-pairs ignored unassigned
+        voters, so one excellent pair beat ten good ones).
+      - The median is priority-weighted: each grade's weight is the priority
+        factor of the voter's assigned task (1.0 for unassigned voters).
+
     Returns:
-        (assignment_ratings, ranked_assignments): A tuple containing:
-      1. A list of median scores for each assignment based on majority judgment.
-      2. A list of indices representing the ranking of assignments based on median scores.
+        (assignment_ratings, ranked_assignments)
     """
-    # Define qualitative rating categories mapped to suitability score ranges
+    if raw_matrix is None:
+        raw_matrix = weighted_matrix
+
+    # Define qualitative rating categories mapped to raw-suitability ranges
     rating_scale = {"Excellent": 3, "Good": 2, "Fair": 1, "Poor": 0}
     rating_thresholds = [(.85, "Excellent"), (.7, "Good"), (.5, "Fair"), (0, "Poor")]
+
+    # 2.3: voters are robots with at least one feasible option; robots with
+    # no positive-score task are indifferent (they'd grade everything Poor,
+    # which only creates ties).
+    voters = [r for r in range(len(raw_matrix))
+              if any(raw_matrix[r][t] > 0 for t in range(len(raw_matrix[r])))]
 
     assignment_ratings = []
 
     for assignment in assignments:
-        ratings = []
-        
-        for robot, task in assignment[0]:
-            # Get the suitability score for the robot-task pair
-            suitability_score = suitability_matrix[robot][task]
+        assigned_by_robot = {r: t for r, t in assignment[0]}
+        grades = []
+        for robot in voters:
+            task = assigned_by_robot.get(robot)
+            if task is None:
+                # unassigned voter grades the candidate Poor
+                grades.append((rating_scale["Poor"], 1.0))
+            else:
+                score = raw_matrix[robot][task]
+                grade = next(rating_scale[rating]
+                             for threshold, rating in rating_thresholds
+                             if score >= threshold)
+                weight = 1.0
+                if priority_factors is not None:
+                    weight = float(priority_factors[task])
+                grades.append((grade, weight))
 
-            # Convert suitability score to qualitative rating
-            for threshold, rating in rating_thresholds:
-                if suitability_score >= threshold:
-                    ratings.append(rating_scale[rating])
-                    break
-        
-        # Calculate the median rating for this assignment
-        median_rating = np.median(ratings) if ratings else 0
-        assignment_ratings.append(median_rating)
+        # Priority-weighted median over all voters
+        assignment_ratings.append(_weighted_median(grades))
 
-    # Rank assignments based on median ratings
-    ranked_assignments = sorted(range(len(assignment_ratings)), key=lambda i: assignment_ratings[i], reverse=True)
+    ranked_assignments = _tie_break_ranking(assignment_ratings, rng)
 
     return assignment_ratings, ranked_assignments
 
-def rank_assignments_cumulative_voting(assignments: List[List[Tuple[int, int]]], suitability_matrix: List[List[float]], total_votes: int = 10) -> Tuple[List[float], List[int]]:
+def rank_assignments_cumulative_voting(assignments: List[List[Tuple[int, int]]], weighted_matrix: List[List[float]],
+                                       raw_matrix=None, priority_factors=None, rng=None, total_votes: int = 10) -> Tuple[List[float], List[int]]:
     """
-    Uses cumulative voting to rank assignments, where each robot distributes a fixed number of votes
-    across assignments based on suitability scores.
-    
-    Parameters:
-        assignments: A list of assignments, where each assignment is a list of (robot, task) pairs.
-        suitability_matrix: A 2D list where the element at [i][j] represents the suitability of robot i for task j.
-        total_votes: The total number of votes each robot has to distribute (default is 10).
-    
-    Returns:
-        (cumulative_votes, ranked_assignments): A tuple containing:
-      1. A list of cumulative votes for each assignment.
-      2. A list of indices representing the ranking of assignments based on cumulative votes.
+    Cumulative voting (cardinal: uses the priority-weighted matrix; raw /
+    factors accepted for the uniform rule signature).
     """
     num_assignments = len(assignments)
     cumulative_votes = [0] * num_assignments
     if total_votes < num_assignments/2:
         total_votes = num_assignments/2
-    
-    for robot in range(len(suitability_matrix)):
+
+    for robot in range(len(weighted_matrix)):
         # Collect suitability scores for this robot across all assignments
         robot_votes = []
-        
+
         for assignment_index, assignment in enumerate(assignments):
             # Find the task assigned to this robot in the current assignment
             assigned_task = next((task for r, task in assignment[0] if r == robot), None)
-            
+
             # If robot is unassigned in this assignment, give it a suitability score of 0
-            suitability_score = suitability_matrix[robot][assigned_task] if assigned_task is not None else 0
+            suitability_score = weighted_matrix[robot][assigned_task] if assigned_task is not None else 0
             robot_votes.append((assignment_index, suitability_score))
-        
+
         # Sort robot votes based on suitability scores in descending order
         robot_votes.sort(key=lambda x: x[1], reverse=True)
 
@@ -246,26 +313,18 @@ def rank_assignments_cumulative_voting(assignments: List[List[Tuple[int, int]]],
             if total_score > 0:
                 cumulative_votes[assignment_index] += total_votes * (score / total_score)
 
-    # Rank assignments based on cumulative votes (higher score is better)
-    ranked_assignments = sorted(range(num_assignments), key=lambda i: cumulative_votes[i], reverse=True)
+    ranked_assignments = _tie_break_ranking(cumulative_votes, rng)
 
     return cumulative_votes, ranked_assignments
 
-def rank_assignments_condorcet_method(assignments: List[List[Tuple[int, int]]], suitability_matrix: List[List[float]]) -> Tuple[List[int], List[int]]:
+def rank_assignments_condorcet_method(assignments: List[List[Tuple[int, int]]], weighted_matrix: List[List[float]],
+                                      raw_matrix=None, priority_factors=None, rng=None) -> Tuple[List[int], List[int]]:
     """
-    Uses the Condorcet method to rank assignments by comparing each assignment in a pairwise manner.
-    
-    Parameters:
-        assignments: A list of assignments, where each assignment is a list of (robot, task) pairs.
-        suitability_matrix: A 2D list where the element at [i][j] represents the suitability of robot i for task j.
-    
-    Returns:
-        (pairwise_wins, ranked_assignments): A tuple containing:
-      1. A list of pairwise win counts for each assignment.
-      2. A list of indices representing the ranking of assignments based on pairwise win counts.
+    Condorcet method (ordinal: uses the priority-weighted matrix; raw /
+    factors accepted for the uniform rule signature).
     """
     num_assignments = len(assignments)
-    num_robots = len(suitability_matrix)
+    num_robots = len(weighted_matrix)
 
     # Initialize a matrix to track pairwise wins for each assignment comparison
     pairwise_wins = [0] * num_assignments
@@ -275,15 +334,15 @@ def rank_assignments_condorcet_method(assignments: List[List[Tuple[int, int]]], 
         for j in range(i + 1, num_assignments):
             # Count the number of robots that prefer assignment i over assignment j and vice versa
             i_wins, j_wins = 0, 0
-            
+
             for robot in range(num_robots):
                 # Find the task assigned to the robot in both assignments
                 task_i = next((task for r, task in assignments[i][0] if r == robot), None)
                 task_j = next((task for r, task in assignments[j][0] if r == robot), None)
-                
+
                 # Get suitability scores (or 0 if unassigned)
-                suitability_i = suitability_matrix[robot][task_i] if task_i is not None else 0
-                suitability_j = suitability_matrix[robot][task_j] if task_j is not None else 0
+                suitability_i = weighted_matrix[robot][task_i] if task_i is not None else 0
+                suitability_j = weighted_matrix[robot][task_j] if task_j is not None else 0
 
                 # Determine which assignment the robot prefers
                 if suitability_i > suitability_j:
@@ -297,8 +356,7 @@ def rank_assignments_condorcet_method(assignments: List[List[Tuple[int, int]]], 
             elif j_wins > i_wins:
                 pairwise_wins[j] += 1
 
-    # Rank assignments based on pairwise win counts
-    ranked_assignments = sorted(range(num_assignments), key=lambda k: pairwise_wins[k], reverse=True)
+    ranked_assignments = _tie_break_ranking(pairwise_wins, rng)
 
     return pairwise_wins, ranked_assignments
 
@@ -316,6 +374,7 @@ def assign_tasks_with_voting(
         extra_candidates: List = None,
         top_k_out: List = None,
         top_k: int = 3,
+        tie_seed: int = None,
         ) -> Tuple[Tuple[List[Tuple[int, int]], List[int], List[int]], float, float, List[float]]:
     """
     Assigns tasks to robots using random assignment and ranks the assignments using the specified voting method.
@@ -326,11 +385,12 @@ def assign_tasks_with_voting(
         suitability_matrix: A 2D numpy array with suitability scores for each robot-task pair.
         num_candidates: Upper bound on candidate assignments to generate.
         voting_method: The name of the voting function.
-        score_threshold: If not None, a float in [0, 1]. Stop generating
-            candidates once one has mean-per-pair suitability >= this value.
-            Because every suitability path clamps to [0, 1], threshold=0.7
-            means "candidate averages 0.7 suitability per pair" and is
-            tunable across runs regardless of num_pairs.
+        score_threshold: If not None, a float in [0, 1]. When
+            VOTING_COVERAGE_THRESHOLD is on (2.8), stops accumulating the
+            pool once a candidate's coverage-normalized quality (total raw
+            score / max_feasible) reaches this value, and only after at
+            least MIN_POOL_BEFORE_THRESHOLD candidates (or the whole pool).
+            When the flag is off, the old mean-per-pair semantics apply.
         time_budget_ms: If not None, stop generating candidates once wall-clock
             elapsed (from function entry) reaches this many milliseconds.
         generator: Optional candidate generator with signature
@@ -350,6 +410,9 @@ def assign_tasks_with_voting(
             populated with the top-`top_k` candidates (local-index 3-tuples) so
             the caller can cache them.
         top_k: How many top candidates to write into top_k_out (default 3).
+        tie_seed: Optional seed (2.5) for the tie-break RNG passed to the
+            voting rule, derived by the caller from the schedule seed +
+            replan index.
         diversity_threshold: Float in [0, 1] or None. Reject a newly-generated
             candidate if its pair-overlap with any already-accepted candidate
             (|A ∩ B| / |A|) exceeds this value. 0.8 means "must have >= 20% of
@@ -471,25 +534,38 @@ def assign_tasks_with_voting(
 
     # Anytime accumulation over the pre-generated pool. When neither budget is
     # set the loop consumes the whole pool identically to the old flow.
-    # NOTE: the score_threshold check averages over FILTERED pairs only
-    # (zero pairs are already dropped), so with the same threshold the
-    # anytime termination now fires EARLIER/more often than before the
-    # zero-pair filter.
+    # 2.8 (VOTING_COVERAGE_THRESHOLD): the old mean-per-pair check broke under
+    # the zero-pair filter - the filtered mean crosses the threshold on the
+    # very first candidate, so voting ranked pools of size 1 under urgency.
+    # Coverage-normalized semantics instead: candidate total raw score
+    # divided by max_feasible = min(#robots with >=1 positive task,
+    # #tasks with >=1 positive robot), and the threshold may only fire after
+    # MIN_POOL_BEFORE_THRESHOLD candidates (or the whole pool if smaller).
+    if VOTING_COVERAGE_THRESHOLD:
+        _m = np.asarray(suitability_matrix)
+        pos_rows = int(np.sum(np.any(_m > 0, axis=1)))
+        pos_cols = int(np.sum(np.any(_m > 0, axis=0)))
+        max_feasible = min(pos_rows, pos_cols)
+        min_pool = min(MIN_POOL_BEFORE_THRESHOLD, len(full_pool))
     random_assignments = []
     for one in full_pool:
         random_assignments.append(one)
 
         if score_threshold is not None:
-            # Cheap per-candidate score = mean-per-pair suitability across
-            # every FILTERED pair in the candidate. Because per-pair
-            # suitability is clamped to [0, 1] at every scorer, this mean is
-            # in [0, 1] too - a threshold of 0.7 means "candidate averages
-            # 0.7 suitability per pair" and is tunable across runs.
-            pairs = one[0]
-            if pairs:
-                candidate_score = sum(suitability_matrix[r][t] for r, t in pairs) / len(pairs)
+            if VOTING_COVERAGE_THRESHOLD:
+                if max_feasible > 0 and len(random_assignments) >= min_pool:
+                    candidate_score = sum(
+                        suitability_matrix[r][t] for r, t in one[0]) / max_feasible
+                else:
+                    # not enough pool yet, or nothing feasible at all: never fire
+                    candidate_score = 0.0
             else:
-                candidate_score = 0.0
+                # flag off: old mean-per-pair semantics over filtered pairs
+                pairs = one[0]
+                if pairs:
+                    candidate_score = sum(suitability_matrix[r][t] for r, t in pairs) / len(pairs)
+                else:
+                    candidate_score = 0.0
             if candidate_score >= score_threshold:
                 break
         if time_budget_ms is not None:
@@ -503,12 +579,36 @@ def assign_tasks_with_voting(
     # up to 2.0 (urgent factor), which is fine for internal ranking but would
     # inflate reported metrics.
     priority_weighted_matrix = apply_priority_weights(suitability_matrix, tasks)
+    factors = priority_factors(tasks)
+
+    # 2.5: seeded tie-break RNG (schedule seed + replan index, derived by the
+    # caller). None keeps deterministic index-order tie-breaks for legacy calls.
+    tie_rng = random.Random(tie_seed) if tie_seed is not None else None
+
+    if POOL_STATS is not None:
+        POOL_STATS.append({
+            "rule": getattr(voting_method, "__name__", str(voting_method)),
+            "full": len(full_pool),
+            "ranked": len(random_assignments),
+            "threshold": score_threshold,
+            "budget_ms": time_budget_ms,
+        })
 
     # Every candidate was zero-pair-filtered before entering the pool, so no
     # candidate contains a zero-score pair and no post-hoc zero handling is
     # needed: the executed candidate is the voting rule's actual winner,
     # assignment_ranking[0].
-    total_scores, assignment_ranking = voting_method(random_assignments, priority_weighted_matrix)
+    total_scores, assignment_ranking = voting_method(
+        random_assignments, priority_weighted_matrix,
+        raw_matrix=suitability_matrix, priority_factors=factors, rng=tie_rng)
+
+    # 2.5 reporting: how often the top two candidates tie, per rule.
+    if len(assignment_ranking) >= 2:
+        rule_name = getattr(voting_method, "__name__", str(voting_method))
+        cell = TIE_STATS.setdefault(rule_name, [0, 0])
+        cell[0] += 1
+        if total_scores[assignment_ranking[0]] == total_scores[assignment_ranking[1]]:
+            cell[1] += 1
     end = time.perf_counter_ns()
     length = (end - start) / 1000.0
 
@@ -665,7 +765,8 @@ def reassign_robots_to_tasks(
         diversity_threshold: float = 0.8,
         cached_candidate_ids: List = None,
         top_k_out_ids: List = None,
-        hall_of_fame_k: int = 3):
+        hall_of_fame_k: int = 3,
+        tie_seed: int = None):
     """
     Reassigns unassigned robots to unassigned tasks using a voting method.
     Parameters:
@@ -760,7 +861,8 @@ def reassign_robots_to_tasks(
             score_threshold=score_threshold, time_budget_ms=time_budget_ms,
             generator=generator, seed_assignment=seed_local,
             diversity_threshold=diversity_threshold,
-            extra_candidates=extra_local, top_k_out=local_top_k, top_k=hall_of_fame_k)
+            extra_candidates=extra_local, top_k_out=local_top_k, top_k=hall_of_fame_k,
+            tie_seed=tie_seed)
 
         # Translate the top-K candidates back to ID pairs for the caller's cache.
         if top_k_out_ids is not None and local_top_k:
