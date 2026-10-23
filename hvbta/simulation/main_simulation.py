@@ -24,6 +24,7 @@ from hvbta.metrics import (
 )
 from hvbta.pathfinding.CBS_helper import load_map, create_obstacle_list
 from hvbta.pathfinding.MAPF_wrapper import run_planner
+import hvbta.pathfinding.MAPF_wrapper as MW
 from hvbta.allocators.misc_assignment import (
     add_new_tasks, add_new_robots, remove_random_robots, remove_random_tasks,
     remove_task_by_id, remove_robot_by_id, unassign_task_from_robot,
@@ -503,6 +504,11 @@ def main_simulation(
     # Invariant-check accumulator: ticks where some robot is assigned to a
     # task but has an empty current_path (can neither move nor work).
     stuck_assigned_robot_ticks = 0
+    # Phase 3 cascade diagnostics: one entry per failed planner call,
+    # {tick, kind, ...} (kind = duplicate_start / duplicate_goal /
+    # lacam_no_solution / lacam_timeout / engine_unsolved). Goes into the
+    # per-run diagnostic JSON.
+    plan_failure_log = []
     # Ticks where allocation was skipped because the unassigned x unassigned
     # submatrix was all zero (2.7 guard; applies to every method and PO and
     # non-PO runs alike).
@@ -1046,6 +1052,9 @@ def main_simulation(
 
             if not planner_okay:
                 plan_failure_count += 1
+                _entry = {"tick": time_step}
+                _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
+                plan_failure_log.append(_entry)
 
             # ---- Replanning on plan failure ----
             if not planner_okay:
@@ -1175,6 +1184,9 @@ def main_simulation(
                         avg_path_length = new_len or avg_path_length
                         if not planner_okay:
                             plan_failure_count += 1
+                            _entry = {"tick": time_step}
+                            _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
+                            plan_failure_log.append(_entry)
                         if planner_okay:
                             print(f"  ALTERNATIVE {retried} SUCCEEDED — new plan accepted.")
 
@@ -1282,6 +1294,8 @@ def main_simulation(
                 planner=planner,
                 mask_level=mask_level,
                 mask_policy=mask_policy,
+                method=func_name(voting_method),
+                plan_failure_log=plan_failure_log,
             )
     else:
         po_metrics = {

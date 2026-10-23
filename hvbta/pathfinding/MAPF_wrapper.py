@@ -34,6 +34,43 @@ from hvbta.pathfinding.planner_common import _prepare_agents, _write_paths_back,
 # break importing this file. Each entry: name -> (kind, callable).
 _PLANNER_CACHE = None
 
+# Phase 3 cascade diagnostics: set on every run_native call - None on
+# success, otherwise a dict describing WHY the call failed:
+#   kind: "duplicate_start" | "duplicate_goal" | "lacam_no_solution" |
+#         "lacam_timeout" | "engine_unsolved"
+# plus, for the duplicate cases, the agents involved. Pure logging; no
+# decision path reads it.
+LAST_PLAN_FAILURE = None
+
+
+def _classify_failure(start_positions, goal_positions, agents, plan_fn):
+    """Build the LAST_PLAN_FAILURE dict for a failed native plan call."""
+    starts = list(start_positions.values())
+    goals = list(goal_positions.values())
+    if len(starts) != len(set(starts)):
+        dup = [s for s in set(starts) if starts.count(s) > 1]
+        involved = [{"id": rid, "start": sp, "goal": goal_positions[rid]}
+                    for rid, sp in start_positions.items()
+                    if sp in dup]
+        return {"kind": "duplicate_start", "cells": [c for c in dup], "agents": involved}
+    if len(goals) != len(set(goals)):
+        dup = [g for g in set(goals) if goals.count(g) > 1]
+        involved = [{"id": rid, "start": start_positions[rid], "goal": gp}
+                    for rid, gp in goal_positions.items()
+                    if gp in dup]
+        return {"kind": "duplicate_goal", "cells": [c for c in dup], "agents": involved}
+    # engine-level failure with clean inputs: ask the engine why (lacam
+    # reports its reason; other engines get the generic label)
+    if getattr(plan_fn, "__module__", "").endswith("lacam_planner"):
+        from hvbta.pathfinding import lacam_planner
+        reason = lacam_planner.LAST_FAILURE_REASON
+        if reason == "timeout":
+            return {"kind": "lacam_timeout", "reason": reason}
+        if reason is not None and reason.startswith("solved=0"):
+            return {"kind": "lacam_no_solution", "reason": reason}
+        return {"kind": "engine_unsolved", "reason": reason}
+    return {"kind": "engine_unsolved", "reason": None}
+
 
 def _registry():
     global _PLANNER_CACHE
@@ -70,6 +107,8 @@ def run_native(plan_fn, robots, start_positions, goal_positions, map_dict):
         `agents` is ALREADY augmented with stationary blockers; the engine must
         not augment again. None / {} == failure.
     """
+    global LAST_PLAN_FAILURE
+    LAST_PLAN_FAILURE = None
     agents, stationary_ids = _prepare_agents(robots, start_positions, goal_positions)
     if agents is None:
         if start_positions and goal_positions:
@@ -81,6 +120,7 @@ def run_native(plan_fn, robots, start_positions, goal_positions, map_dict):
             # mechanism triggers (trying alternative assignments that may
             # give the robots different goals and separate them), and
             # pending_event_steps is NOT drained.
+            LAST_PLAN_FAILURE = _classify_failure(start_positions, goal_positions, agents, plan_fn)
             return 0.0, False
         # genuinely nothing to plan (empty start_positions)
         return 0.0, True
@@ -89,6 +129,7 @@ def run_native(plan_fn, robots, start_positions, goal_positions, map_dict):
     if not paths:
         print(f"{getattr(plan_fn, '__module__', '?')}.{getattr(plan_fn, '__name__', 'plan')} "
               f"found no plan under current state.")
+        LAST_PLAN_FAILURE = _classify_failure(start_positions, goal_positions, agents, plan_fn)
         return 0.0, False
 
     avg_len = _write_paths_back(robots, paths, stationary_ids)

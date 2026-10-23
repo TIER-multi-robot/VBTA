@@ -57,6 +57,13 @@ if not os.path.exists(_LACAM_BINARY):
 # the file once per map per process).
 _map_file_cache = {}
 
+# Last failure reason, set on every None return from plan() (pure
+# diagnostics for the Phase 3 cascade investigation; not read by any
+# decision path). Values: "timeout" (subprocess hit the time limit),
+# "solved=0" (engine finished but reported no solution), "no_output_file",
+# "no_solution_section", "empty_solution", "exception:<msg>".
+LAST_FAILURE_REASON = None
+
 
 def _ensure_map_file(map_dict):
     """Write the sim's grid to a temp .map file in lacam format (cached).
@@ -170,6 +177,7 @@ def plan(agents, map_dict, time_limit=3.0):
     if not agents:
         return {}
 
+    global LAST_FAILURE_REASON
     map_path = _ensure_map_file(map_dict)
     scen_path = _write_scen_file(agents, os.path.basename(map_path))
 
@@ -193,17 +201,40 @@ def plan(agents, map_dict, time_limit=3.0):
             timeout=time_limit + 5,  # +5s grace for process overhead
         )
 
-        paths = _parse_output(output_path, len(agents))
-        if paths is None:
+        if not os.path.exists(output_path):
+            LAST_FAILURE_REASON = "no_output_file"
+            return None
+        with open(output_path, "r") as f:
+            content = f.read()
+        if "solved=0" in content:
+            # Distinguish budget exhaustion from a genuine no-solution:
+            # comp_time at/near the limit = timeout; well under it = the
+            # engine exhausted the (finite) search space, i.e. unsolvable.
+            import re as _re
+            m = _re.search(r"comp_time=(\d+)", content)
+            comp_time = int(m.group(1)) if m else -1
+            LAST_FAILURE_REASON = (
+                f"solved=0,comp_time={comp_time}" if comp_time >= 0 else "solved=0")
+            return None
+        if "solution=" not in content:
+            LAST_FAILURE_REASON = "no_solution_section"
             return None
 
+        paths = _parse_output(output_path, len(agents))
+        if paths is None:
+            LAST_FAILURE_REASON = "empty_solution"
+            return None
+
+        LAST_FAILURE_REASON = None
         # Map agent indices back to agent IDs (same order as the scen file).
         return {agents[i]["id"]: paths.get(i, [agents[i]["start"]])
                 for i in range(len(agents))}
 
     except subprocess.TimeoutExpired:
+        LAST_FAILURE_REASON = "timeout"
         return None
-    except Exception:
+    except Exception as e:
+        LAST_FAILURE_REASON = f"exception:{type(e).__name__}"
         return None
     finally:
         # Clean up temp files (keep the cached map file).
