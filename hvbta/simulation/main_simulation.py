@@ -2,6 +2,7 @@ import time
 import random
 import glob
 import re
+import zlib
 import numpy as np
 import csv
 import os
@@ -81,6 +82,27 @@ FAIRNESS_METRIC_NAMES = ["Jains_Index", "Gini", "Median", "IQR"]
 
 def func_name(f):
     return getattr(f, "__name__", str(f))
+
+
+def _derived_seed(*parts) -> int:
+    """
+    Deterministic seed derivation from arbitrary key parts (agent
+    instructions: use zlib.adler32 everywhere, never hash()). Returns an
+    unsigned 32-bit seed.
+    """
+    return zlib.adler32(repr(tuple(parts)).encode()) & 0xFFFFFFFF
+
+
+def _seed_rngs(seed: int):
+    """
+    Seed BOTH RNGs the simulator uses: Python's module-level `random` and
+    numpy's global `np.random`. Called at every isolation scope (per-rep
+    entity generation, per-method initial assignment, per-method run) so
+    results are reproducible across processes and one method's random
+    draws can never change another method's results.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
 
 
 def suitability_all_zero(suitability_matrix):
@@ -379,6 +401,15 @@ def main_simulation(
         mask_level: str = None,
         mask_policy: str = None,
         schedule_seed: int = None,
+        # Per-run RNG seed keyed by (group, method): derived by the sweep via
+        # _derived_seed(schedule_seed, "run", method). Deliberately does NOT
+        # include mask_level/mask_policy (or any future observation-noise
+        # sigma): conditions that share robots/tasks/schedule must share the
+        # run seed, so e.g. sigma_obs = 0 reproduces the no-noise results
+        # exactly. Seeding both `random` and `np.random` with it at entry
+        # makes each method's run reproducible regardless of execution order
+        # or what any other method consumed before it.
+        run_seed: int = None,
         # Optional path for the per-run PO diagnostic JSON (masks, per-field
         # mis-assignment breakdown). Only written when mask_level is set.
         po_diag_path: str = None,
@@ -393,6 +424,11 @@ def main_simulation(
         scheduled_event_count: int = 0,
         horizon_binding_term: str = ""):
     print(f"SUITABILITY METHOD: {suitability_method}")
+
+    # Per-run RNG isolation (agent instructions Step 1.2): seed both RNGs so
+    # this method's draws depend only on its own (group, method) key.
+    if run_seed is not None:
+        _seed_rngs(run_seed)
 
     voting_methods = {
         V.rank_assignments_borda: "Borda Count",
@@ -1334,6 +1370,15 @@ def benchmark_simulation(
         mask_level: str = None,
         mask_policy: str = None,
         schedule_seed: int = None,
+        # Per-run RNG seed keyed by (group, method): derived by the sweep via
+        # _derived_seed(schedule_seed, "run", method). Deliberately does NOT
+        # include mask_level/mask_policy (or any future observation-noise
+        # sigma): conditions that share robots/tasks/schedule must share the
+        # run seed, so e.g. sigma_obs = 0 reproduces the no-noise results
+        # exactly. Seeding both `random` and `np.random` with it at entry
+        # makes each method's run reproducible regardless of execution order
+        # or what any other method consumed before it.
+        run_seed: int = None,
         po_diag_path: str = None,
         planner: str = "lacam",
         scenario: str = "",
@@ -1357,6 +1402,7 @@ def benchmark_simulation(
         mask_level=mask_level,
         mask_policy=mask_policy,
         schedule_seed=schedule_seed,
+        run_seed=run_seed,
         po_diag_path=po_diag_path,
         planner=planner,
         scenario=scenario,
@@ -1563,13 +1609,17 @@ if __name__ == "__main__":
     # The mask condition is NOT part of the schedule seed, so all 5
     # conditions replay identical schedules (spec §5).
     PO_EXPERIMENT = True
-    # P1 pilot: zero-pair voting fix only (ablation vs
-    # pilot_po_pre_zero_pair_fix). Same config/seeds as the pre-fix pilot.
+    # Seeded ablation pilots (agent instructions Step 4): same pilot config
+    # run twice with the zero-pair voting filter OFF and ON. Both use the
+    # seeded harness (Step 1) so entities, schedules, and per-method RNG
+    # streams are identical between them.
     PO_SWEEP_CONFIGS = [(r"lak102d.map", [10, 20], [10, 20])]
-    # Every run writes to a NEW directory - never into an existing one.
+    # Every run writes to a NEW directory - never an existing one.
     # Fresh dir => the resume scanner finds no completed rows => nothing
     # is skipped, every config re-runs (per agent instructions §0.4).
-    PO_OUTPUT_DIRNAME = "pilot_po_P1_zero_pair_fix"
+    PO_OUTPUT_DIRNAME = "pilot_po_P1_seeded_filter_on"
+    # voting.py zero-pair filter flag for this launch (Step 2):
+    V.VOTING_ZERO_PAIR_FILTER = True
     from hvbta.partial_observability import PO_CONDITIONS, MASK_COUNTS
 
     # Uncomment ONE of the following lines:
@@ -1718,6 +1768,21 @@ if __name__ == "__main__":
                                     voting_outputs = []
                                     assignment_infos = []
 
+                                    # Pre-compute the group's schedule seed BEFORE
+                                    # generating entities (it depends only on the group
+                                    # key, not on the drawn entities), then seed the
+                                    # RNGs so per-rep entity generation is reproducible
+                                    # across processes (agent instructions Step 1.1).
+                                    # zlib.adler32 is stable across runs; hash() is not.
+                                    seed_tuple = (
+                                        os.path.basename(map_file), num_robots, num_tasks,
+                                        nc, sm_name, rep, scenario_name
+                                    )
+                                    schedule_seed = zlib.adler32(
+                                        repr(seed_tuple).encode()
+                                    ) & 0xFFFFFFFF
+                                    _seed_rngs(_derived_seed(schedule_seed, "entities"))
+
                                     # Spawn rule: robots may not overlap each other, tasks may not overlap
                                     # each other, but a robot and a task may share a cell.
                                     robot_locs = set()
@@ -1736,21 +1801,6 @@ if __name__ == "__main__":
                                         tasks.append(t)
                                         task_locs.add(t.location)
                                     task_profiles = [t.strict_profile_name for t in tasks]
-
-                                    # Pre-build one deterministic event schedule per
-                                    # (map, num_robots, num_tasks, nc, sm, rep, scenario).
-                                    # Every method + planner in this group replays the SAME schedule
-                                    # so their comparisons are fair. Uses zlib.adler32 (stable across
-                                    # runs) instead of hash() (which is per-process-randomized in
-                                    # Python 3 unless PYTHONHASHSEED is fixed).
-                                    import zlib
-                                    seed_tuple = (
-                                        os.path.basename(map_file), num_robots, num_tasks,
-                                        nc, sm_name, rep, scenario_name
-                                    )
-                                    schedule_seed = zlib.adler32(
-                                        repr(seed_tuple).encode()
-                                    ) & 0xFFFFFFFF
 
                                     # Phase 2: build-long → compute-horizon → truncate.
                                     # Build the schedule to a generous provisional length first.
@@ -1888,25 +1938,32 @@ if __name__ == "__main__":
                                             else:
                                                 # voting - random fallback
                                                 for method_fn, method_name in zip(voting_methods, voting_names):
+                                                    _seed_rngs(_derived_seed(schedule_seed, "initial", method_name))
                                                     output, score, length, per_agent = V.assign_tasks_randomly(robots, tasks, suitability_matrix, nc)
                                                     initial_jains = _record_initial(Run_ID, method_name, output, score, length, per_agent)
                                                     voting_outputs.append((output, initial_jains))
                                                 # optimization - random fallback
                                                 opt_outputs = []
                                                 for opt_fn, opt_name in zip(optimization_methods, optimization_names):
+                                                    _seed_rngs(_derived_seed(schedule_seed, "initial", opt_name))
                                                     out, score, length, per_agent = O.assign_tasks_with_method_randomly(opt_fn, suitability_matrix, nc)
                                                     initial_jains = _record_initial(Run_ID, opt_name, out, score, length, per_agent)
                                                     opt_outputs.append((out, initial_jains))
                                                 outputs = voting_outputs + opt_outputs + direct_outputs
                                         else:
-                                            # voting - normal
+                                            # voting - normal. Each method's initial assignment is
+                                            # RNG-isolated (agent instructions Step 1.2) so one
+                                            # method's candidate-generation draws can never change
+                                            # another method's initial assignment.
                                             for method_fn, method_name in zip(voting_methods, voting_names):
+                                                _seed_rngs(_derived_seed(schedule_seed, "initial", method_name))
                                                 output, score, length, per_agent = V.assign_tasks_with_voting(robots, tasks, suitability_matrix, nc, method_fn)
                                                 initial_jains = _record_initial(Run_ID, method_name, output, score, length, per_agent)
                                                 voting_outputs.append((output, initial_jains))
                                             # optimization - normal
                                             opt_outputs = []
                                             for opt_fn, opt_name in zip(optimization_methods, optimization_names):
+                                                _seed_rngs(_derived_seed(schedule_seed, "initial", opt_name))
                                                 out, score, length, per_agent = O.assign_tasks_with_method(opt_fn, suitability_matrix)
                                                 initial_jains = _record_initial(Run_ID, opt_name, out, score, length, per_agent)
                                                 opt_outputs.append((out, initial_jains))
@@ -1930,27 +1987,27 @@ if __name__ == "__main__":
                                                 if PO_EXPERIMENT else None
                                             )
                                             output_tuple = benchmark_simulation(
-                                                output=out, 
-                                                robots=copy.deepcopy(robots), 
+                                                output=out,
+                                                robots=copy.deepcopy(robots),
                                                 tasks=copy.deepcopy(tasks),
-                                                num_candidates=nc, 
-                                                voting_method=meth, 
-                                                grid=grid, 
-                                                map_dict=map_dict, 
-                                                suitability_method=sm, 
-                                                suitability_matrix=suitability_matrix, 
-                                                max_time_steps=max_time_steps, 
-                                                add_tasks=add_tasks, 
-                                                add_robots=add_robots, 
+                                                num_candidates=nc,
+                                                voting_method=meth,
+                                                grid=grid,
+                                                map_dict=map_dict,
+                                                suitability_method=sm,
+                                                suitability_matrix=suitability_matrix,
+                                                max_time_steps=max_time_steps,
+                                                add_tasks=add_tasks,
+                                                add_robots=add_robots,
                                                 remove_robots=remove_robots,
-                                                tasks_to_add=tasks_to_add, 
-                                                robots_to_add=robots_to_add, 
+                                                tasks_to_add=tasks_to_add,
+                                                robots_to_add=robots_to_add,
                                                 robots_to_remove=robots_to_remove,
-                                                robot_generation_strict=robot_generation_strict, 
+                                                robot_generation_strict=robot_generation_strict,
                                                 task_generation_strict=task_generation_strict,
-                                                initial_jains_index=initial_jains, 
+                                                initial_jains_index=initial_jains,
                                                 task_arrival_rate=task_arrival_rate,
-                                                robot_arrival_rate=robot_arrival_rate, 
+                                                robot_arrival_rate=robot_arrival_rate,
                                                 robot_departure_rate=robot_departure_rate,
                                                 task_cancellation_rate=task_cancellation_rate,
                                                 remove_tasks=remove_tasks,
@@ -1959,6 +2016,7 @@ if __name__ == "__main__":
                                                 mask_level=mask_level,
                                                 mask_policy=mask_policy,
                                                 schedule_seed=schedule_seed,
+                                                run_seed=_derived_seed(schedule_seed, "run", method_pretty[meth]),
                                                 po_diag_path=po_diag_path,
                                                 planner=algo,
                                                 scenario=scenario_name,

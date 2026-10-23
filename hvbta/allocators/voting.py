@@ -2,8 +2,15 @@ import time, numpy as np
 from typing import List, Tuple, Callable
 from .assignments import generate_random_assignments, generate_high_suitability_assignments
 from hvbta.models import CapabilityProfile, TaskDescription
-from hvbta.suitability import calculate_total_suitability, calculate_suitability_matrix, apply_priority_weights
+from hvbta.suitability import calculate_total_suitability, check_zero_suitability, calculate_suitability_matrix, apply_priority_weights
 from .misc_assignment import extract_submatrix
+
+# Config flag (default True). When False, assign_tasks_with_voting behaves
+# EXACTLY like the pre-fix voting.py: no zero-pair filtering of candidates,
+# the check_zero_suitability skip loop and best_ranking reset, and the
+# "keep the random assignment" all-zero else-branch. This lets pre-fix and
+# post-fix voting run from the same code with the same seeds (ablation).
+VOTING_ZERO_PAIR_FILTER = True
 
 
 def _filter_zero_pairs(candidate, suitability_matrix):
@@ -377,12 +384,13 @@ def assign_tasks_with_voting(
     #   3. Diversity filter rejects candidates whose pair-overlap with any
     #      already-accepted candidate exceeds diversity_threshold (bounded
     #      retry loop; degrades gracefully in tiny state spaces).
-    # Every candidate (seed, hall-of-fame, generated) is filtered through
-    # _filter_zero_pairs FIRST: zero-score (infeasible) pairs are dropped
-    # before ranking, with the dropped robots/tasks moved to the candidate's
-    # unassigned lists. Candidates that are empty after filtering are not
-    # added. This re-scores the warm-start / hall-of-fame entries against
-    # the CURRENT matrix (no stored scores).
+    # When VOTING_ZERO_PAIR_FILTER is on, every candidate (seed,
+    # hall-of-fame, generated) is filtered through _filter_zero_pairs
+    # FIRST: zero-score (infeasible) pairs are dropped before ranking, with
+    # the dropped robots/tasks moved to the candidate's unassigned lists.
+    # This re-scores the warm-start / hall-of-fame entries against the
+    # CURRENT matrix (no stored scores). With the flag off, the pre-fix
+    # unfiltered pool construction is used verbatim.
     full_pool = []
     if seed_assignment:
         seed_pairs = [(int(r), int(t)) for r, t in seed_assignment]
@@ -390,22 +398,26 @@ def assign_tasks_with_voting(
         seed_task_ids = {t for _, t in seed_pairs}
         seed_unr = [r for r in range(num_robots) if r not in seed_robot_ids]
         seed_unt = [t for t in range(num_tasks) if t not in seed_task_ids]
-        seed_cand = _filter_zero_pairs((seed_pairs, seed_unr, seed_unt), suitability_matrix)
+        seed_cand = (seed_pairs, seed_unr, seed_unt)
+        if VOTING_ZERO_PAIR_FILTER:
+            seed_cand = _filter_zero_pairs(seed_cand, suitability_matrix)
         if seed_cand is not None:
             full_pool.append(seed_cand)
 
     # Hall-of-fame extras (already validated/translated by the caller). Add as
     # many as fit; they earned their place so they bypass the diversity filter,
     # but they DO seed accepted_pair_sets so generated candidates avoid them.
-    # Zero-score pairs are dropped by the same filter.
     if extra_candidates:
         for cand in extra_candidates:
             if len(full_pool) >= num_candidates:
                 break
-            fixed = _filter_zero_pairs(cand, suitability_matrix)
-            if fixed is None:
-                continue
-            full_pool.append(fixed)
+            if VOTING_ZERO_PAIR_FILTER:
+                fixed = _filter_zero_pairs(cand, suitability_matrix)
+                if fixed is None:
+                    continue
+                full_pool.append(fixed)
+            else:
+                full_pool.append(cand)
 
     diversity_active = diversity_threshold is not None and diversity_threshold < 1.0
     accepted_pair_sets = [set(c[0]) for c in full_pool]
@@ -421,9 +433,12 @@ def assign_tasks_with_voting(
         for candidate in batch:
             if len(full_pool) >= num_candidates:
                 break
-            fixed = _filter_zero_pairs(candidate, suitability_matrix)
-            if fixed is None:
-                continue
+            if VOTING_ZERO_PAIR_FILTER:
+                fixed = _filter_zero_pairs(candidate, suitability_matrix)
+                if fixed is None:
+                    continue
+            else:
+                fixed = candidate
             if not diversity_active:
                 full_pool.append(fixed)
                 continue
@@ -443,10 +458,11 @@ def assign_tasks_with_voting(
                 accepted_pair_sets.append(new_pairs)
 
     # If the retry cap was hit before we filled the pool, we still proceed
-    # with what we have. If ZERO-PAIR FILTERING emptied the entire pool
-    # (every candidate's pairs were all infeasible), assign NOTHING this
-    # round - same behavior as Murty's on an all-infeasible matrix. Voting
-    # must never execute a zero-score pair.
+    # with what we have. When the zero-pair filter is on and it emptied the
+    # entire pool (every candidate's pairs were all infeasible), assign
+    # NOTHING this round - same behavior as Murty's on an all-infeasible
+    # matrix. Voting must never execute a zero-score pair. (With the flag
+    # off, the pre-fix code always had >= 1 candidate.)
     if not full_pool:
         length = (time.perf_counter_ns() - start) / 1000.0
         empty = ([], list(range(num_robots)), list(range(num_tasks)))
@@ -501,10 +517,52 @@ def assign_tasks_with_voting(
         for rank_idx in assignment_ranking[:top_k]:
             top_k_out.append(random_assignments[rank_idx])
 
-    best_assignment = random_assignments[assignment_ranking[0]]
-    assigned_pairs = list(best_assignment[0])
-    unassigned_robots = list(best_assignment[1] or [])
-    unassigned_tasks = list(best_assignment[2] or [])
+    if VOTING_ZERO_PAIR_FILTER:
+        # Every candidate was zero-pair-filtered before entering the pool, so
+        # no candidate contains a zero-score pair and no post-hoc zero handling
+        # is needed: the executed candidate is the voting rule's actual winner,
+        # assignment_ranking[0].
+        best_assignment = random_assignments[assignment_ranking[0]]
+        assigned_pairs = list(best_assignment[0])
+        unassigned_robots = list(best_assignment[1] or [])
+        unassigned_tasks = list(best_assignment[2] or [])
+    else:
+        # Pre-fix behavior, verbatim: advance past candidates containing a
+        # zero pair (so the executed candidate is NOT necessarily the rule's
+        # winner), reset to index 0 when the loop runs out, and fall back to
+        # keeping the random assignment when the chosen candidate is all-zero.
+        best_ranking = 0
+        # check for zero suitability in the best assignment and move to the next best if so
+        while(check_zero_suitability(random_assignments[assignment_ranking[best_ranking]][0], suitability_matrix) and best_ranking < len(assignment_ranking)-1):
+            best_ranking += 1
+        if best_ranking == len(random_assignments) - 1:
+            best_ranking = 0
+
+        best_assignment = random_assignments[assignment_ranking[best_ranking]]
+        assigned_pairs = list(best_assignment[0])
+        unassigned_robots = list(best_assignment[1] or [])
+        unassigned_tasks = list(best_assignment[2] or [])
+
+        has_positive = any(suitability_matrix[r][t] > 0 for r, t in assigned_pairs)
+        if has_positive:
+            kept_pairs = []
+            for r, t in assigned_pairs:
+                if suitability_matrix[r][t] > 0:
+                    kept_pairs.append((r, t))
+                else:
+                    if r not in unassigned_robots:
+                        unassigned_robots.append(r)
+                    if t not in unassigned_tasks:
+                        unassigned_tasks.append(t)
+            assigned_pairs = kept_pairs
+        else:
+            # All pairs scored 0 – keep the random assignment so the simulator has work to do.
+            if best_assignment[1] is None:
+                assigned_ids = {r for r, _ in assigned_pairs}
+                unassigned_robots = [idx for idx in range(num_robots) if idx not in assigned_ids]
+            if best_assignment[2] is None:
+                assigned_task_ids = {t for _, t in assigned_pairs}
+                unassigned_tasks = [idx for idx in range(num_tasks) if idx not in assigned_task_ids]
 
     filtered_best_assignments = (
         assigned_pairs,

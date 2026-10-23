@@ -4,13 +4,15 @@ Validation tests for the partial-observability experiment
 
 1. Leak test       - masked fields' true values never reach the scorer.
 2. Mask fairness   - masks identical across methods/policies; low ⊂ high.
-3. Determinism     - same seed -> same masks, same masked views.
+3. Determinism     - cross-process + order independence (driver-based).
 4. Reveal-once     - each task's mask is removed at most once.
 5. No-bounce       - a task infeasible for every robot is never assigned
                      (voting filters zero-suitability pairs).
 6. Hard-fail parity - balanced_hard_fail True ⟹ _balanced_pair == 0.
 """
+import os
 import random
+import sys
 
 import numpy as np
 import pytest
@@ -162,16 +164,14 @@ def test_masks_deterministic_and_nested():
 
 def test_masks_identical_across_methods_and_policies():
     """Two PO states built for different policies (i.e. different 'methods'
-    in a group) see identical masks for the same (seed, task)."""
+    in a group) see identical masks for the same (seed, task). (Run-level
+    determinism is covered by the cross-process / order-independence
+    tests above.)"""
     tasks = make_tasks()
     po_opt = PartialObservabilityState(SEED, "high", "optimistic")
     po_pess = PartialObservabilityState(SEED, "high", "pessimistic")
     for t in tasks:
         assert po_opt.mask_of(t.task_id) == po_pess.mask_of(t.task_id)
-    # and a second instance with the same config reproduces them (§9.3)
-    po_again = PartialObservabilityState(SEED, "high", "optimistic")
-    for t in tasks:
-        assert po_again.mask_of(t.task_id) == po_opt.mask_of(t.task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +282,72 @@ def test_hard_fail_uses_true_attributes_at_arrival():
     assert balanced_hard_fail(feasible_robot, task, 0.0) is True  # true attributes
     view = build_masked_view(task, frozenset(["required_capabilities.payload"]), "optimistic")
     assert balanced_hard_fail(feasible_robot, view, 0.0) is False  # masked view passes
+
+
+# ---------------------------------------------------------------------------
+# Real determinism tests (agent instructions Step 3): cross-process + order
+# independence, via tests/determinism_driver.py.
+# ---------------------------------------------------------------------------
+ORDER_A = ["borda", "cumulative", "murtys"]
+ORDER_B = ["murtys", "borda", "cumulative"]
+# Wall-clock timing columns in the driver's output: c1 = total_reassignment_time,
+# c45 (last) = Execution Time. Everything else must match exactly.
+TIMING_COLS = {"c1", "c45"}
+
+
+def _run_driver(order, out_path):
+    import subprocess
+    driver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "determinism_driver.py")
+    res = subprocess.run(
+        [sys.executable, driver, out_path, ",".join(order)],
+        capture_output=True, text=True, timeout=900,
+    )
+    assert res.returncode == 0, f"driver failed:\n{res.stderr[-2000:]}"
+
+
+def _load_rows(path):
+    import csv as _csv
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(_csv.DictReader(f))
+
+
+def test_cross_process_determinism():
+    """The same config run in two separate subprocesses produces identical
+    results, excluding wall-clock timing columns."""
+    tmp = os.environ.get("TEMP", ".")
+    p1 = os.path.join(tmp, "det_run1.csv")
+    p2 = os.path.join(tmp, "det_run2.csv")
+    _run_driver(ORDER_A, p1)
+    _run_driver(ORDER_A, p2)
+    rows1, rows2 = _load_rows(p1), _load_rows(p2)
+    assert len(rows1) == len(rows2) == 3
+    for r1, r2 in zip(rows1, rows2):
+        for col in r1:
+            if col == "method" or col in TIMING_COLS:
+                continue
+            assert r1[col] == r2[col], (
+                f"cross-process mismatch: {r1['method']} col {col}: "
+                f"{r1[col]!r} != {r2[col]!r}")
+
+
+def test_order_independence():
+    """Running the methods in a different order does not change any
+    method's results (per-method RNG isolation), excluding timing columns."""
+    tmp = os.environ.get("TEMP", ".")
+    pa = os.path.join(tmp, "det_order_a.csv")
+    pb = os.path.join(tmp, "det_order_b.csv")
+    _run_driver(ORDER_A, pa)
+    _run_driver(ORDER_B, pb)
+    by_method_a = {r["method"]: r for r in _load_rows(pa)}
+    by_method_b = {r["method"]: r for r in _load_rows(pb)}
+    assert set(by_method_a) == set(by_method_b)
+    for m in by_method_a:
+        ra, rb = by_method_a[m], by_method_b[m]
+        for col in ra:
+            if col == "method" or col in TIMING_COLS:
+                continue
+            assert ra[col] == rb[col], (
+                f"order-dependence: {m} col {col}: {ra[col]!r} != {rb[col]!r}")
 
 
 # ---------------------------------------------------------------------------
