@@ -76,6 +76,11 @@ load_dotenv(dotenv_path=Path("C:\\Users\\owner\\Documents\\PhD\\TierLab\\VBTA - 
 
 ScoreFn = Callable[[CapabilityProfile, TaskDescription], float]
 
+# Optional pre-clip score collector for the balanced scorer (saturation
+# analysis): set to a list to record the raw final_score of every feasible
+# pair before the [0, 1] clip. Inert by default.
+UNCLIPPED_COLLECTOR = None
+
 def navigation_suitability(
         robot_mobility_type: str, 
         robot_size: Tuple[float, float, float], 
@@ -174,6 +179,47 @@ def navigation_suitability(
     # Final suitability score between [0, 1] (0 if any constraint returns 0)
     return max(0.0, score / max(len(task_constraints), 1.0))
 
+def bfs_distances(grid, source):
+    """
+    BFS shortest-path distances (in grid steps) from `source` to every free
+    cell reachable from it. grid[r][c] == 0 is free, 1 is blocked.
+
+    Computed ONCE per task at creation and attached as
+    task.distance_map = {(row, col): steps}; the scorer then answers any
+    "how far is this robot from this task" question with a dict lookup.
+    """
+    from collections import deque
+    rows, cols = len(grid), len(grid[0])
+    dist_map = {source: 0}
+    queue = deque([source])
+    while queue:
+        r, c = queue.popleft()
+        d = dist_map[(r, c)]
+        for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+            if 0 <= nr < rows and 0 <= nc < cols and grid[nr][nc] == 0:
+                cell = (nr, nc)
+                if cell not in dist_map:
+                    dist_map[cell] = d + 1
+                    queue.append(cell)
+    return dist_map
+
+
+def dist(robot: CapabilityProfile, task: TaskDescription):
+    """
+    True shortest-path (BFS) distance between the robot's CURRENT location
+    and the task location, using the distance map computed once at task
+    creation - never the stale current_path length.
+
+    Returns the number of grid steps, or None when the robot sits in a map
+    region the task cannot be reached from at all (disconnected component),
+    or when the task carries no distance map (callers fall back to
+    Manhattan in that case, e.g. unit-test fixtures).
+    """
+    dm = getattr(task, "distance_map", None)
+    if dm is None:
+        return None
+    return dm.get(robot.location)
+
 def evaluate_suitability_balanced(
         robots: list[CapabilityProfile], 
         tasks: list[TaskDescription], 
@@ -250,13 +296,19 @@ def _balanced_pair(robot: CapabilityProfile, task: TaskDescription, map_size: in
     }
 
     # ---- Distance to task ----
-    # Computed up front because the hard-fail battery check and the
-    # sensor-range component both need it.
-    if robot.current_path and len(robot.current_path) > 0:
-        distance_to_task = len(robot.current_path) - 1
+    # Always the true distance between the robot's CURRENT location and the
+    # task location - never the (stale) current_path length. Uses the BFS
+    # distance map computed once at task creation; Manhattan fallback for
+    # tasks without one. A robot in a region the task cannot be reached
+    # from can never complete it: score 0.
+    _bfs = dist(robot, task)
+    if _bfs is None:
+        if getattr(task, "distance_map", None) is not None:
+            return 0.0  # unreachable: no path from robot to task, ever
+        # no distance map on this task (e.g. unit-test fixture): Manhattan
+        distance_to_task = abs(task.location[0] - robot.location[0]) + abs(task.location[1] - robot.location[1])
     else:
-        # manhattan distance fallback if path does not exist yet
-        distance_to_task = (task.location[0] - robot.location[0]) + (task.location[1] - robot.location[1])
+        distance_to_task = _bfs
 
     # ---- Hard-fail checks (shared with execution-time feasibility) ----
     if balanced_hard_fail(robot, task, distance_to_task):
@@ -367,9 +419,15 @@ def _balanced_pair(robot: CapabilityProfile, task: TaskDescription, map_size: in
         final_score = score / total_weight
         # ---- Proximity ---- #
         if map_size and map_size > 0:
-            final_score *= 2.0 / (1.0 + distance_to_task / map_size)   # in (0, 1]
+            final_score *= 1.0 / (1.0 + distance_to_task / map_size)   # in (0.5, 1] for d <= map_size
     else:
         final_score = 0.0
+
+    # Optional pre-clip capture (saturation analysis): when set to a list,
+    # every feasible pair's raw final_score - before the [0, 1] clip - is
+    # recorded. Inert by default.
+    if UNCLIPPED_COLLECTOR is not None:
+        UNCLIPPED_COLLECTOR.append(final_score)
 
     return max(0.0, min(1.0, final_score))
 

@@ -1639,13 +1639,14 @@ if __name__ == "__main__":
     # The mask condition is NOT part of the schedule seed, so all 5
     # conditions replay identical schedules (spec §5).
     PO_EXPERIMENT = True
-    # P2 pilot: ALL Phase 2 fixes (2.1-2.8) incl. the coverage threshold.
-    # The threshold-off ablation (pilot_po_P2_threshold_off) isolates 2.8.
+    # Pilot re-run after the suitability scoring fix (true BFS distance +
+    # de-saturated proximity factor). 1 repetition - pilot only, quick
+    # turnaround; full sweeps use 3.
     PO_SWEEP_CONFIGS = [(r"lak102d.map", [10, 20], [10, 20])]
     # Every run writes to a NEW directory - never an existing one.
     # Fresh dir => the resume scanner finds no completed rows => nothing
     # is skipped, every config re-runs (per agent instructions §0.4).
-    PO_OUTPUT_DIRNAME = "pilot_po_P2_all_voting_fixes"
+    PO_OUTPUT_DIRNAME = "pilot_po_P2_dist_fix_1rep"
     # Phase 2 flags (defaults are True; explicit here for clarity).
     V.VOTING_ZERO_PAIR_FILTER = True
     V.VOTING_COVERAGE_THRESHOLD = True
@@ -1656,14 +1657,21 @@ if __name__ == "__main__":
     # bucketed per scenario, plus low-priority task tallies. The wrapper is
     # only active during none runs; sm_name / seed derivation are untouched.
     _suit_collector = {"active": False, "scenario": None,
-                       "positives": {}, "task_ids": {}, "low_task_ids": {}}
+                       "positives": {}, "unclipped": {},
+                       "task_ids": {}, "low_task_ids": {}}
 
     def _collecting_sm(robots, tasks, *, map_size=None):
-        result = S.evaluate_suitability_balanced(robots, tasks, map_size=map_size)
         if _suit_collector["active"]:
             scen = _suit_collector["scenario"]
+            _unclip = []
+            S.UNCLIPPED_COLLECTOR = _unclip
+            try:
+                result = S.evaluate_suitability_balanced(robots, tasks, map_size=map_size)
+            finally:
+                S.UNCLIPPED_COLLECTOR = None
             _m = np.asarray(result)
             _suit_collector["positives"].setdefault(scen, []).extend(_m[_m > 0].tolist())
+            _suit_collector["unclipped"].setdefault(scen, []).extend(_unclip)
             seen = _suit_collector["task_ids"].setdefault(scen, set())
             low = _suit_collector["low_task_ids"].setdefault(scen, set())
             for _t in tasks:
@@ -1671,6 +1679,8 @@ if __name__ == "__main__":
                     seen.add(_t.task_id)
                     if getattr(_t, "priority_level", "medium") == "low":
                         low.add(_t.task_id)
+        else:
+            result = S.evaluate_suitability_balanced(robots, tasks, map_size=map_size)
         return result
 
     # Uncomment ONE of the following lines:
@@ -1684,7 +1694,7 @@ if __name__ == "__main__":
 
     map_dir = r"MAPF_benchmark_maps"
 
-    num_repetitions = 3
+    num_repetitions = 1
     add_tasks = True
     add_robots = True
     remove_robots = True
@@ -2093,10 +2103,12 @@ if __name__ == "__main__":
         json.dump({rule: {"calls": c, "top2_ties": t} for rule, (c, t) in V.TIE_STATS.items()}, f, indent=2)
 
     # Report A: balanced-suitability distribution over all feasible pairs
-    # scored during the none conditions, per scenario.
+    # scored during the none conditions, per scenario - both the clipped
+    # (matrix) values and the raw pre-clip values (saturation analysis).
     _report_a = {}
     for scen, vals in _suit_collector["positives"].items():
         arr = np.asarray(vals)
+        unc = np.asarray(_suit_collector["unclipped"].get(scen, []))
         hist, _ = np.histogram(arr, bins=20, range=(0.0, 1.0))
         pct = {p: float(np.percentile(arr, p)) for p in (1, 5, 25, 50, 75, 95)}
         n_tasks = len(_suit_collector["task_ids"].get(scen, ()))
@@ -2107,6 +2119,11 @@ if __name__ == "__main__":
             "percentiles": pct,
             "share_above_0.95": float(np.mean(arr > 0.95)),
             "share_above_0.99": float(np.mean(arr > 0.99)),
+            "unclipped": {
+                "n_entries": int(unc.size),
+                "share_above_1.0": float(np.mean(unc > 1.0)) if unc.size else 0.0,
+                "percentiles": {p: float(np.percentile(unc, p)) for p in (1, 5, 25, 50, 75, 95)} if unc.size else {},
+            },
             "distinct_tasks_seen": n_tasks,
             "low_priority_tasks": n_low,
             "low_priority_share": (n_low / n_tasks) if n_tasks else 0.0,

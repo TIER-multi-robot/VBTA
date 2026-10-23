@@ -264,7 +264,7 @@ def generate_random_task_description_strict(task_id: str, grid: List[List[int]],
     environmental_conditions = random.choice(overrides["environmental_conditions"]) if "environmental_conditions" in overrides else list(p.get("environmental_conditions", []))
     safety_protocols = random.choice(overrides["safety_protocols"]) if "safety_protocols" in overrides else list(p.get("safety_protocols", []))
 
-    return TaskDescription(
+    task = TaskDescription(
         task_id=task_id,
         task_type=p["task_type"],
         objective=f"Perform {p['task_type']} task",
@@ -289,3 +289,10 @@ def generate_random_task_description_strict(task_id: str, grid: List[List[int]],
         assigned=False,
         strict_profile_name=p.get("nl_description", p.get("task_type", ""))
     )
+    # BFS distance map from the task's location to every reachable free
+    # cell, computed once at creation: the balanced scorer's dist() answers
+    # robot-to-task distances with a dict lookup on this map. Survives the
+    # schedule deep-copies and is shared (not re-masked) by masked views.
+    from .suitability import bfs_distances
+    task.distance_map = bfs_distances(grid, task.location)
+    return task

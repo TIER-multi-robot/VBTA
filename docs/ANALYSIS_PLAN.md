@@ -80,3 +80,30 @@ labeled as exploratory.
 ## Amendments
 
 (none yet)
+
+### 2026-10-23: suitability scoring change (distance and proximity factor)
+
+The balanced suitability scores saturated: over 90% of feasible pairs
+scored at or above 0.95 and the median was exactly 1.0 (measured on the
+lak102d P2 pilot, all scenarios; pooled unclipped median 1.69). The cause
+was twofold: the proximity factor multiplied scores by up to 2 for nearby
+robots (2 / (1 + d/map_size)), pushing most feasible pairs past the 1.0
+cap, and the distance it used was the robot's stale planned-path length
+(or an un-absoluted Manhattan fallback that could even go negative)
+rather than the actual robot-task distance.
+
+Change: distance is now the true shortest-path (BFS) distance between the
+robot's current location and the task location, computed once per task at
+creation, with an absolute-value Manhattan fallback when no map is
+available; the proximity factor is now 1 / (1 + d/map_size), bounded in
+(0.5, 1]. After the change, unclipped feasible scores spread across
+(0.3, 0.95) with a median near 0.6 and nothing above 1.0.
+
+This matters for H1: the noise experiment assumes scores are graded
+(continuous, spread out) so observation noise has something to perturb.
+With scores piling at the 1.0 cap, noise of any size would barely change
+the ranking of pairs and H1 could not be meaningfully tested. Because the
+scoring changed, all pilots run before 2026-10-23 (pilot_po_P1_*,
+pilot_po_P2_all_voting_fixes, the partial pilot_po_P2_threshold_off) used
+the saturated scorer and will be re-run; the pilot repetition count was
+also reduced to 1 for faster iteration. Full sweeps keep 3 repetitions.
