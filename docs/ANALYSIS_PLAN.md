@@ -107,3 +107,12 @@ scoring changed, all pilots run before 2026-10-23 (pilot_po_P1_*,
 pilot_po_P2_all_voting_fixes, the partial pilot_po_P2_threshold_off) used
 the saturated scorer and will be re-run; the pilot repetition count was
 also reduced to 1 for faster iteration. Full sweeps keep 3 repetitions.
+
+### 2026-10-23: unreachable robot-task pairs score 0
+
+Follow-up to the scoring amendment above, which did not spell this out:
+when the BFS distance map says the robot's map region has no path to the
+task at all, the pair scores 0 - the robot can never reach it, so the
+pair is treated as infeasible for allocation (the same effect as a
+hard-fail). At execution time this case cannot arise: the feasibility
+check runs when the robot is standing on the task (distance 0).
