@@ -3,34 +3,30 @@ from collections import deque
 
 # Master switch for the Phase 3v2 anti-collision design: idle robots join
 # every planner call as agents whose goal is their current cell (never hard
-# obstacles). LaCAM/PIBT may displace and return such agents (their paths
-# are written back and the timestep walks them); PP plans them like any
-# agent. Exists so the pre-fix behavior can be reproduced for
+# obstacles). Exists so the pre-fix behavior can be reproduced for
 # measurement; leave True.
 IDLE_AGENTS_IN_PLAN = True
 
 
-def _nearest_free_cell(source, obstacles, taken, max_radius=40):
-    """BFS outward from `source` for the nearest cell that is free (not an
-    obstacle, not in `taken`). Returns the cell or None within max_radius."""
+def _nearest_free_cell(source, obstacles, taken, rows, cols):
+    """BFS over the whole reachable map from `source` for the nearest cell
+    that is free (not an obstacle, not in `taken`). Returns the cell or None."""
     if source is None:
         return None
-    q = deque([(source, 0)])
+    q = deque([source])
     seen = {source}
     while q:
-        (r, c), d = q.popleft()
-        if d > max_radius:
-            return None
+        r, c = q.popleft()
         for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
-            cell = (nr, nc)
-            if cell in seen or cell in obstacles or cell in taken:
+            if not (0 <= nr < rows and 0 <= nc < cols):
                 continue
-            if d + 1 > max_radius:
+            cell = (nr, nc)
+            if cell in seen:
                 continue
             seen.add(cell)
             if cell not in obstacles and cell not in taken:
                 return cell
-            q.append((cell, d + 1))
+            q.append(cell)
     return None
 
 
@@ -40,96 +36,89 @@ def _nearest_free_cell(source, obstacles, taken, max_radius=40):
 # ---------------------------------------------------------------------------
 def _prepare_agents(robots, start_positions, goal_positions, map_dict=None):
     """
-    Returns (agents, stationary_ids) or (None, None) on a fast-fail.
+    Returns (agents, stationary_ids, failure) — failure is None on success,
+    otherwise a classification dict (kind: duplicate_start / duplicate_goal /
+    invalid_input) describing exactly why the input is unusable. The caller
+    should NOT invoke the planner when failure is not None; it logs the
+    failure directly.
 
-    agents: list of dicts {id, start:(x,y), goal:(x,y)} for every robot that
-            should occupy space this round:
+    agents: list of dicts {id, start, goal} for every robot that should
+            occupy space this round:
               - movers (from start/goal_positions),
-              - idle robots, as agents whose goal is their CURRENT cell
-                (not obstacles, not stationary). LaCAM/PIBT may displace
-                and return them; their paths are written back and the
-                timestep walks the displacement. PP plans them like any
-                agent (a start==goal agent is a parked agent others route
-                around). This keeps idle robots from ever being invisible
-                obstacles that movers walk straight through.
-              - EXCEPTION: an idle robot standing on a mover's GOAL cell
-                (a task can spawn on any free cell, including one an idle
-                robot occupies) would make two agents share one goal -
-                provably unsolvable, and LaCAM grinds to its time limit
-                proving it (the P3v2 pilot's pathological runs were exactly
-                this). Such an idle gets a real goal instead: the nearest
-                free cell that is no other agent's start or goal, so it
-                walks out of the way.
-              - assigned robots somehow missing from start_positions are
-                still pinned as stationary blockers (legacy run_cbs
-                behavior).
+              - idle robots as stay-put agents whose goal is their CURRENT
+                cell (not obstacles, not stationary). LaCAM/PIBT may
+                displace and return them; their paths are written back.
+              - EXCEPTION: an idle robot standing on a mover's goal cell
+                gets a step-aside goal instead (nearest free cell not
+                claimed by any agent's start or goal), searched over the
+                WHOLE reachable map.
 
-    map_dict (optional): {"dimension": (rows, cols), "obstacles": [...]} -
-            needed to find the step-aside goal for an idle agent on a
-            mover's goal cell.
+    Input validation (before any planner call):
+    - After step-aside assignment, every start and goal in the call is
+      claimed. If a duplicate start or goal remains, the failure dict says
+      so with the agents involved — the planner is never invoked on an
+      unsolvable instance.
     """
     if not start_positions or not goal_positions:
-        return None, None  # caller returns (0.0, True): nothing to plan
+        return None, None, None  # caller returns (0.0, True): nothing to plan
 
     aug_starts = dict(start_positions)
     aug_goals = dict(goal_positions)
     stationary_ids = set()
-    idle_ids_on_goal = []
+    idle_ids = []
     for r in robots:
         if r.robot_id in aug_starts:
             continue
         if getattr(r, "location", None) is None:
             continue
         if not (getattr(r, "assigned", False) and getattr(r, "current_task", None) is not None):
-            # Unassigned (idle) robot: include it as a stay-put agent whose
-            # goal is its current cell. NOT in stationary_ids - its path is
-            # written back so it executes any displacement the planner asks
-            # of it.
             if IDLE_AGENTS_IN_PLAN:
                 aug_starts[r.robot_id] = r.location
                 aug_goals[r.robot_id] = r.location
-                if r.location in set(goal_positions.values()):
-                    idle_ids_on_goal.append(r.robot_id)
+                idle_ids.append(r.robot_id)
             continue
-        # Assigned robot somehow missing from start/goal: legacy stationary
-        # blocker pin (paths skipped at write-back).
         aug_starts[r.robot_id] = r.location
         aug_goals[r.robot_id] = r.location
         stationary_ids.add(r.robot_id)
 
-    # An idle agent parked on a mover's goal makes the instance unsolvable:
-    # two agents can never both end on one cell. Give such an idle a real
-    # "step aside" goal (nearest free cell not claimed by any other agent's
-    # start or goal) so the instance stays solvable and the idle physically
-    # walks out of the way.
-    if idle_ids_on_goal and map_dict is not None:
+    # Step-aside goals for idle agents on mover goals: compute AFTER all
+    # mover goals are set, claim every start and goal in the call, search
+    # the whole reachable map (no radius cap).
+    if idle_ids and map_dict is not None:
         obstacles = set(map_dict.get("obstacles") or [])
+        rows, cols = map_dict.get("dimension", (0, 0))
+        mover_goals = set(goal_positions.values())
         taken = set(aug_starts.values()) | set(aug_goals.values())
-        for rid in idle_ids_on_goal:
-            aside = _nearest_free_cell(aug_starts[rid], obstacles, taken)
-            if aside is not None:
-                aug_goals[rid] = aside
-                taken.add(aside)
-            # no free cell within reach: leave the stay-put goal; the
-            # instance is genuinely unsolvable and the planner fails
-            # honestly (replan-on-failure takes over).
+        for rid in idle_ids:
+            if aug_starts[rid] in mover_goals:
+                aside = _nearest_free_cell(aug_starts[rid], obstacles, taken, rows, cols)
+                if aside is not None:
+                    aug_goals[rid] = aside
+                    taken.add(aside)
+                # no reachable free cell: leave the stay-put goal; the
+                # input validation below will catch the duplicate goal.
+
+    # Input validation on the FULL agent set (starts AND goals):
+    starts = list(aug_starts.values())
+    goals = list(aug_goals.values())
+    if len(starts) != len(set(starts)):
+        dup = [s for s in set(starts) if starts.count(s) > 1]
+        involved = [{"id": rid, "start": aug_starts[rid], "goal": aug_goals[rid]}
+                    for rid in aug_starts if aug_starts[rid] in dup]
+        return None, None, {"kind": "duplicate_start", "cells": [c for c in dup],
+                            "agents": involved}
+    if len(goals) != len(set(goals)):
+        dup = [g for g in set(goals) if goals.count(g) > 1]
+        involved = [{"id": rid, "start": aug_starts[rid], "goal": aug_goals[rid]}
+                    for rid in aug_starts if aug_goals[rid] in dup]
+        return None, None, {"kind": "duplicate_goal", "cells": [c for c in dup],
+                            "agents": involved}
 
     agents = [
         {"id": rid, "start": aug_starts[rid], "goal": aug_goals[rid]}
         for rid in aug_starts
     ]
-
-    starts = [a["start"] for a in agents]
-    if len(starts) != len(set(starts)):
-        # two agents claim the same cell -- same guard run_cbs uses
-        return None, None
-    goals = [a["goal"] for a in agents]
-    if len(goals) != len(set(goals)):
-        # duplicate goals (two movers routed to the same task cell) - same
-        # class of unsolvable instance; fail fast instead of letting the
-        # engine grind.
-        return None, None
-    return agents, stationary_ids
+    return agents, stationary_ids, None
 
 
 def _write_paths_back(robots, paths, stationary_ids):

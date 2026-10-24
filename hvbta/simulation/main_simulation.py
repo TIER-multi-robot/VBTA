@@ -634,6 +634,12 @@ def main_simulation(
 
     run_wall_start = time.perf_counter()
     run_timed_out = False
+    # Tick-order restructure (Phase 3v3): the timestep is the LAST thing in
+    # each tick. Completions / battery deaths / reveals from tick N's
+    # timestep are processed at the START of tick N+1, before any new
+    # movement. No robot moves on a plan made stale by an event in the
+    # same tick.
+    completed_prev_timestep = 0
     for time_step in range(max_time_steps):
         # Per-run wall-clock limit: stop early, flag the row, never drop it.
         if time.perf_counter() - run_wall_start > RUN_WALL_LIMIT_S:
@@ -641,49 +647,15 @@ def main_simulation(
             run_timed_out = True
             total_time_steps = time_step
             break
-        # update unnasigned robots and tasks
+        # update unassigned robots and tasks
         unassigned_robots = [r.robot_id for r in robots if not r.assigned]
         unassigned_tasks = [t.task_id for t in tasks if not t.assigned]
 
-        # simulate timestep
-        completed_this_step, _unassigned_count, total_reward, total_success = simulate_time_step(
-            robots, tasks, unassigned_robots, unassigned_tasks,
-            suitability_method, occupied_positions, start_positions,
-            goal_positions, 1.0, total_reward, total_success,
-            po_state=po, current_tick=time_step, pending_event_steps=pending_event_steps,
-            obstacles=_obstacle_set,
-            collision_counters=collision_counters,
-        )
-        # Per-step throughput signal (used for mean + variance at end).
-        completed_per_step.append(completed_this_step)
-        # Phase 0: log pool/fleet size every timestep, right after the step.
-        task_pool_size_per_step.append(len(tasks))
-        fleet_size_per_step.append(len(robots))
-
-        # Record the first moment the task pool hits 0 — useful METRIC even
-        # when we don't terminate (the pool may refill from future arrivals).
-        # Captured whether or not the sim breaks here.
-        if len(tasks) == 0 and all_tasks_completed_at_step is None:
-            all_tasks_completed_at_step = time_step + 1
-
-        # Termination: pool empty AND no future task arrivals in the schedule.
-        # This prevents the sim from ending lifelong runs early when future
-        # arrivals would refill the pool — the confound the event schedule
-        # exists to remove. Under overload the pool never empties, so this
-        # never fires and the run goes to max_time_steps (correct).
-        no_future_tasks = (
-            event_schedule is None
-            or all(len(e["add_tasks"]) == 0 for e in event_schedule[time_step + 1:])
-        )
-        if len(tasks) == 0 and no_future_tasks:
-            print(f"All tasks completed at time step {time_step + 1} (no future arrivals).")
-            total_time_steps = time_step + 1
-            break
-
-        # update events with any completed tasks this timestep
-        events["completed_tasks"] += completed_this_step
-        # set the replan_cbs flag
-        should_replan_paths = completed_this_step > 0
+        # Tick order (Phase 3v3): process completions from the PREVIOUS
+        # tick's timestep BEFORE any new movement or event application.
+        # No robot moves on a plan made stale by an event in the same tick.
+        events["completed_tasks"] += completed_prev_timestep
+        should_replan_paths = completed_prev_timestep > 0
 
         # Snapshot pool sizes so we can measure add/remove churn from the dynamic
         # block below. Combined with completions, this feeds the adaptive
@@ -794,10 +766,11 @@ def main_simulation(
                         pending_event_steps.append(time_step)
 
         # Record this step's churn for the adaptive candidate window. Sum of
-        # completions + |task pool delta| + |robot pool delta| approximates
-        # total activity this step (a heuristic; exactness is not required).
+        # completions (from the PREVIOUS tick's timestep) + |task pool delta|
+        # + |robot pool delta| approximates total activity this step (a
+        # heuristic; exactness is not required).
         events_this_step = (
-            completed_this_step
+            completed_prev_timestep
             + abs(len(tasks) - n_tasks_before_events)
             + abs(len(robots) - n_robots_before_events)
         )
@@ -1247,6 +1220,42 @@ def main_simulation(
                 1 for r in robots
                 if r.assigned and r.current_task is not None and not r.current_path
             )
+
+        # ---- SIMULATE TIMESTEP (the LAST thing in each tick) ----
+        # Robots move on the plan computed above, which accounts for all
+        # events applied at the top of this tick. Completions, battery
+        # deaths, reveals, and nav drops happen here; they are processed
+        # at the START of the next tick (completed_prev_timestep).
+        completed_this_step, _unassigned_count, total_reward, total_success = simulate_time_step(
+            robots, tasks, unassigned_robots, unassigned_tasks,
+            suitability_method, occupied_positions, start_positions,
+            goal_positions, 1.0, total_reward, total_success,
+            po_state=po, current_tick=time_step, pending_event_steps=pending_event_steps,
+            obstacles=_obstacle_set,
+            collision_counters=collision_counters,
+        )
+        completed_prev_timestep = completed_this_step
+
+        # Per-step throughput signal (used for mean + variance at end).
+        completed_per_step.append(completed_this_step)
+        # Phase 0: log pool/fleet size every timestep, right after the step.
+        task_pool_size_per_step.append(len(tasks))
+        fleet_size_per_step.append(len(robots))
+
+        # Record the first moment the task pool hits 0 — useful METRIC even
+        # when we don't terminate (the pool may refill from future arrivals).
+        if len(tasks) == 0 and all_tasks_completed_at_step is None:
+            all_tasks_completed_at_step = time_step + 1
+
+        # Termination: pool empty AND no future task arrivals in the schedule.
+        no_future_tasks = (
+            event_schedule is None
+            or all(len(e["add_tasks"]) == 0 for e in event_schedule[time_step + 1:])
+        )
+        if len(tasks) == 0 and no_future_tasks:
+            print(f"All tasks completed at time step {time_step + 1} (no future arrivals).")
+            total_time_steps = time_step + 1
+            break
 
     task_completion_fraction = total_success / total_tasks if total_tasks else 0.0
     attempted_completion_rate = total_success / len(tasks_ever_assigned) if tasks_ever_assigned else 0.0
@@ -1707,9 +1716,9 @@ if __name__ == "__main__":
     # Every run writes to a NEW directory - never an existing one.
     # Fresh dir => the resume scanner finds no completed rows => nothing
     # is skipped, every config re-runs (per agent instructions §0.4).
-    PO_OUTPUT_DIRNAME = "pilot_po_P3_collision_v2"
-    # Phase 3v2: idle robots planned as stay-put agents; safety nets behind
-    # COLLISION_AVOIDANCE with counters; end-of-tick collision invariant.
+    PO_OUTPUT_DIRNAME = "pilot_po_P3_collision_v3"
+    # Phase 3v3: idle agents + step-aside goals + 1s planner budget +
+    # 10-min run limit. The v2 dir holds the interrupted 18-hour partial.
     V.VOTING_ZERO_PAIR_FILTER = True
     V.VOTING_COVERAGE_THRESHOLD = True
     from hvbta.partial_observability import PO_CONDITIONS, MASK_COUNTS

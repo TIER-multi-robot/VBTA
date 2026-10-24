@@ -144,17 +144,13 @@ def run_native(plan_fn, robots, start_positions, goal_positions, map_dict):
     """
     global LAST_PLAN_FAILURE
     LAST_PLAN_FAILURE = None
-    agents, stationary_ids = _prepare_agents(robots, start_positions, goal_positions, map_dict)
+    agents, stationary_ids, failure = _prepare_agents(robots, start_positions, goal_positions, map_dict)
     if agents is None:
         if start_positions and goal_positions:
-            # Non-empty input but _prepare_agents returned None
-            # -> duplicate start positions (or duplicate goals) detected.
-            # This is a FAILURE, not trivial success. Return (0.0, False)
-            # so plan_failure_count is incremented, the replan-on-failure
-            # mechanism triggers (trying alternative assignments that may
-            # give the robots different goals and separate them), and
-            # pending_event_steps is NOT drained.
-            LAST_PLAN_FAILURE = _classify_failure(start_positions, goal_positions, agents, plan_fn)
+            # Input-level failure (duplicate start/goal after repair, or
+            # genuinely nothing to plan): classify from _prepare_agents,
+            # which saw the FULL agent set including idle agents.
+            LAST_PLAN_FAILURE = failure or {"kind": "engine_unsolved", "reason": "no_agents"}
             return 0.0, False
         # genuinely nothing to plan (empty start_positions)
         return 0.0, True
@@ -200,8 +196,11 @@ def run_stepwise(step_fn, robots, start_positions, goal_positions, map_dict,
         * priority inheritance down the chain,
         * pinned agents (stationary blockers) never yield.
     """
-    agents, stationary_ids = _prepare_agents(robots, start_positions, goal_positions, map_dict)
+    agents, stationary_ids, failure = _prepare_agents(robots, start_positions, goal_positions, map_dict)
     if agents is None:
+        if failure and start_positions and goal_positions:
+            LAST_PLAN_FAILURE = failure
+            return 0.0, False
         return 0.0, True
 
     PLANNER_TIMING["agents_sum"] += len(agents)

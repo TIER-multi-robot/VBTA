@@ -23,7 +23,7 @@ def extract_submatrix(full_matrix, robots_subset, tasks_subset, robot_id_to_idx,
     sub_t_indices = [task_id_to_idx[t.task_id] for t in tasks_subset]
     return full_matrix[np.ix_(sub_r_indices, sub_t_indices)]
 
-def unassign_task_from_robot(robot: CapabilityProfile, task: TaskDescription, unassigned_robots: List[str], unassigned_tasks: List[str]):
+def unassign_task_from_robot(robot: CapabilityProfile, task: TaskDescription, unassigned_robots: List[str], unassigned_tasks: List[str], keep_path: bool = False):
     # task_id = robot.current_task.task_id
     # t_index = [task.task_id for task in tasks].index(task_id)
     # unassign task
@@ -39,8 +39,13 @@ def unassign_task_from_robot(robot: CapabilityProfile, task: TaskDescription, un
         unassigned_tasks.append(tid)
     # unassign robot
     robot.current_task = None
-    robot.current_path = []
-    robot.remaining_distance = 0
+    if not keep_path:
+        # Cancellation passes keep_path=True: the robot keeps following its
+        # remaining planned path (collision-free, jointly planned) and
+        # becomes an idle agent at wherever it ends up. Only clear the path
+        # when the robot must physically stop (battery death, reveal, etc).
+        robot.current_path = []
+        robot.remaining_distance = 0
 # move it to unassigned robots list with check
     rid = robot.robot_id
     if rid not in unassigned_robots:
@@ -119,7 +124,10 @@ def remove_task_by_id(
         return False
     assigned_robot = victim.assigned_robot
     if assigned_robot is not None:
-        unassign_task_from_robot(assigned_robot, victim, unassigned_robots, unassigned_tasks)
+        # Cancellation: keep the robot's path so it keeps following its
+        # jointly-planned (collision-free) route instead of stranding
+        # mid-path. It becomes an idle agent at its next replan.
+        unassign_task_from_robot(assigned_robot, victim, unassigned_robots, unassigned_tasks, keep_path=True)
     if victim.task_id in unassigned_tasks:
         unassigned_tasks.remove(victim.task_id)
     try:

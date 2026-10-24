@@ -482,7 +482,7 @@ def test_idle_robots_are_planned_agents():
         r.current_task = None
     sp = {m.robot_id: m.location for m in movers}
     gp = {m.robot_id: (0, i) for i, m in enumerate(movers)}  # distinct goals
-    agents, stationary = _prepare_agents(robots, sp, gp)
+    agents, stationary, failure = _prepare_agents(robots, sp, gp)
     ids = {a["id"] for a in agents}
     assert ids == {r.robot_id for r in robots}          # idle robots included
     for r in idle:
