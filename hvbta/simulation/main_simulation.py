@@ -568,6 +568,9 @@ def main_simulation(
     }
 
     occupied_positions = set(r.location for r in robots)
+    # Frozen-cell obstacle set for the timestep's post-movement
+    # reconciliation (Phase 3 cascade fix).
+    _obstacle_set = frozenset(map_dict.get("obstacles") or [])
 
     # Partial-observability state. Active whenever mask_level is set
     # (including "none", which runs the execution-time feasibility check
@@ -627,6 +630,7 @@ def main_simulation(
             suitability_method, occupied_positions, start_positions,
             goal_positions, 1.0, total_reward, total_success,
             po_state=po, current_tick=time_step, pending_event_steps=pending_event_steps,
+            obstacles=_obstacle_set,
         )
         # Per-step throughput signal (used for mean + variance at end).
         completed_per_step.append(completed_this_step)
@@ -1653,17 +1657,17 @@ if __name__ == "__main__":
     # The mask condition is NOT part of the schedule seed, so all 5
     # conditions replay identical schedules (spec §5).
     PO_EXPERIMENT = True
-    # Pilot re-run after the suitability scoring fix (true BFS distance +
-    # de-saturated proximity factor). 1 repetition - pilot only, quick
-    # turnaround; full sweeps use 3.
+    # FINAL ablation pilots on the current code (new scorer + all Phase 2
+    # fixes), 3 reps, pilot config. Three flag combinations; Murty's rows
+    # must be identical across all three.
     PO_SWEEP_CONFIGS = [(r"lak102d.map", [10, 20], [10, 20])]
     # Every run writes to a NEW directory - never an existing one.
     # Fresh dir => the resume scanner finds no completed rows => nothing
     # is skipped, every config re-runs (per agent instructions §0.4).
-    PO_OUTPUT_DIRNAME = "pilot_po_P2_dist_fix_1rep"
-    # Phase 2 flags (defaults are True; explicit here for clarity).
+    PO_OUTPUT_DIRNAME = "pilot_po_final_threshold_off"
+    # Ablation 3: coverage threshold off (zero-pair filter stays on).
     V.VOTING_ZERO_PAIR_FILTER = True
-    V.VOTING_COVERAGE_THRESHOLD = True
+    V.VOTING_COVERAGE_THRESHOLD = False
     from hvbta.partial_observability import PO_CONDITIONS, MASK_COUNTS
 
     # Report A collector (Phase 2 addition): record every positive balanced-
@@ -1708,7 +1712,7 @@ if __name__ == "__main__":
 
     map_dir = r"MAPF_benchmark_maps"
 
-    num_repetitions = 1
+    num_repetitions = 3
     add_tasks = True
     add_robots = True
     remove_robots = True

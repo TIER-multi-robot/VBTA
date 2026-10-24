@@ -4,6 +4,11 @@ from hvbta.models import CapabilityProfile, TaskDescription
 from hvbta.allocators.misc_assignment import unassign_task_from_robot
 from hvbta.suitability import navigation_suitability
 
+# Master switch for the Phase 3 anti-collision fixes (idle-robot yield
+# swap + post-tick reconciliation). Exists so the pre-fix behavior can be
+# reproduced for measurement/ablation; leave True.
+COLLISION_AVOIDANCE = True
+
 
 def simulate_time_step(
     robots: List[CapabilityProfile],
@@ -19,7 +24,8 @@ def simulate_time_step(
     total_success: int = 0,
     po_state=None,
     current_tick: int = None,
-    pending_event_steps: List[int] = None
+    pending_event_steps: List[int] = None,
+    obstacles: frozenset = None
 ) -> Tuple[int, int, float, int]:
     """
     Simulates a single time step, updating robot positions, task progress, and handling failures.
@@ -37,6 +43,10 @@ def simulate_time_step(
             event bookkeeping).
         pending_event_steps: The main loop's pending-event FIFO (only used
             by po_state to raise replan events on mis-assignment).
+        obstacles: Optional set of blocked cells. When provided, a
+            post-movement reconciliation nudges any pathless robot that
+            ended the tick sharing a cell with another robot into a free
+            neighboring cell (see the reconciliation block below).
 
     Returns:
         (tasks_completed, count, total_reward, total_success): A count of unassigned robots and the updated total reward.
@@ -51,7 +61,27 @@ def simulate_time_step(
             # walk one step along the precomputed path (built by CBS upstream)
             if robot.current_path and len(robot.current_path) > 1:
                 next_position = robot.current_path[1]
-                occupied_locations.discard(robot.location)
+                # Idle-robot yield: the planner treats unassigned robots as
+                # non-blocking (they are neither movers nor stationary
+                # blockers in _prepare_agents), so a mover's path may route
+                # straight through an idle robot's cell. Idle robots have no
+                # path and never move on their own, so without this the
+                # mover steps onto them, and once the co-located idle robot
+                # is later assigned, start_positions contains two robots on
+                # one cell - the duplicate-start cascade trigger. Fix: the
+                # idle robot yields into the cell the mover is vacating
+                # (the mover is by definition adjacent). A swap leaves the
+                # occupied_locations set unchanged.
+                idle_hit = next(
+                    (r for r in robots
+                     if r is not robot and not r.assigned
+                     and r.location == next_position), None) if COLLISION_AVOIDANCE else None
+                if idle_hit is not None:
+                    # swap cells: the vacated cell stays occupied (by the
+                    # idle robot), the target cell stays occupied (by us)
+                    idle_hit.location = robot.location
+                else:
+                    occupied_locations.discard(robot.location)
                 robot.location = next_position
                 start_positions[robot.robot_id] = next_position
                 occupied_locations.add(next_position)
@@ -198,5 +228,35 @@ def simulate_time_step(
 
         elif not robot.assigned:
             unassigned_count += 1
+
+    # ---- Post-movement reconciliation (Phase 3 cascade fix) ----
+    # No two robots may share a cell at the end of a tick. The idle-yield
+    # swap above handles movers stepping onto idle robots, but a robot can
+    # also be frozen mid-plan on a cell another agent's plan depends on:
+    # a task cancellation / battery death / mis-assignment reveal clears
+    # its path while it stands where a later mover (or a LaCAM goal
+    # displacement schedule) expects it to vacate. Nudge any PATHLESS
+    # robot that shares a cell into a free neighboring cell; if none
+    # exists, leave it (the next planner call fails as before).
+    if obstacles is not None and COLLISION_AVOIDANCE:
+        by_loc = {}
+        for r in robots:
+            by_loc.setdefault(r.location, []).append(r)
+        for loc, group in by_loc.items():
+            if len(group) < 2:
+                continue
+            rr, cc = loc
+            for occupant in group:
+                if occupant.current_path or occupant.assigned:
+                    continue  # only nudge frozen (pathless, unassigned) robots
+                for cand in ((rr - 1, cc), (rr + 1, cc), (rr, cc - 1), (rr, cc + 1)):
+                    if cand in obstacles or cand in occupied_locations:
+                        continue
+                    if any(other.location == cand for other in group if other is not occupant):
+                        continue
+                    occupied_locations.discard(occupant.location)
+                    occupant.location = cand
+                    occupied_locations.add(cand)
+                    break
 
     return tasks_completed, unassigned_count, total_reward, total_success

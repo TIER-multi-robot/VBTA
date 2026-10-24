@@ -447,6 +447,27 @@ def test_coverage_threshold_requires_min_pool():
         _V.POOL_STATS = None
 
 
+def test_idle_robot_yields_to_mover():
+    """Phase 3 fix: a mover stepping onto an idle robot's cell swaps cells
+    with it (the idle robot takes the mover's vacated cell). Without this,
+    movers walk through idle robots and later planner calls see two robots
+    on one cell (the duplicate-start cascade trigger)."""
+    from hvbta.simulation.timestep import simulate_time_step
+    mover = _fake_robot("R1", (2, 2))
+    idle = _fake_robot("R2", (2, 3))
+    idle.assigned = False
+    idle.current_task = None
+    mover.current_task.location = (0, 9)   # far away: mover must not reach it this tick
+    mover.current_path = [(2, 2), (2, 3), (2, 4), (2, 5)]
+    occupied = {(2, 2), (2, 3)}
+    sp = {"R1": (2, 2)}
+    simulate_time_step([mover, idle], [mover.current_task], [], [],
+                       None, occupied, sp, {})
+    assert mover.location == (2, 3)      # moved onto the idle robot's cell
+    assert idle.location == (2, 2)        # yielded into the vacated cell
+    assert occupied == {(2, 2), (2, 3)}   # both cells still occupied
+
+
 # ---------------------------------------------------------------------------
 # Config sanity
 # ---------------------------------------------------------------------------
