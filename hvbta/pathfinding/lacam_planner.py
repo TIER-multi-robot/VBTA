@@ -213,8 +213,9 @@ def plan(agents, map_dict, time_limit=3.0):
             import re as _re
             m = _re.search(r"comp_time=(\d+)", content)
             comp_time = int(m.group(1)) if m else -1
+            limit_ms = int(time_limit * 1000)
             LAST_FAILURE_REASON = (
-                f"solved=0,comp_time={comp_time}" if comp_time >= 0 else "solved=0")
+                f"solved=0,comp_time={comp_time},limit={limit_ms}" if comp_time >= 0 else "solved=0")
             return None
         if "solution=" not in content:
             LAST_FAILURE_REASON = "no_solution_section"

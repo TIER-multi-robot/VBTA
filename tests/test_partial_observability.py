@@ -290,9 +290,9 @@ def test_hard_fail_uses_true_attributes_at_arrival():
 # ---------------------------------------------------------------------------
 ORDER_A = ["borda", "cumulative", "murtys"]
 ORDER_B = ["murtys", "borda", "cumulative"]
-# Wall-clock timing columns in the driver's output: c1 = total_reassignment_time,
-# c47 (last) = Execution Time. Everything else must match exactly.
-TIMING_COLS = {"c1", "c47"}
+# Wall-clock timing columns in the driver's output (c0 = first tuple value):
+# c1 = total_reassignment_time, c51 (last) = Execution Time.
+TIMING_COLS = {"c1", "c51"}
 
 
 def _run_driver(order, out_path):
@@ -448,10 +448,9 @@ def test_coverage_threshold_requires_min_pool():
 
 
 def test_idle_robot_yields_to_mover():
-    """Phase 3 fix: a mover stepping onto an idle robot's cell swaps cells
-    with it (the idle robot takes the mover's vacated cell). Without this,
-    movers walk through idle robots and later planner calls see two robots
-    on one cell (the duplicate-start cascade trigger)."""
+    """Safety net (3v2c): a mover stepping onto a PARKED idle robot's cell
+    swaps cells with it. Counted in collision_counters['swap']; the target
+    is zero fires once idle robots are planned as agents."""
     from hvbta.simulation.timestep import simulate_time_step
     mover = _fake_robot("R1", (2, 2))
     idle = _fake_robot("R2", (2, 3))
@@ -461,11 +460,70 @@ def test_idle_robot_yields_to_mover():
     mover.current_path = [(2, 2), (2, 3), (2, 4), (2, 5)]
     occupied = {(2, 2), (2, 3)}
     sp = {"R1": (2, 2)}
+    counters = {"swap": 0, "nudge": 0, "violations": 0}
     simulate_time_step([mover, idle], [mover.current_task], [], [],
-                       None, occupied, sp, {})
+                       None, occupied, sp, {}, collision_counters=counters)
     assert mover.location == (2, 3)      # moved onto the idle robot's cell
     assert idle.location == (2, 2)        # yielded into the vacated cell
     assert occupied == {(2, 2), (2, 3)}   # both cells still occupied
+    assert counters["swap"] == 1
+
+
+def test_idle_robots_are_planned_agents():
+    """3v2a: every idle robot joins the planner call as an agent whose goal
+    is its current cell (never a hard obstacle, never a stationary blocker
+    - its path must be written back so it can walk displacements)."""
+    from hvbta.pathfinding.planner_common import _prepare_agents
+    robots = make_robots(n=4, seed=9)
+    movers = robots[:2]
+    idle = robots[2:]
+    for r in idle:
+        r.assigned = False
+        r.current_task = None
+    sp = {m.robot_id: m.location for m in movers}
+    gp = {m.robot_id: (0, i) for i, m in enumerate(movers)}  # distinct goals
+    agents, stationary = _prepare_agents(robots, sp, gp)
+    ids = {a["id"] for a in agents}
+    assert ids == {r.robot_id for r in robots}          # idle robots included
+    for r in idle:
+        a = next(x for x in agents if x["id"] == r.robot_id)
+        assert a["start"] == a["goal"] == r.location     # stay-put agent
+        assert r.robot_id not in stationary              # path gets written back
+
+
+def test_idle_agent_walks_displacement_path():
+    """3v2a: an unassigned robot with a planner-issued displacement path
+    [cell, aside, cell] walks it (no work block, no task needed)."""
+    from hvbta.simulation.timestep import simulate_time_step
+    idle = _fake_robot("R2", (2, 3))
+    idle.assigned = False
+    idle.current_task = None
+    idle.current_path = [(2, 3), (3, 3), (2, 3)]
+    counters = {"swap": 0, "nudge": 0, "violations": 0}
+    simulate_time_step([idle], [], [], [], None, {(2, 3)}, {}, {},
+                       collision_counters=counters)
+    assert idle.location == (3, 3)                       # stepped aside
+    assert idle.current_path == [(3, 3), (2, 3)]
+    simulate_time_step([idle], [], [], [], None, {(3, 3)}, {}, {},
+                       collision_counters=counters)
+    assert idle.location == (2, 3)                      # returned to its cell
+    assert counters["violations"] == 0
+
+
+def test_collision_violation_counted():
+    """3v2d: two robots ending a tick on the same cell (or swapping cells)
+    is counted in collision_counters['violations']."""
+    from hvbta.simulation.timestep import simulate_time_step
+    a = _fake_robot("R1", (2, 2))
+    b = _fake_robot("R2", (2, 2))          # deliberately co-located
+    a.assigned = b.assigned = False
+    a.current_task = b.current_task = None
+    counters = {"swap": 0, "nudge": 0, "violations": 0}
+    # two idle robots co-located, no obstacles passed -> nudge net inactive,
+    # the invariant check still counts the shared cell
+    simulate_time_step([a, b], [], [], [], None, set(), {}, {},
+                       collision_counters=counters)
+    assert counters["violations"] >= 1
 
 
 # ---------------------------------------------------------------------------

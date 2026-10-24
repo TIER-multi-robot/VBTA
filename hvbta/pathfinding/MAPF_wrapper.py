@@ -30,6 +30,12 @@ Planner modules never import MAPF_wrapper.
 
 from hvbta.pathfinding.planner_common import _prepare_agents, _write_paths_back, _manhattan
 
+# Per-call planner time budget (seconds). Engines that accept a time limit
+# (LaCAM, CBS) get this passed; a budget hit is a FAILURE classified as
+# "lacam_timeout" (or "engine_unsolved" for engines without limits) - never
+# treated as proof of infeasibility. Configurable.
+PLANNER_TIME_BUDGET_S = 1.0
+
 # Registry built lazily so an unimplemented planner module (e.g. lacam) doesn't
 # break importing this file. Each entry: name -> (kind, callable).
 _PLANNER_CACHE = None
@@ -67,6 +73,16 @@ def _classify_failure(start_positions, goal_positions, agents, plan_fn):
         if reason == "timeout":
             return {"kind": "lacam_timeout", "reason": reason}
         if reason is not None and reason.startswith("solved=0"):
+            # Distinguish a budget hit (LaCAM self-terminated at its time
+            # limit) from a genuine no-solution (it finished well under
+            # the limit). Parse comp_time and limit from the reason string.
+            import re as _re
+            m_ct = _re.search(r"comp_time=(\d+)", reason)
+            m_lim = _re.search(r"limit=(\d+)", reason)
+            comp_time = int(m_ct.group(1)) if m_ct else -1
+            limit = int(m_lim.group(1)) if m_lim else -1
+            if limit > 0 and comp_time >= 0.9 * limit:
+                return {"kind": "lacam_timeout", "reason": reason}
             return {"kind": "lacam_no_solution", "reason": reason}
         return {"kind": "engine_unsolved", "reason": reason}
     return {"kind": "engine_unsolved", "reason": None}
@@ -87,14 +103,33 @@ def _registry():
 
 
 def run_planner(planner, robots, start_positions, goal_positions, map_dict, **kw):
+    import time as _time
     registry = _registry()
     if planner not in registry:
         raise ValueError(f"unknown planner {planner!r}; "
                          f"choose from {list(registry)}")
     kind, fn = registry[planner]
-    if kind == "native":
-        return run_native(fn, robots, start_positions, goal_positions, map_dict)
-    return run_stepwise(fn, robots, start_positions, goal_positions, map_dict, **kw)
+    _t0 = _time.perf_counter_ns()
+    try:
+        if kind == "native":
+            return run_native(fn, robots, start_positions, goal_positions, map_dict)
+        return run_stepwise(fn, robots, start_positions, goal_positions, map_dict, **kw)
+    finally:
+        PLANNER_TIMING["ns"] += _time.perf_counter_ns() - _t0
+        PLANNER_TIMING["calls"] += 1
+
+
+# Per-run planner-call wall-time accounting (Phase 3v2: planning idle
+# robots as stay-put agents costs time, so measure it). Reset/read by
+# main_simulation per run. agents_sum accumulates the agent count of every
+# successful _prepare_agents call for mean-agents-per-call reporting.
+PLANNER_TIMING = {"calls": 0, "ns": 0, "agents_sum": 0}
+
+
+def reset_planner_timing():
+    PLANNER_TIMING["calls"] = 0
+    PLANNER_TIMING["ns"] = 0
+    PLANNER_TIMING["agents_sum"] = 0
 
 
 # ===========================================================================
@@ -109,12 +144,11 @@ def run_native(plan_fn, robots, start_positions, goal_positions, map_dict):
     """
     global LAST_PLAN_FAILURE
     LAST_PLAN_FAILURE = None
-    agents, stationary_ids = _prepare_agents(robots, start_positions, goal_positions)
+    agents, stationary_ids = _prepare_agents(robots, start_positions, goal_positions, map_dict)
     if agents is None:
         if start_positions and goal_positions:
             # Non-empty input but _prepare_agents returned None
-            # -> duplicate start positions detected (two robots at the same
-            # cell after stale-path movement without collision checking).
+            # -> duplicate start positions (or duplicate goals) detected.
             # This is a FAILURE, not trivial success. Return (0.0, False)
             # so plan_failure_count is incremented, the replan-on-failure
             # mechanism triggers (trying alternative assignments that may
@@ -125,7 +159,16 @@ def run_native(plan_fn, robots, start_positions, goal_positions, map_dict):
         # genuinely nothing to plan (empty start_positions)
         return 0.0, True
 
-    paths = plan_fn(agents, map_dict)
+    PLANNER_TIMING["agents_sum"] += len(agents)
+
+    # Thread the per-call time budget to LaCAM (the subprocess engine whose
+    # runs are unbounded without it). CBS keeps its own 30s internal limit;
+    # PP/PIBT are fast and have no limit parameter.
+    if getattr(plan_fn, "__module__", "").endswith("lacam_planner"):
+        paths = plan_fn(agents, map_dict, time_limit=PLANNER_TIME_BUDGET_S)
+    else:
+        paths = plan_fn(agents, map_dict)
+
     if not paths:
         print(f"{getattr(plan_fn, '__module__', '?')}.{getattr(plan_fn, '__name__', 'plan')} "
               f"found no plan under current state.")
@@ -157,9 +200,11 @@ def run_stepwise(step_fn, robots, start_positions, goal_positions, map_dict,
         * priority inheritance down the chain,
         * pinned agents (stationary blockers) never yield.
     """
-    agents, stationary_ids = _prepare_agents(robots, start_positions, goal_positions)
+    agents, stationary_ids = _prepare_agents(robots, start_positions, goal_positions, map_dict)
     if agents is None:
         return 0.0, True
+
+    PLANNER_TIMING["agents_sum"] += len(agents)
 
     dim = map_dict["dimension"]
     if max_internal_steps is None:

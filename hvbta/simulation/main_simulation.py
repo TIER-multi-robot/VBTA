@@ -85,6 +85,12 @@ def func_name(f):
     return getattr(f, "__name__", str(f))
 
 
+# Per-run wall-clock limit (seconds). A run that hits it stops early and is
+# written as a row with Run_Timed_Out = 1 (metrics computed over the ticks
+# executed), never dropped. Configurable.
+RUN_WALL_LIMIT_S = 600
+
+
 def _derived_seed(*parts) -> int:
     """
     Deterministic seed derivation from arbitrary key parts (agent
@@ -504,11 +510,18 @@ def main_simulation(
     # Invariant-check accumulator: ticks where some robot is assigned to a
     # task but has an empty current_path (can neither move nor work).
     stuck_assigned_robot_ticks = 0
+    # Phase 3v2 collision accounting: safety-net fires (swap/nudge) and
+    # end-of-tick invariant violations, counted by the timestep.
+    collision_counters = {"swap": 0, "nudge": 0, "violations": 0}
     # Phase 3 cascade diagnostics: one entry per failed planner call,
     # {tick, kind, ...} (kind = duplicate_start / duplicate_goal /
     # lacam_no_solution / lacam_timeout / engine_unsolved). Goes into the
     # per-run diagnostic JSON.
     plan_failure_log = []
+    # Planner-call wall-time accounting (reported per run in the diag JSON;
+    # planning idle agents as stay-put agents costs time, so measure it).
+    MW.reset_planner_timing()
+    planner_timing = MW.PLANNER_TIMING
     # Ticks where allocation was skipped because the unassigned x unassigned
     # submatrix was all zero (2.7 guard; applies to every method and PO and
     # non-PO runs alike).
@@ -619,7 +632,15 @@ def main_simulation(
     robot_max_id = len(robots) + 1
     task_max_id = len(tasks) + 1
 
+    run_wall_start = time.perf_counter()
+    run_timed_out = False
     for time_step in range(max_time_steps):
+        # Per-run wall-clock limit: stop early, flag the row, never drop it.
+        if time.perf_counter() - run_wall_start > RUN_WALL_LIMIT_S:
+            print(f"RUN WALL LIMIT ({RUN_WALL_LIMIT_S}s) hit at tick {time_step} - stopping early.")
+            run_timed_out = True
+            total_time_steps = time_step
+            break
         # update unnasigned robots and tasks
         unassigned_robots = [r.robot_id for r in robots if not r.assigned]
         unassigned_tasks = [t.task_id for t in tasks if not t.assigned]
@@ -631,6 +652,7 @@ def main_simulation(
             goal_positions, 1.0, total_reward, total_success,
             po_state=po, current_tick=time_step, pending_event_steps=pending_event_steps,
             obstacles=_obstacle_set,
+            collision_counters=collision_counters,
         )
         # Per-step throughput signal (used for mean + variance at end).
         completed_per_step.append(completed_this_step)
@@ -883,6 +905,12 @@ def main_simulation(
                     all_zero_skip_ticks += 1
                     if po is not None:
                         po.all_zero_skip_ticks += 1  # mirrored in the diag JSON
+
+            # top_k_out_ids is only populated on voting rounds; the
+            # replan-on-failure block reads it on ANY tick, so it must
+            # exist even when allocation was skipped this tick (all-zero
+            # guard) or the method is an optimizer.
+            top_k_out_ids = []
 
             # assign with voting
             if not po_all_zero and voting_method in voting_methods:
@@ -1292,15 +1320,24 @@ def main_simulation(
     if po is not None:
         po_metrics = po.finalize(tasks, tasks_ever_assigned)
         if po_diag_path:
-            po.dump_diagnostics(
-                po_diag_path,
-                scenario=scenario,
-                planner=planner,
-                mask_level=mask_level,
-                mask_policy=mask_policy,
-                method=func_name(voting_method),
-                plan_failure_log=plan_failure_log,
-            )
+                planner_calls = MW.PLANNER_TIMING["calls"]
+                planner_ns = MW.PLANNER_TIMING["ns"]
+                planner_agents = MW.PLANNER_TIMING["agents_sum"]
+                po.dump_diagnostics(
+                    po_diag_path,
+                    scenario=scenario,
+                    planner=planner,
+                    mask_level=mask_level,
+                    mask_policy=mask_policy,
+                    method=func_name(voting_method),
+                    plan_failure_log=plan_failure_log,
+                    collision_counters=dict(collision_counters),
+                    run_timed_out=run_timed_out,
+                    planner_calls=planner_calls,
+                    planner_total_ms=planner_ns / 1e6,
+                    planner_mean_ms_per_call=(planner_ns / 1e6 / planner_calls) if planner_calls else 0.0,
+                    planner_mean_agents_per_call=(planner_agents / planner_calls) if planner_calls else 0.0,
+                )
     else:
         po_metrics = {
             "mis_assignment_count": 0,
@@ -1382,6 +1419,12 @@ def main_simulation(
         never_attempted_count,
         all_zero_skip_ticks,
         stuck_assigned_robot_ticks,
+        # Section 15b-2 - collision handling diagnostics (Phase 3v2)
+        collision_counters["swap"],
+        collision_counters["nudge"],
+        collision_counters["violations"],
+        # Run-level wall-clock limit flag (1 = hit the limit, stopped early)
+        1 if run_timed_out else 0,
         # Section 15c - anytime pool diagnostics (2.8)
         threshold_fire_rate,
         mean_pool_size_at_rank,
@@ -1664,10 +1707,11 @@ if __name__ == "__main__":
     # Every run writes to a NEW directory - never an existing one.
     # Fresh dir => the resume scanner finds no completed rows => nothing
     # is skipped, every config re-runs (per agent instructions §0.4).
-    PO_OUTPUT_DIRNAME = "pilot_po_final_threshold_off"
-    # Ablation 3: coverage threshold off (zero-pair filter stays on).
+    PO_OUTPUT_DIRNAME = "pilot_po_P3_collision_v2"
+    # Phase 3v2: idle robots planned as stay-put agents; safety nets behind
+    # COLLISION_AVOIDANCE with counters; end-of-tick collision invariant.
     V.VOTING_ZERO_PAIR_FILTER = True
-    V.VOTING_COVERAGE_THRESHOLD = False
+    V.VOTING_COVERAGE_THRESHOLD = True
     from hvbta.partial_observability import PO_CONDITIONS, MASK_COUNTS
 
     # Report A collector (Phase 2 addition): record every positive balanced-
@@ -1806,6 +1850,10 @@ if __name__ == "__main__":
                 'Nav_Drop_Count', 'Nav_Drop_Wasted_Travel',
                 # PO baseline + invariant diagnostics
                 'Never_Attempted_Count', 'All_Zero_Skip_Ticks', 'Stuck_Assigned_Robot_Ticks',
+                # Collision handling diagnostics (Phase 3v2)
+                'Safety_Swap_Count', 'Safety_Nudge_Count', 'Collision_Violation_Count',
+                # Run wall-clock limit flag (1 = hit the limit, stopped early)
+                'Run_Timed_Out',
                 # Anytime pool diagnostics (2.8)
                 'Threshold_Fire_Rate', 'Mean_Pool_Size_At_Rank',
                 # Overhead
