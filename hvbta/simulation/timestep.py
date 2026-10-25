@@ -4,12 +4,12 @@ from hvbta.models import CapabilityProfile, TaskDescription
 from hvbta.allocators.misc_assignment import unassign_task_from_robot
 from hvbta.suitability import navigation_suitability
 
-# Master switch for the safety-net nudge (the idle-yield swap is GONE:
-# the two-phase timestep makes it unnecessary - all movement is
-# synchronous and jointly planned, so there is no sequential processing
-# window for a mover to step onto an idle robot). The nudge remains as
-# a counted last resort for edge cases; the target is zero fires.
-COLLISION_AVOIDANCE = True
+# The v6-era safety-nudge net is REMOVED (v9): with mover-mover
+# resolution + transitive waiting + the occupied-set race fixed, the
+# pilot shows zero nudge fires, zero planned conflicts, and zero
+# violations, so the net never fires and only masks invariant
+# breaches. The end-of-tick invariant check below stays as the hard
+# detector (Collision_Violation_Count).
 
 
 def simulate_time_step(
@@ -37,13 +37,15 @@ def simulate_time_step(
 
     Phase 1: compute every robot's next cell from its current path
              (robots without a path stay put).
-    Phase 1.5: transitive waiting. Robots without a usable path (newly
+    Phase 1.5a: mover-mover conflict resolution. Movers targeting the
+             same cell, or exchanging cells, are resolved deterministi-
+             cally: the lower robot ID keeps its move, the higher one
+             waits (Mover_Conflict_Waits).
+    Phase 1.5b: transitive waiting. Robots without a usable path (newly
              assigned after a failed replan, newly arrived, unassigned
              mid-route) stay put; any robot whose next cell is occupied
              by a staying robot also stays put, repeated to a fixed
-             point. Old paths are jointly conflict-free and stayers never
-             move, so no vertex or swap conflict can occur between the
-             survivors. Forced waits are counted in propagated_waits.
+             point. Forced waits are counted in propagated_waits.
     Phase 2: check the full next-position set for vertex conflicts (two
               robots in one cell) and swap conflicts (two robots exchanging
               cells). Jointly planned paths should produce none; any that
@@ -54,13 +56,16 @@ def simulate_time_step(
               onto it OR planning a wait there. A forced (propagated)
               wait consumes nothing: the robot retries the same step next
               tick.
+    Phase 3.5: deviation detection. Any off-plan wait or an assigned
+              robot that cannot follow any plan sets the plan_deviation
+              flag; the main loop replans at the top of the next tick,
+              before movement.
     Phase 4: apply status changes (task progress and completions, battery
               drain and deaths, reveals and mis-assignments). A robot that
               stops ends the tick at its current cell; the next tick's
               top-of-tick replan includes it before anyone moves. Work
               requires the robot to be physically AT the task location -
               path bookkeeping alone never teleports a robot onto a task.
-    Phase 5: safety nudge (last resort, should never fire).
 
     Returns:
         (tasks_completed, count, total_reward, total_success)
@@ -80,16 +85,59 @@ def simulate_time_step(
             next_positions[robot.robot_id] = robot.location
 
     # ================================================================
-    # Phase 1.5: transitive waiting (v7 stale-path safety). Seed: every
-    # robot that stays put this tick (no usable path, path exhausted, or
-    # a planned wait). Propagate: any robot whose next cell is occupied
-    # by a staying robot also stays put, to a fixed point. Survivors move
-    # on old paths that are jointly conflict-free, and stayers never
-    # move, so no mover-stayer vertex or swap conflict is possible.
+    # Phase 1.5a: mover-mover conflict resolution. Two MOVERS targeting
+    # the same cell, or two movers exchanging cells, cannot both
+    # proceed. Deterministic rule: the LOWER robot ID keeps its move;
+    # the higher one waits at its current cell (counted in
+    # mover_conflict_waits). Resolution runs BEFORE the transitive-wait
+    # fixed point because a resolved waiter becomes a stayer that can
+    # block further robots.
+    # ================================================================
+    loc_by_id = {r.robot_id: r.location for r in robots}
+    def _rid_key(rid):
+        # numeric robot id order (R12 > R2), falling back to the string
+        import re as _re
+        m = _re.match(r"R(\d+)$", rid)
+        return (int(m.group(1)) if m else 0, rid)
+    movers = [rid for rid in next_positions if next_positions[rid] != loc_by_id[rid]]
+    mover_waits = 0
+    # vertex: >1 movers targeting the same cell -> lowest id keeps moving
+    by_target = {}
+    for rid in movers:
+        by_target.setdefault(next_positions[rid], []).append(rid)
+    for cell in sorted(by_target):
+        rids = sorted(by_target[cell], key=_rid_key)
+        for rid in rids[1:]:
+            next_positions[rid] = loc_by_id[rid]
+            mover_waits += 1
+    # swap: two movers exchanging cells -> higher id waits (the lower
+    # one is then caught by the fixed point below if the waiter's cell
+    # blocks it, which correctly forces both to hold this tick)
+    movers = [rid for rid in next_positions if next_positions[rid] != loc_by_id[rid]]
+    movers.sort(key=_rid_key)
+    for i in range(len(movers)):
+        for j in range(i + 1, len(movers)):
+            a, b = movers[i], movers[j]
+            if (next_positions[a] == loc_by_id[b]
+                    and next_positions[b] == loc_by_id[a]):
+                loser = b  # higher _rid_key of the pair
+                next_positions[loser] = loc_by_id[loser]
+                mover_waits += 1
+    if collision_counters is not None and mover_waits:
+        collision_counters["mover_conflict_waits"] = (
+            collision_counters.get("mover_conflict_waits", 0) + mover_waits)
+
+    # ================================================================
+    # Phase 1.5b: transitive waiting (v7 stale-path safety). Seed: every
+    # robot that stays put this tick (no usable path, path exhausted, a
+    # planned wait, or a mover-conflict resolution above). Propagate:
+    # any robot whose next cell is occupied by a staying robot also
+    # stays put, to a fixed point. Survivors move on old paths that are
+    # jointly conflict-free, and stayers never move, so no
+    # mover-stayer vertex or swap conflict is possible.
     # Forced waits (a robot that intended to move but must hold) are
     # counted in propagated_waits.
     # ================================================================
-    loc_by_id = {r.robot_id: r.location for r in robots}
     staying = set()
     for rid, pos in next_positions.items():
         if pos == loc_by_id[rid]:
@@ -156,13 +204,20 @@ def simulate_time_step(
     # (forced) wait consumes NOTHING - the robot retries the same step
     # next tick, so its path always starts at its physical location.
     # ================================================================
+    # The occupied-set update is TWO-PASS (discard every vacated cell,
+    # then add every entered cell): updating per-robot inside the loop
+    # loses a cell whenever a robot enters a cell another robot is
+    # vacating in the same synchronous move (the later robot's discard
+    # deletes the earlier robot's fresh entry). The set would decay
+    # over the run and arrival nudges would place new robots onto
+    # occupied cells.
+    vacated = [robot.location for robot in robots]
+    entered = [next_positions[robot.robot_id] for robot in robots]
     for robot in robots:
         rid = robot.robot_id
         next_pos = next_positions[rid]
         if next_pos != robot.location:
-            occupied_locations.discard(robot.location)
             robot.location = next_pos
-            occupied_locations.add(next_pos)
             if robot.assigned:
                 start_positions[rid] = next_pos
             if po_state is not None and robot.assigned:
@@ -171,6 +226,27 @@ def simulate_time_step(
                 and robot.current_path[1] == next_pos):
             robot.current_path.pop(0)
             robot.remaining_distance = max(0, len(robot.current_path) - 1)
+    for cell in vacated:
+        occupied_locations.discard(cell)
+    for cell in entered:
+        occupied_locations.add(cell)
+
+    # ================================================================
+    # Phase 3.5: deviation detection (v8 replan-on-deviation). Any
+    # off-plan wait (a forced propagated wait, a mover-conflict
+    # resolution) or an assigned robot that cannot follow any plan
+    # (pathless and not at its task) marks the plan STALE. The main
+    # loop reads this flag after the timestep and triggers a planner
+    # call at the top of the next tick, before movement.
+    # ================================================================
+    deviation = (forced_waits > 0) or (mover_waits > 0)
+    for robot in robots:
+        if (robot.assigned and robot.current_task is not None
+                and (not robot.current_path or len(robot.current_path) <= 1)
+                and tuple(robot.location) != tuple(robot.current_task.location)):
+            deviation = True
+    if collision_counters is not None:
+        collision_counters["plan_deviation"] = 1 if deviation else 0
 
     # ================================================================
     # Phase 4: apply status changes. All robots have already moved; this
@@ -304,38 +380,9 @@ def simulate_time_step(
             continue
 
     # ================================================================
-    # Phase 5: safety nudge (last resort; should never fire with the
-    # two-phase timestep + idle agents in the plan). A PATHLESS robot
-    # that ended the tick sharing a cell is nudged to a free neighbor.
-    # ================================================================
-    if obstacles is not None and COLLISION_AVOIDANCE:
-        by_loc = {}
-        for r in robots:
-            by_loc.setdefault(r.location, []).append(r)
-        for loc, group in by_loc.items():
-            if len(group) < 2:
-                continue
-            rr, cc = loc
-            for occupant in group:
-                if occupant.assigned or (occupant.current_path and len(occupant.current_path) > 1):
-                    continue  # only nudge PARKED robots
-                for cand in ((rr - 1, cc), (rr + 1, cc), (rr, cc - 1), (rr, cc + 1)):
-                    if cand in obstacles or cand in occupied_locations:
-                        continue
-                    if any(other.location == cand for other in group if other is not occupant):
-                        continue
-                    occupied_locations.discard(occupant.location)
-                    occupant.location = cand
-                    occupied_locations.add(cand)
-                    if collision_counters is not None:
-                        collision_counters["nudge"] += 1
-                    break
-
-    # ================================================================
     # End-of-tick invariant: no two robots share a cell and no two
-    # robots swapped cells this tick (MAPF validity). Counted every tick
-    # regardless of the safety-net switch; violations are bugs or
-    # stale-path conflicts the nets could not repair.
+    # robots swapped cells this tick (MAPF validity). Counted every
+    # tick; any violation is an unpatched collision bug.
     # ================================================================
     end_locs = {r.robot_id: r.location for r in robots}
     by_end = {}

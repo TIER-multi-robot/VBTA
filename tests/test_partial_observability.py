@@ -291,9 +291,9 @@ def test_hard_fail_uses_true_attributes_at_arrival():
 ORDER_A = ["borda", "cumulative", "murtys"]
 ORDER_B = ["murtys", "borda", "cumulative"]
 # Wall-clock timing columns in the driver's output (c0 = first tuple value):
-# c1 = total_reassignment_time, c52 (last) = Execution Time.
-# (v7: Propagated_Wait_Count inserted before Run_Timed_Out shifts the tail.)
-TIMING_COLS = {"c1", "c52"}
+# c1 = total_reassignment_time, c53 (last) = Execution Time.
+# (v8: Mover_Conflict_Waits inserted after Propagated_Wait_Count.)
+TIMING_COLS = {"c1", "c53"}
 
 
 def _run_driver(order, out_path):
@@ -555,11 +555,91 @@ def test_collision_violation_counted():
     a.assigned = b.assigned = False
     a.current_task = b.current_task = None
     counters = {"planned_conflicts": 0, "nudge": 0, "violations": 0}
-    # two idle robots co-located, no obstacles passed -> nudge net inactive,
-    # the invariant check still counts the shared cell
+    # two idle robots co-located; with the nudge net removed (v9) the
+    # invariant check still counts the shared cell
     simulate_time_step([a, b], [], [], [], None, set(), {}, {},
                        collision_counters=counters)
     assert counters["violations"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# v8/v9 collision-resolution hard assertions
+# ---------------------------------------------------------------------------
+def test_mover_mover_vertex_resolved():
+    """Two movers targeting the same cell: the lower robot ID keeps its
+    move, the higher one waits, and the wait is counted in
+    mover_conflict_waits with the deviation flag set."""
+    from hvbta.simulation.timestep import simulate_time_step
+    a = _fake_robot("R1", (0, 0))
+    b = _fake_robot("R2", (2, 0))
+    a.current_path = [(0, 0), (1, 0)]
+    b.current_path = [(2, 0), (1, 0)]
+    counters = {"planned_conflicts": 0, "nudge": 0, "violations": 0}
+    simulate_time_step([a, b], [], [], [], None, {(0, 0), (2, 0)}, {}, {},
+                       collision_counters=counters)
+    assert a.location == (1, 0) and b.location == (2, 0)  # lower ID moved
+    assert counters.get("mover_conflict_waits", 0) == 1
+    assert counters["planned_conflicts"] == 0 and counters["violations"] == 0
+    assert counters.get("plan_deviation") == 1
+
+
+def test_mover_mover_swap_resolved():
+    """Two movers exchanging cells: higher ID waits, and the fixed point
+    forces the lower one to hold too - no swap, no violation."""
+    from hvbta.simulation.timestep import simulate_time_step
+    a = _fake_robot("R5", (5, 5))
+    b = _fake_robot("R6", (5, 6))
+    a.current_path = [(5, 5), (5, 6)]
+    b.current_path = [(5, 6), (5, 5)]
+    counters = {"planned_conflicts": 0, "nudge": 0, "violations": 0}
+    simulate_time_step([a, b], [], [], [], None, {(5, 5), (5, 6)}, {}, {},
+                       collision_counters=counters)
+    assert a.location == (5, 5) and b.location == (5, 6)  # both hold
+    assert counters.get("mover_conflict_waits", 0) == 1
+    assert counters.get("propagated_waits", 0) == 1
+    assert counters["planned_conflicts"] == 0 and counters["violations"] == 0
+
+
+def test_occupied_set_survives_follow_move():
+    """v9 occupied-set race: a robot entering a cell vacated in the same
+    synchronous move must not lose its cell from the occupied set."""
+    from hvbta.simulation.timestep import simulate_time_step
+    a = _fake_robot("R1", (0, 0))
+    b = _fake_robot("R2", (1, 0))
+    # R1 (earlier in list) enters R2's cell while R2 vacates it
+    a.current_path = [(0, 0), (1, 0)]
+    b.current_path = [(1, 0), (2, 0)]
+    occ = {(0, 0), (1, 0)}
+    counters = {"planned_conflicts": 0, "nudge": 0, "violations": 0}
+    simulate_time_step([a, b], [], [], [], None, occ, {}, {},
+                       collision_counters=counters)
+    assert a.location == (1, 0)   # followed into the vacated cell
+    assert b.location == (2, 0)
+    assert (1, 0) in occ and (2, 0) in occ and (0, 0) not in occ
+    assert counters["violations"] == 0
+
+
+def test_no_conflict_no_violation_no_nudge_across_joint_plan():
+    """v9 hard assertion: a jointly-planned fleet moving on conflict-free
+    paths produces ZERO planned conflicts, ZERO violations, ZERO
+    propagated/mover waits, and no deviation flag."""
+    from hvbta.simulation.timestep import simulate_time_step
+    robots, paths, starts = [], [], [(0, 0), (5, 5), (9, 9), (0, 9)]
+    for i, s in enumerate(starts):
+        r = _fake_robot(f"R{i+1}", s)
+        r.current_path = [s, (s[0] + 1, s[1])]  # each moves right, disjoint
+        r.current_task.location = (s[0] + 1, s[1])  # task at the path end
+        robots.append(r)
+    occ = set(starts)
+    counters = {"planned_conflicts": 0, "nudge": 0, "violations": 0}
+    simulate_time_step(robots, [], [], [], None, occ, {}, {},
+                       collision_counters=counters)
+    assert counters["planned_conflicts"] == 0
+    assert counters["violations"] == 0
+    assert counters["nudge"] == 0
+    assert counters.get("mover_conflict_waits", 0) == 0
+    assert counters.get("propagated_waits", 0) == 0
+    assert counters.get("plan_deviation") == 0
 
 
 # ---------------------------------------------------------------------------
