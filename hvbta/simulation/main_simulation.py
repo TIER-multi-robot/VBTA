@@ -512,7 +512,8 @@ def main_simulation(
     stuck_assigned_robot_ticks = 0
     # Phase 3v2 collision accounting: safety-net fires (swap/nudge) and
     # end-of-tick invariant violations, counted by the timestep.
-    collision_counters = {"swap": 0, "nudge": 0, "violations": 0, "planned_conflicts": 0}
+    collision_counters = {"swap": 0, "nudge": 0, "violations": 0, "planned_conflicts": 0,
+                          "propagated_waits": 0}
     # Phase 3 cascade diagnostics: one entry per failed planner call,
     # {tick, kind, ...} (kind = duplicate_start / duplicate_goal /
     # lacam_no_solution / lacam_timeout / engine_unsolved). Goes into the
@@ -623,7 +624,16 @@ def main_simulation(
         # true-vs-masked suitability metrics.
         po.note_round(robots, HYPOTENUSE)
 
-    avg_path_length, _ = run_planner(planner, robots, start_positions, goal_positions, map_dict)
+    avg_path_length, _initial_planner_okay = run_planner(planner, robots, start_positions, goal_positions, map_dict)
+    # The initial call's outcome was previously ignored entirely - a
+    # failure left every robot pathless but invisible to
+    # Plan_Failure_Count, contaminating "runs with no planner failure"
+    # analyses. Count it like any other failed call.
+    if not _initial_planner_okay:
+        plan_failure_count += 1
+        _entry = {"tick": 0, "phase": "initial"}
+        _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
+        plan_failure_log.append(_entry)
 
     # create the initial state
     previous_active, previous_goals, previous_unassigned_robots, previous_unassigned_tasks = state_check(robots, unassigned_robots, unassigned_tasks)
@@ -1447,6 +1457,7 @@ def main_simulation(
         collision_counters["planned_conflicts"],
         collision_counters["nudge"],
         collision_counters["violations"],
+        collision_counters.get("propagated_waits", 0),
         # Run-level wall-clock limit flag (1 = hit the limit, stopped early)
         1 if run_timed_out else 0,
         # Section 15c - anytime pool diagnostics (2.8)
@@ -1731,7 +1742,7 @@ if __name__ == "__main__":
     # Every run writes to a NEW directory - never an existing one.
     # Fresh dir => the resume scanner finds no completed rows => nothing
     # is skipped, every config re-runs (per agent instructions §0.4).
-    PO_OUTPUT_DIRNAME = "pilot_po_P3_collision_v5"
+    PO_OUTPUT_DIRNAME = "pilot_po_P3_collision_v7"
     # Phase 3v3: idle agents + step-aside goals + 1s planner budget +
     # 10-min run limit. The v2 dir holds the interrupted 18-hour partial.
     V.VOTING_ZERO_PAIR_FILTER = True
@@ -1876,6 +1887,7 @@ if __name__ == "__main__":
                 'Never_Attempted_Count', 'All_Zero_Skip_Ticks', 'Stuck_Assigned_Robot_Ticks',
                 # Collision handling diagnostics (Phase 3v6: two-phase timestep)
                 'Planned_Conflict_Count', 'Safety_Nudge_Count', 'Collision_Violation_Count',
+                'Propagated_Wait_Count',
                 # Run wall-clock limit flag (1 = hit the limit, stopped early)
                 'Run_Timed_Out',
                 # Anytime pool diagnostics (2.8)

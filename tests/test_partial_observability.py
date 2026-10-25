@@ -291,8 +291,9 @@ def test_hard_fail_uses_true_attributes_at_arrival():
 ORDER_A = ["borda", "cumulative", "murtys"]
 ORDER_B = ["murtys", "borda", "cumulative"]
 # Wall-clock timing columns in the driver's output (c0 = first tuple value):
-# c1 = total_reassignment_time, c51 (last) = Execution Time.
-TIMING_COLS = {"c1", "c51"}
+# c1 = total_reassignment_time, c52 (last) = Execution Time.
+# (v7: Propagated_Wait_Count inserted before Run_Timed_Out shifts the tail.)
+TIMING_COLS = {"c1", "c52"}
 
 
 def _run_driver(order, out_path):

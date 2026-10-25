@@ -31,22 +31,35 @@ def simulate_time_step(
     collision_counters: dict = None
 ) -> Tuple[int, int, float, int]:
     """
-    TWO-PHASE synchronous timestep. Movement and status changes are strictly
-    separated so no robot's mid-timestep state change can affect another
-    robot's movement within the same tick.
+    TWO-PHASE synchronous timestep with transitive waiting. Movement and
+    status changes are strictly separated so no robot's mid-timestep state
+    change can affect another robot's movement within the same tick.
 
     Phase 1: compute every robot's next cell from its current path
              (robots without a path stay put).
+    Phase 1.5: transitive waiting. Robots without a usable path (newly
+             assigned after a failed replan, newly arrived, unassigned
+             mid-route) stay put; any robot whose next cell is occupied
+             by a staying robot also stays put, repeated to a fixed
+             point. Old paths are jointly conflict-free and stayers never
+             move, so no vertex or swap conflict can occur between the
+             survivors. Forced waits are counted in propagated_waits.
     Phase 2: check the full next-position set for vertex conflicts (two
-             robots in one cell) and swap conflicts (two robots exchanging
-             cells). Jointly planned paths should produce none; any that
-             appear are from stale paths and are logged in detail, counted
-             in Planned_Conflict_Count - NOT patched.
-    Phase 3: move every robot at once.
+              robots in one cell) and swap conflicts (two robots exchanging
+              cells). Jointly planned paths should produce none; any that
+              appear are from stale paths and are logged in detail, counted
+              in Planned_Conflict_Count - NOT patched.
+    Phase 3: move every robot at once. A robot consumes a step of its
+              path when it ENDS the tick on the step's cell - moving
+              onto it OR planning a wait there. A forced (propagated)
+              wait consumes nothing: the robot retries the same step next
+              tick.
     Phase 4: apply status changes (task progress and completions, battery
-             drain and deaths, reveals and mis-assignments). A robot that
-             stops ends the tick at its current cell; the next tick's
-             top-of-tick replan includes it before anyone moves.
+              drain and deaths, reveals and mis-assignments). A robot that
+              stops ends the tick at its current cell; the next tick's
+              top-of-tick replan includes it before anyone moves. Work
+              requires the robot to be physically AT the task location -
+              path bookkeeping alone never teleports a robot onto a task.
     Phase 5: safety nudge (last resort, should never fire).
 
     Returns:
@@ -65,6 +78,41 @@ def simulate_time_step(
             next_positions[robot.robot_id] = robot.current_path[1]
         else:
             next_positions[robot.robot_id] = robot.location
+
+    # ================================================================
+    # Phase 1.5: transitive waiting (v7 stale-path safety). Seed: every
+    # robot that stays put this tick (no usable path, path exhausted, or
+    # a planned wait). Propagate: any robot whose next cell is occupied
+    # by a staying robot also stays put, to a fixed point. Survivors move
+    # on old paths that are jointly conflict-free, and stayers never
+    # move, so no mover-stayer vertex or swap conflict is possible.
+    # Forced waits (a robot that intended to move but must hold) are
+    # counted in propagated_waits.
+    # ================================================================
+    loc_by_id = {r.robot_id: r.location for r in robots}
+    staying = set()
+    for rid, pos in next_positions.items():
+        if pos == loc_by_id[rid]:
+            staying.add(rid)
+    stay_cells = {loc_by_id[rid] for rid in staying}
+    changed = True
+    while changed:
+        changed = False
+        for rid, pos in next_positions.items():
+            if rid in staying:
+                continue
+            if pos in stay_cells:
+                staying.add(rid)
+                stay_cells.add(loc_by_id[rid])
+                changed = True
+    forced_waits = 0
+    for rid in staying:
+        if next_positions[rid] != loc_by_id[rid]:
+            next_positions[rid] = loc_by_id[rid]
+            forced_waits += 1
+    if collision_counters is not None and forced_waits:
+        collision_counters["propagated_waits"] = (
+            collision_counters.get("propagated_waits", 0) + forced_waits)
 
     # ================================================================
     # Phase 2: check the full next-position set for vertex and swap
@@ -102,7 +150,11 @@ def simulate_time_step(
                 print(f"  PLANNED CONFLICT {pc}")
 
     # ================================================================
-    # Phase 3: move every robot at once.
+    # Phase 3: move every robot at once. A path step is consumed when the
+    # robot ends the tick on that step's cell: moving onto it OR the step
+    # being a planned wait (path[1] == own location). A propagated
+    # (forced) wait consumes NOTHING - the robot retries the same step
+    # next tick, so its path always starts at its physical location.
     # ================================================================
     for robot in robots:
         rid = robot.robot_id
@@ -113,12 +165,12 @@ def simulate_time_step(
             occupied_locations.add(next_pos)
             if robot.assigned:
                 start_positions[rid] = next_pos
-            robot.current_path.pop(0)
-            robot.remaining_distance = max(0, len(robot.current_path) - 1)
-            if robot.remaining_distance <= 1:
-                robot.remaining_distance = 0
             if po_state is not None and robot.assigned:
                 po_state.on_move(robot)
+        if (robot.current_path and len(robot.current_path) > 1
+                and robot.current_path[1] == next_pos):
+            robot.current_path.pop(0)
+            robot.remaining_distance = max(0, len(robot.current_path) - 1)
 
     # ================================================================
     # Phase 4: apply status changes. All robots have already moved; this
@@ -136,8 +188,11 @@ def simulate_time_step(
 
         task = robot.current_task
 
-        # at task location -> work on it
-        if robot.remaining_distance != 0:
+        # at task location -> work on it. The gate is the robot's
+        # PHYSICAL location, never path bookkeeping: a pathless robot
+        # (newly assigned after a failed replan) has remaining_distance 0
+        # and must NOT teleport onto the task.
+        if tuple(robot.location) != tuple(task.location):
             continue
 
         # PO arrival hook: reveal the task's mask (once) and run

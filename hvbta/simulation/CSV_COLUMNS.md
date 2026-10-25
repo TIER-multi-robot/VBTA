@@ -3,8 +3,8 @@
 Every row in a simulation-results CSV corresponds to a single
 `(map, num_robots, num_tasks, num_candidates, suitability_method, planner,
 scenario, rep, method, mask_condition)` run. This document describes the
-71-column CSV that `main_simulation.py` produces (51 legacy + 20
-partial-observability/pool-diagnostic columns).
+76-column CSV that `main_simulation.py` produces (v7: 51 legacy + 20
+partial-observability/pool-diagnostic columns + 5 collision/limit columns).
 
 For each metric we note: **what it measures**, **whether high or low is
 better**, and **what claim it backs** (see `CLAIMS_AND_EVIDENCE.md`).
@@ -19,10 +19,10 @@ The row is assembled as:
 | Component | Items | Source |
 |---|---|---|
 | `row_prefix` | 14 | `_record_assignment` (13 items: identity + initial quality + initial fairness) with `Planner` injected at position 4 |
-| `output_tuple` | 48 | `benchmark_simulation` = `main_simulation` return (47) + `execution_time` (1) |
+| `output_tuple` | 53 | `benchmark_simulation` = `main_simulation` return (52: 48 pre-collision + 4 collision/limit incl. `Propagated_Wait_Count`) + `execution_time` (1) |
 | `config_suffix` | 8 | Scenario + 4 raw rates + 3 PO config columns, appended at the writer callsite |
 | `map_size` | 1 | Appended at the writer callsite |
-| **Total** | **71** | |
+| **Total** | **76** | |
 
 ---
 
@@ -219,6 +219,20 @@ the per-run JSON in `<results_dir>/po_diagnostics/`, not this CSV.
 | 57 | `Never_Attempted_Count` | Tasks spawned but never assigned to any robot, regardless of masking | **Lower** = better | Capacity baseline: `Masked_Starvation_Count` must be read against this (even at `Mask_Level=none` some tasks are never attempted when the fleet is saturated) |
 | 58 | `All_Zero_Skip_Ticks` | Ticks where allocation was skipped because the unassigned × unassigned (masked) submatrix was all zero | Contextual | The no-bounce guard: no random fallback, no zero-suitability pairs executed; infeasible-for-all tasks starve instead |
 | 59 | `Stuck_Assigned_Robot_Ticks` | Ticks (after a SUCCESSFUL plan call) where some robot had an assigned task but an EMPTY `current_path` (can neither move nor work) | **Must be 0** | Invariant per spec §1c. Ticks following planner FAILURES are excluded: the documented accept-stale-paths behavior legitimately leaves newly-assigned robots pathless until the next successful plan (verified: no stuck robot survives a successful plan call) |
+
+## 12c-2. Collision handling diagnostics (v7, 4 columns)
+
+Emitted by the two-phase timestep (`timestep.py`); counts are per-run totals.
+Column numbers below are the v7 CSV positions; sections 12d/13 shift accordingly
+(the doc pre-dates the collision block, which was added in v6 without a
+renumbering pass).
+
+| # | Column | What it measures | Direction | Notes |
+|---|---|---|---|---|
+| 60 | `Planned_Conflict_Count` | Vertex + swap conflicts in the tick's intended next-position set (after transitive waiting) | **Must be ~0** | With jointly planned paths this is 0; a nonzero value marks a mixed-vintage plan bug |
+| 61 | `Safety_Nudge_Count` | Safety-net fires: a parked robot sharing a cell was nudged to a free neighbor | **Must be 0** | Last resort; each fire also leaves `occupied_locations` stale |
+| 62 | `Collision_Violation_Count` | End-of-tick invariant breaches (co-located robots or same-tick swaps) | **Must be 0** | A violation means the nets failed to prevent physical overlap |
+| 63 | `Propagated_Wait_Count` | Forced waits from transitive waiting: robots whose planned next step was blocked by a staying robot (no usable path / mid-route unassign / newly arrived), so they held position | Contextual | The cost of the stale-path design: robots that wait instead of colliding. 0 in runs with no planner failures and no mid-route stops |
 
 ## 12d. Anytime pool diagnostics (2 columns)
 
