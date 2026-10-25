@@ -686,6 +686,20 @@ def main_simulation(
                 print(f"ADDING NEW ROBOTS AT TIME STEP {time_step + 1} (scheduled)")
                 for new_r in entry["add_robots"]:
                     r_copy = copy.deepcopy(new_r)
+                    # The schedule picked this location at build time (using
+                    # the INITIAL robot positions). By replay time robots have
+                    # moved, so the cell may be occupied. Nudge the arrival
+                    # to the nearest free cell to avoid spawning on top of a
+                    # standing robot (the duplicate-start trigger).
+                    if r_copy.location in occupied_positions:
+                        _dims = map_dict.get("dimension", (0, 0))
+                        _free = MW._nearest_free_cell(
+                            r_copy.location, _obstacle_set, occupied_positions,
+                            _dims[0], _dims[1])
+                        if _free is not None:
+                            print(f"  [arrival] {r_copy.robot_id} nudged from "
+                                  f"{r_copy.location} (occupied) to {_free}")
+                            r_copy.location = _free
                     robots.append(r_copy)
                     unassigned_robots.append(r_copy.robot_id)
                     occupied_positions.add(r_copy.location)
@@ -1716,7 +1730,7 @@ if __name__ == "__main__":
     # Every run writes to a NEW directory - never an existing one.
     # Fresh dir => the resume scanner finds no completed rows => nothing
     # is skipped, every config re-runs (per agent instructions §0.4).
-    PO_OUTPUT_DIRNAME = "pilot_po_P3_collision_v3"
+    PO_OUTPUT_DIRNAME = "pilot_po_P3_collision_v4"
     # Phase 3v3: idle agents + step-aside goals + 1s planner budget +
     # 10-min run limit. The v2 dir holds the interrupted 18-hour partial.
     V.VOTING_ZERO_PAIR_FILTER = True
