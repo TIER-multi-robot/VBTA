@@ -116,3 +116,54 @@ task at all, the pair scores 0 - the robot can never reach it, so the
 pair is treated as infeasible for allocation (the same effect as a
 hard-fail). At execution time this case cannot arise: the feasibility
 check runs when the robot is standing on the task (distance 0).
+
+### 2026-10-25: execution-layer collision safety (tick order through replan on deviation)
+
+This amendment records every execution-layer change since the plan was
+written, so the provenance of all post-v9 sweep data is explicit. None of
+these changes alter allocation objectives, event schedules, seeds, or
+metrics; they fix physical-collision correctness in the simulator.
+
+1. **Tick order**: dynamic events, then replan, then the MAPF planner call,
+   then movement - movement is always last, on a plan that already accounts
+   for this tick's events.
+2. **Idle agents**: every unassigned robot joins every planner call as a
+   stay-put agent (never a hard obstacle); LaCAM may displace them.
+3. **Step-aside goals**: an idle agent standing on a mover's goal cell gets
+   a nearest-free-cell goal searched over the whole reachable map.
+4. **Two-phase synchronous movement**: all next cells are computed before
+   anyone moves; vertex/swap conflicts in the intended set are counted
+   (Planned_Conflict_Count) as an invariant detector, not patched.
+5. **Transitive waiting (v7)**: robots without a usable path stay put; any
+   robot whose next cell is occupied by a staying robot also stays put
+   (fixed point). Forced waits are counted in Propagated_Wait_Count.
+6. **Three movement bugs fixed (v7)**: (a) planned waits were never
+   consumed, freezing robots mid-route and desynchronizing the joint plan;
+   (b) a remaining_distance force-zero made robots work tasks one cell
+   early and teleport onto task cells without updating the occupied set;
+   (c) pathless reassigned robots (remaining_distance 0 after unassign)
+   passed the work gate and teleported onto new tasks after failed replans.
+   Work now requires the robot to be physically at the task location.
+7. **Mover-mover resolution + replan on deviation (v8/v9)**: two movers
+   targeting one cell, or exchanging cells, are resolved deterministically
+   (lower robot ID keeps its move; Mover_Conflict_Waits counts the other).
+   Any off-plan wait or plan-less assigned robot sets a deviation flag
+   that forces a planner call at the top of the next tick, before movement.
+8. **Occupied-set race fixed (v9)**: the occupied-cell set is updated
+   two-pass (discard all vacated, then add all entered) so a robot
+   entering a cell vacated in the same synchronous move no longer loses
+   it; the set previously decayed over a run and arrival nudges placed
+   new robots onto occupied cells.
+9. **Safety nudge removed (v9)**: after the fixes above, the pilot shows
+   0 planned conflicts, 0 nudges, 0 violations, and 0 plan failures over
+   1680 runs; the last-resort nudge never fired and was masking-only.
+   The end-of-tick MAPF-validity check remains as a hard invariant
+   (Collision_Violation_Count must be 0 in every sweep used for analysis).
+
+CSV: two columns were added for these mechanisms
+(Propagated_Wait_Count, Mover_Conflict_Waits; see CSV_COLUMNS.md 12c-2).
+All result directories at pilot_po_P3_collision_v6 and earlier predate
+these fixes and must not be used for collision-sensitive analysis; the
+final ablation arms (pilot_po_P3_collision_v9 = zero_pair on,
+pilot_po_final_v9_zero_pair_off, pilot_po_final_v9_threshold_off) are the
+first fully clean data.
