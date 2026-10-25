@@ -4,9 +4,11 @@ from hvbta.models import CapabilityProfile, TaskDescription
 from hvbta.allocators.misc_assignment import unassign_task_from_robot
 from hvbta.suitability import navigation_suitability
 
-# Master switch for the Phase 3 anti-collision fixes (idle-robot yield
-# swap + post-tick reconciliation). Exists so the pre-fix behavior can be
-# reproduced for measurement/ablation; leave True.
+# Master switch for the safety-net nudge (the idle-yield swap is GONE:
+# the two-phase timestep makes it unnecessary - all movement is
+# synchronous and jointly planned, so there is no sequential processing
+# window for a mover to step onto an idle robot). The nudge remains as
+# a counted last resort for edge cases; the target is zero fires.
 COLLISION_AVOIDANCE = True
 
 
@@ -25,219 +27,232 @@ def simulate_time_step(
     po_state=None,
     current_tick: int = None,
     pending_event_steps: List[int] = None,
-    obstacles: frozenset = None
+    obstacles: frozenset = None,
+    collision_counters: dict = None
 ) -> Tuple[int, int, float, int]:
     """
-    Simulates a single time step, updating robot positions, task progress, and handling failures.
+    TWO-PHASE synchronous timestep. Movement and status changes are strictly
+    separated so no robot's mid-timestep state change can affect another
+    robot's movement within the same tick.
 
-    Parameters:
-        robots: List of all robots.
-        tasks: List of all tasks.
-        time_step: The time increment for the simulation step.
-        total_reward: Accumulated reward from successfully completed tasks.
-        po_state: Optional PartialObservabilityState (partial-observability
-            experiment). When provided, robot arrivals reveal task masks and
-            run the execution-time feasibility check; mis-assignments free
-            the robot and raise a replan event. Default None = no-op.
-        current_tick: Current loop timestep (only used by po_state for
-            event bookkeeping).
-        pending_event_steps: The main loop's pending-event FIFO (only used
-            by po_state to raise replan events on mis-assignment).
-        obstacles: Optional set of blocked cells. When provided, a
-            post-movement reconciliation nudges any pathless robot that
-            ended the tick sharing a cell with another robot into a free
-            neighboring cell (see the reconciliation block below).
+    Phase 1: compute every robot's next cell from its current path
+             (robots without a path stay put).
+    Phase 2: check the full next-position set for vertex conflicts (two
+             robots in one cell) and swap conflicts (two robots exchanging
+             cells). Jointly planned paths should produce none; any that
+             appear are from stale paths and are logged in detail, counted
+             in Planned_Conflict_Count - NOT patched.
+    Phase 3: move every robot at once.
+    Phase 4: apply status changes (task progress and completions, battery
+             drain and deaths, reveals and mis-assignments). A robot that
+             stops ends the tick at its current cell; the next tick's
+             top-of-tick replan includes it before anyone moves.
+    Phase 5: safety nudge (last resort, should never fire).
 
     Returns:
-        (tasks_completed, count, total_reward, total_success): A count of unassigned robots and the updated total reward.
+        (tasks_completed, count, total_reward, total_success)
     """
     unassigned_count = 0
     tasks_completed = 0
+    _start_locs = {r.robot_id: r.location for r in robots}
 
+    # ================================================================
+    # Phase 1: compute every robot's next cell from its current path.
+    # ================================================================
+    next_positions = {}
     for robot in robots:
-        if robot.assigned and robot.current_task and robot.current_path:
-            task = robot.current_task
+        if robot.current_path and len(robot.current_path) > 1:
+            next_positions[robot.robot_id] = robot.current_path[1]
+        else:
+            next_positions[robot.robot_id] = robot.location
 
-            # walk one step along the precomputed path (built by CBS upstream)
-            if robot.current_path and len(robot.current_path) > 1:
-                next_position = robot.current_path[1]
-                # Idle-robot yield: the planner treats unassigned robots as
-                # non-blocking (they are neither movers nor stationary
-                # blockers in _prepare_agents), so a mover's path may route
-                # straight through an idle robot's cell. Idle robots have no
-                # path and never move on their own, so without this the
-                # mover steps onto them, and once the co-located idle robot
-                # is later assigned, start_positions contains two robots on
-                # one cell - the duplicate-start cascade trigger. Fix: the
-                # idle robot yields into the cell the mover is vacating
-                # (the mover is by definition adjacent). A swap leaves the
-                # occupied_locations set unchanged.
-                idle_hit = next(
-                    (r for r in robots
-                     if r is not robot and not r.assigned
-                     and r.location == next_position), None) if COLLISION_AVOIDANCE else None
-                if idle_hit is not None:
-                    # swap cells: the vacated cell stays occupied (by the
-                    # idle robot), the target cell stays occupied (by us)
-                    idle_hit.location = robot.location
-                else:
-                    occupied_locations.discard(robot.location)
-                robot.location = next_position
-                start_positions[robot.robot_id] = next_position
-                occupied_locations.add(next_position)
-                robot.current_path.pop(0)
-                robot.remaining_distance = max(0, len(robot.current_path) - 1)
-                if po_state is not None:
-                    po_state.on_move(robot)
+    # ================================================================
+    # Phase 2: check the full next-position set for vertex and swap
+    # conflicts. Jointly planned paths should produce none. Any that
+    # appear are logged in detail (NOT patched) and counted.
+    # ================================================================
+    if collision_counters is not None:
+        planned = []
+        # vertex conflicts: two robots moving to (or staying in) the same cell
+        by_next = {}
+        for rid, pos in next_positions.items():
+            by_next.setdefault(pos, []).append(rid)
+        for pos, rids in sorted(by_next.items()):
+            if len(rids) > 1:
+                planned.append({
+                    "type": "vertex", "cell": pos, "robots": sorted(rids),
+                    "tick": current_tick,
+                })
+        # swap conflicts: A at X → Y while B at Y → X
+        ids = sorted(next_positions)
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = ids[i], ids[j]
+                if (next_positions[a] == _start_locs.get(b)
+                        and next_positions[b] == _start_locs.get(a)
+                        and next_positions[a] != next_positions[b]):
+                    planned.append({
+                        "type": "swap", "robots": [a, b],
+                        "cells": [next_positions[a], next_positions[b]],
+                        "tick": current_tick,
+                    })
+        if planned:
+            collision_counters["planned_conflicts"] += len(planned)
+            for pc in planned:
+                print(f"  PLANNED CONFLICT {pc}")
 
-                if robot.remaining_distance <= 1:
-                    robot.remaining_distance = 0
+    # ================================================================
+    # Phase 3: move every robot at once.
+    # ================================================================
+    for robot in robots:
+        rid = robot.robot_id
+        next_pos = next_positions[rid]
+        if next_pos != robot.location:
+            occupied_locations.discard(robot.location)
+            robot.location = next_pos
+            occupied_locations.add(next_pos)
+            if robot.assigned:
+                start_positions[rid] = next_pos
+            robot.current_path.pop(0)
+            robot.remaining_distance = max(0, len(robot.current_path) - 1)
+            if robot.remaining_distance <= 1:
+                robot.remaining_distance = 0
+            if po_state is not None and robot.assigned:
+                po_state.on_move(robot)
 
-                if robot.battery_life == 0:
-                    if po_state is not None:
-                        po_state.on_unassign(robot)
-                    unassign_task_from_robot(robot, task, unassigned_robots=unassigned_robots, unassigned_tasks=unassigned_tasks)
-                    continue
-
-            # at task location -> work on it
-            if robot.remaining_distance == 0:
-                # Partial-observability arrival hook: reveal the task's mask
-                # (once) and run balanced's hard-fail checks against the TRUE
-                # attributes. A mis-assignment frees the robot, returns the
-                # task to the pool unmasked, and raises a replan event.
-                if po_state is not None and po_state.handle_arrival(
-                        robot, task, unassigned_robots, unassigned_tasks,
-                        current_tick, pending_event_steps):
-                    continue
-
-                required_caps = getattr(task, "required_capabilities", None) or []
-                payload_required = None
-                for req in required_caps:
-                    if isinstance(req, str) and "payload" in req.lower():
-                        try:
-                            payload_required = float(req.split(">=")[-1].strip())
-                        except ValueError:
-                            payload_required = None
-                tools_needed = getattr(task, "tools_needed", None) or []
-                sensors_required = tools_needed[0] if len(tools_needed) > 0 and tools_needed[0] else []
-                manipulators_required = tools_needed[1] if len(tools_needed) > 1 and tools_needed[1] else []
-
-                suitability = getattr(robot, "current_task_suitability", 0.5)
-                if suitability is None:
-                    suitability = 0.5
-                suitability = max(0.0, min(1.0, suitability))
-                speed_factor = 0.5 + 1.5 * suitability  # [0.5, 2.0]
-
-                robot.location = task.location
-                start_positions[robot.robot_id] = robot.location
-                robot.battery_life -= time_step
-                task.time_left -= time_step * speed_factor
-
-                # task completion
-                if task.time_left <= 0:
-                    total_reward += task.reward
-                    total_success += 1
-                    task.assigned = False
-                    task.assigned_robot = None
-                    robot.current_task = None
-                    robot.tasks_successful += 1
-                    robot.assigned = False
-                    robot.time_on_task = 0
-                    robot.current_path = []
-                    robot.remaining_distance = 0
-                    robot.current_task_suitability = None
-                    task.current_suitability = None
-                    rid = robot.robot_id
-                    if rid not in unassigned_robots:
-                        unassigned_robots.append(rid)
-                    tasks_completed += 1
-                    try:
-                        tasks.remove(task)
-                    except ValueError:
-                        pass
-
-                # battery exhausted while working
-                if robot.battery_life <= 0:
-                    if getattr(task, "reset_progress", False):
-                        task.time_left = task.time_to_complete
-                    else:
-                        task.time_to_complete = task.time_left
-                    if po_state is not None:
-                        po_state.on_unassign(robot)
-                    unassign_task_from_robot(
-                        robot, task,
-                        unassigned_robots=unassigned_robots,
-                        unassigned_tasks=unassigned_tasks,
-                    )
-
-                # safety-compliance stochastic failure
-                if task.performance_metrics == "safety compliance":
-                    if robot.safety_features:
-                        matched_safety = sum(safety in robot.safety_features for safety in task.safety_protocols)
-                        safety_score = matched_safety / max(1, len(task.safety_protocols))
-                        if safety_score < 0.75 and (random.random() > 0.75):
-                            if po_state is not None:
-                                po_state.on_unassign(robot)
-                            unassign_task_from_robot(
-                                robot, task,
-                                unassigned_robots=unassigned_robots,
-                                unassigned_tasks=unassigned_tasks,
-                            )
-                    else:
-                        if po_state is not None:
-                            po_state.on_unassign(robot)
-                        unassign_task_from_robot(
-                            robot, task,
-                            unassigned_robots=unassigned_robots,
-                            unassigned_tasks=unassigned_tasks,
-                        )
-
-                # runtime capability re-checks
-                if payload_required is not None and robot.payload_capacity < payload_required:
-                    unassign_task_from_robot(
-                        robot, task,
-                        unassigned_robots=unassigned_robots,
-                        unassigned_tasks=unassigned_tasks,
-                    )
-                    continue
-
-                if manipulators_required and not any(tool in robot.manipulators for tool in manipulators_required):
-                    unassign_task_from_robot(
-                        robot, task,
-                        unassigned_robots=unassigned_robots,
-                        unassigned_tasks=unassigned_tasks,
-                    )
-                    continue
-
-                nav_score = navigation_suitability(
-                    robot.mobility_type, robot.size, robot.sensor_range,
-                    task.navigation_constraints or [],
-                )
-                if nav_score == 0.0:
-                    if po_state is not None:
-                        # Pre-existing navigation drop: count it, don't
-                        # change the behavior (spec §6.5).
-                        po_state.record_nav_drop(robot)
-                        po_state.on_unassign(robot)
-                    unassign_task_from_robot(
-                        robot, task,
-                        unassigned_robots=unassigned_robots,
-                        unassigned_tasks=unassigned_tasks,
-                    )
-                    continue
-
-        elif not robot.assigned:
+    # ================================================================
+    # Phase 4: apply status changes. All robots have already moved; this
+    # only processes work, completions, battery drain, and unassignments.
+    # A robot that stops (battery death, mis-assignment reveal, nav drop)
+    # ends the tick at its current cell; the next tick's replan handles
+    # it before anyone moves.
+    # ================================================================
+    for robot in robots:
+        if not robot.assigned:
             unassigned_count += 1
+            continue
+        if robot.current_task is None:
+            continue
 
-    # ---- Post-movement reconciliation (Phase 3 cascade fix) ----
-    # No two robots may share a cell at the end of a tick. The idle-yield
-    # swap above handles movers stepping onto idle robots, but a robot can
-    # also be frozen mid-plan on a cell another agent's plan depends on:
-    # a task cancellation / battery death / mis-assignment reveal clears
-    # its path while it stands where a later mover (or a LaCAM goal
-    # displacement schedule) expects it to vacate. Nudge any PATHLESS
-    # robot that shares a cell into a free neighboring cell; if none
-    # exists, leave it (the next planner call fails as before).
+        task = robot.current_task
+
+        # at task location -> work on it
+        if robot.remaining_distance != 0:
+            continue
+
+        # PO arrival hook: reveal the task's mask (once) and run
+        # balanced's hard-fail checks against the TRUE attributes.
+        # A mis-assignment frees the robot, returns the task to the
+        # pool unmasked, and raises a replan event.
+        if po_state is not None and po_state.handle_arrival(
+                robot, task, unassigned_robots, unassigned_tasks,
+                current_tick, pending_event_steps):
+            unassigned_count += 1
+            continue
+
+        # (the runtime payload / manipulator re-checks in the old code
+        # parsed a legacy string format and never fired; omitted)
+
+        suitability = getattr(robot, "current_task_suitability", 0.5)
+        if suitability is None:
+            suitability = 0.5
+        suitability = max(0.0, min(1.0, suitability))
+        speed_factor = 0.5 + 1.5 * suitability  # [0.5, 2.0]
+
+        robot.location = task.location
+        start_positions[robot.robot_id] = robot.location
+        robot.battery_life -= time_step
+        task.time_left -= time_step * speed_factor
+
+        # task completion
+        if task.time_left <= 0:
+            total_reward += task.reward
+            total_success += 1
+            task.assigned = False
+            task.assigned_robot = None
+            robot.current_task = None
+            robot.tasks_successful += 1
+            robot.assigned = False
+            robot.time_on_task = 0
+            robot.current_path = []
+            robot.remaining_distance = 0
+            robot.current_task_suitability = None
+            task.current_suitability = None
+            rid = robot.robot_id
+            if rid not in unassigned_robots:
+                unassigned_robots.append(rid)
+            tasks_completed += 1
+            try:
+                tasks.remove(task)
+            except ValueError:
+                pass
+            unassigned_count += 1
+            continue
+
+        # battery exhausted while working
+        if robot.battery_life <= 0:
+            if getattr(task, "reset_progress", False):
+                task.time_left = task.time_to_complete
+            else:
+                task.time_to_complete = task.time_left
+            if po_state is not None:
+                po_state.on_unassign(robot)
+            unassign_task_from_robot(
+                robot, task,
+                unassigned_robots=unassigned_robots,
+                unassigned_tasks=unassigned_tasks,
+            )
+            unassigned_count += 1
+            continue
+
+        # safety-compliance stochastic failure
+        if task.performance_metrics == "safety compliance":
+            if robot.safety_features:
+                matched_safety = sum(safety in robot.safety_features for safety in task.safety_protocols)
+                safety_score = matched_safety / max(1, len(task.safety_protocols))
+                if safety_score < 0.75 and (random.random() > 0.75):
+                    if po_state is not None:
+                        po_state.on_unassign(robot)
+                    unassign_task_from_robot(
+                        robot, task,
+                        unassigned_robots=unassigned_robots,
+                        unassigned_tasks=unassigned_tasks,
+                    )
+                    unassigned_count += 1
+                    continue
+            else:
+                if po_state is not None:
+                    po_state.on_unassign(robot)
+                unassign_task_from_robot(
+                    robot, task,
+                    unassigned_robots=unassigned_robots,
+                    unassigned_tasks=unassigned_tasks,
+                )
+                unassigned_count += 1
+                continue
+
+        # navigation drop (pre-existing behavior)
+        nav_score = navigation_suitability(
+            robot.mobility_type, robot.size, robot.sensor_range,
+            task.navigation_constraints or [],
+        )
+        if nav_score == 0.0:
+            if po_state is not None:
+                po_state.record_nav_drop(robot)
+                po_state.on_unassign(robot)
+            unassign_task_from_robot(
+                robot, task,
+                unassigned_robots=unassigned_robots,
+                unassigned_tasks=unassigned_tasks,
+            )
+            unassigned_count += 1
+            continue
+
+    # ================================================================
+    # Phase 5: safety nudge (last resort; should never fire with the
+    # two-phase timestep + idle agents in the plan). A PATHLESS robot
+    # that ended the tick sharing a cell is nudged to a free neighbor.
+    # ================================================================
     if obstacles is not None and COLLISION_AVOIDANCE:
         by_loc = {}
         for r in robots:
@@ -247,8 +262,8 @@ def simulate_time_step(
                 continue
             rr, cc = loc
             for occupant in group:
-                if occupant.current_path or occupant.assigned:
-                    continue  # only nudge frozen (pathless, unassigned) robots
+                if occupant.assigned or (occupant.current_path and len(occupant.current_path) > 1):
+                    continue  # only nudge PARKED robots
                 for cand in ((rr - 1, cc), (rr + 1, cc), (rr, cc - 1), (rr, cc + 1)):
                     if cand in obstacles or cand in occupied_locations:
                         continue
@@ -257,6 +272,30 @@ def simulate_time_step(
                     occupied_locations.discard(occupant.location)
                     occupant.location = cand
                     occupied_locations.add(cand)
+                    if collision_counters is not None:
+                        collision_counters["nudge"] += 1
                     break
+
+    # ================================================================
+    # End-of-tick invariant: no two robots share a cell and no two
+    # robots swapped cells this tick (MAPF validity). Counted every tick
+    # regardless of the safety-net switch; violations are bugs or
+    # stale-path conflicts the nets could not repair.
+    # ================================================================
+    end_locs = {r.robot_id: r.location for r in robots}
+    by_end = {}
+    for rid, loc in end_locs.items():
+        by_end.setdefault(loc, []).append(rid)
+    colocated = sum(len(g) - 1 for g in by_end.values() if len(g) > 1)
+    swapped = 0
+    ids = sorted(end_locs)
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            a, b = ids[i], ids[j]
+            if (end_locs[a] == _start_locs.get(b) and end_locs[b] == _start_locs.get(a)
+                    and end_locs[a] != end_locs[b]):
+                swapped += 1
+    if collision_counters is not None and (colocated or swapped):
+        collision_counters["violations"] += colocated + swapped
 
     return tasks_completed, unassigned_count, total_reward, total_success

@@ -447,26 +447,61 @@ def test_coverage_threshold_requires_min_pool():
         _V.POOL_STATS = None
 
 
-def test_idle_robot_yields_to_mover():
-    """Safety net (3v2c): a mover stepping onto a PARKED idle robot's cell
-    swaps cells with it. Counted in collision_counters['swap']; the target
-    is zero fires once idle robots are planned as agents."""
+def test_overload_hard_no_violations():
+    """Hard assertion: an overload config with multiple robots produces ZERO
+    vertex conflicts, ZERO swap conflicts, ZERO violations, and ZERO nudge
+    fires at the end of every tick."""
     from hvbta.simulation.timestep import simulate_time_step
-    mover = _fake_robot("R1", (2, 2))
-    idle = _fake_robot("R2", (2, 3))
-    idle.assigned = False
-    idle.current_task = None
-    mover.current_task.location = (0, 9)   # far away: mover must not reach it this tick
-    mover.current_path = [(2, 2), (2, 3), (2, 4), (2, 5)]
-    occupied = {(2, 2), (2, 3)}
-    sp = {"R1": (2, 2)}
-    counters = {"swap": 0, "nudge": 0, "violations": 0}
-    simulate_time_step([mover, idle], [mover.current_task], [], [],
+    robots = make_robots(n=6, seed=13)
+    tasks = make_tasks(n=5, seed=17)
+    occupied = set()
+    sp = {}
+    for i, r in enumerate(robots):
+        r.assigned = True
+        r.current_task = tasks[i % len(tasks)]
+        r.current_task.assigned = True
+        r.current_task.assigned_robot = r
+        r.battery_life = 1000.0          # plenty of battery for the test
+        r.current_task.time_left = 100.0  # won't complete during the test
+        col = i + 2
+        start = (i, col)
+        r.location = start
+        # path ends at the task location so the work block's teleport is a no-op
+        end = (start[0] + 7, col)
+        r.current_task.location = end
+        r.current_path = [(start[0] + k, col) for k in range(8)]
+        occupied.add(start)
+        sp[r.robot_id] = start
+    counters = {"planned_conflicts": 0, "nudge": 0, "violations": 0}
+    for tick in range(5):
+        simulate_time_step(robots, tasks, [], [], None, occupied, sp, {},
+                           collision_counters=counters)
+        assert counters["planned_conflicts"] == 0, f"planned conflict at tick {tick}"
+        assert counters["violations"] == 0, f"violation at tick {tick}"
+        assert counters["nudge"] == 0, f"nudge fired at tick {tick}"
+
+
+def test_synchronous_movement_no_conflict():
+    """Two-phase timestep: two movers with jointly planned (conflict-free)
+    paths move simultaneously with zero planned conflicts, zero violations,
+    and zero safety-net fires."""
+    from hvbta.simulation.timestep import simulate_time_step
+    a = _fake_robot("R1", (2, 2))
+    b = _fake_robot("R2", (2, 4))
+    a.current_task.location = (0, 9)
+    b.current_task.location = (0, 8)
+    a.current_path = [(2, 2), (2, 3), (2, 4), (2, 5)]   # R1 passes through (2,4)
+    b.current_path = [(2, 4), (2, 5), (2, 6), (2, 7)]   # R2 vacates before R1 arrives
+    occupied = {(2, 2), (2, 4)}
+    sp = {"R1": (2, 2), "R2": (2, 4)}
+    counters = {"planned_conflicts": 0, "nudge": 0, "violations": 0}
+    simulate_time_step([a, b], [a.current_task, b.current_task], [], [],
                        None, occupied, sp, {}, collision_counters=counters)
-    assert mover.location == (2, 3)      # moved onto the idle robot's cell
-    assert idle.location == (2, 2)        # yielded into the vacated cell
-    assert occupied == {(2, 2), (2, 3)}   # both cells still occupied
-    assert counters["swap"] == 1
+    assert a.location == (2, 3)
+    assert b.location == (2, 5)
+    assert counters["planned_conflicts"] == 0
+    assert counters["nudge"] == 0
+    assert counters["violations"] == 0
 
 
 def test_idle_robots_are_planned_agents():
@@ -499,7 +534,7 @@ def test_idle_agent_walks_displacement_path():
     idle.assigned = False
     idle.current_task = None
     idle.current_path = [(2, 3), (3, 3), (2, 3)]
-    counters = {"swap": 0, "nudge": 0, "violations": 0}
+    counters = {"planned_conflicts": 0, "nudge": 0, "violations": 0}
     simulate_time_step([idle], [], [], [], None, {(2, 3)}, {}, {},
                        collision_counters=counters)
     assert idle.location == (3, 3)                       # stepped aside
@@ -518,7 +553,7 @@ def test_collision_violation_counted():
     b = _fake_robot("R2", (2, 2))          # deliberately co-located
     a.assigned = b.assigned = False
     a.current_task = b.current_task = None
-    counters = {"swap": 0, "nudge": 0, "violations": 0}
+    counters = {"planned_conflicts": 0, "nudge": 0, "violations": 0}
     # two idle robots co-located, no obstacles passed -> nudge net inactive,
     # the invariant check still counts the shared cell
     simulate_time_step([a, b], [], [], [], None, set(), {}, {},

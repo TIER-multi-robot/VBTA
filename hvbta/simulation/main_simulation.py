@@ -512,7 +512,7 @@ def main_simulation(
     stuck_assigned_robot_ticks = 0
     # Phase 3v2 collision accounting: safety-net fires (swap/nudge) and
     # end-of-tick invariant violations, counted by the timestep.
-    collision_counters = {"swap": 0, "nudge": 0, "violations": 0}
+    collision_counters = {"swap": 0, "nudge": 0, "violations": 0, "planned_conflicts": 0}
     # Phase 3 cascade diagnostics: one entry per failed planner call,
     # {tick, kind, ...} (kind = duplicate_start / duplicate_goal /
     # lacam_no_solution / lacam_timeout / engine_unsolved). Goes into the
@@ -693,7 +693,8 @@ def main_simulation(
                     # standing robot (the duplicate-start trigger).
                     if r_copy.location in occupied_positions:
                         _dims = map_dict.get("dimension", (0, 0))
-                        _free = MW._nearest_free_cell(
+                        from hvbta.pathfinding.planner_common import _nearest_free_cell
+                        _free = _nearest_free_cell(
                             r_copy.location, _obstacle_set, occupied_positions,
                             _dims[0], _dims[1])
                         if _free is not None:
@@ -1442,8 +1443,8 @@ def main_simulation(
         never_attempted_count,
         all_zero_skip_ticks,
         stuck_assigned_robot_ticks,
-        # Section 15b-2 - collision handling diagnostics (Phase 3v2)
-        collision_counters["swap"],
+        # Section 15b-2 - collision handling diagnostics (Phase 3v6)
+        collision_counters["planned_conflicts"],
         collision_counters["nudge"],
         collision_counters["violations"],
         # Run-level wall-clock limit flag (1 = hit the limit, stopped early)
@@ -1730,7 +1731,7 @@ if __name__ == "__main__":
     # Every run writes to a NEW directory - never an existing one.
     # Fresh dir => the resume scanner finds no completed rows => nothing
     # is skipped, every config re-runs (per agent instructions §0.4).
-    PO_OUTPUT_DIRNAME = "pilot_po_P3_collision_v4"
+    PO_OUTPUT_DIRNAME = "pilot_po_P3_collision_v5"
     # Phase 3v3: idle agents + step-aside goals + 1s planner budget +
     # 10-min run limit. The v2 dir holds the interrupted 18-hour partial.
     V.VOTING_ZERO_PAIR_FILTER = True
@@ -1873,8 +1874,8 @@ if __name__ == "__main__":
                 'Nav_Drop_Count', 'Nav_Drop_Wasted_Travel',
                 # PO baseline + invariant diagnostics
                 'Never_Attempted_Count', 'All_Zero_Skip_Ticks', 'Stuck_Assigned_Robot_Ticks',
-                # Collision handling diagnostics (Phase 3v2)
-                'Safety_Swap_Count', 'Safety_Nudge_Count', 'Collision_Violation_Count',
+                # Collision handling diagnostics (Phase 3v6: two-phase timestep)
+                'Planned_Conflict_Count', 'Safety_Nudge_Count', 'Collision_Violation_Count',
                 # Run wall-clock limit flag (1 = hit the limit, stopped early)
                 'Run_Timed_Out',
                 # Anytime pool diagnostics (2.8)
