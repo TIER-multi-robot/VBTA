@@ -928,7 +928,12 @@ def main_simulation(
                 # event this tick triggers a tight budget so voting bails on
                 # the first good-enough candidate.
                 urgent_pressure = (percentage_urgent > 0.0) or (robot_pressure > 0.0) # NOTE: here I can take out robot pressure
-                voting_budget_ms = 20.0 if urgent_pressure else None
+                # Deterministic urgent budget (2026-10-25): the old 20 ms
+                # wall-clock cap made results load-dependent; the candidate-
+                # count cap reproduces its MEDIAN behavior (see
+                # VOTING_URGENT_CANDIDATE_BUDGET).
+                voting_candidate_budget = (V.VOTING_URGENT_CANDIDATE_BUDGET
+                                          if urgent_pressure else None)
                 voting_score_threshold = 0.7 if urgent_pressure else None
 
                 # Adaptive candidate count: recent churn shrinks the pool so
@@ -953,7 +958,7 @@ def main_simulation(
                 _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = V.reassign_robots_to_tasks(
                     robots, tasks, effective_candidates, voting_method, suitability_source,
                     unassigned_robots, unassigned_tasks, start_positions, goal_positions, HYPOTENUSE,
-                    time_budget_ms=voting_budget_ms,
+                    candidate_budget=voting_candidate_budget,
                     score_threshold=voting_score_threshold,
                     seed_assignment_ids=previous_best_id_pairs,
                     cached_candidate_ids=(candidate_cache or None),

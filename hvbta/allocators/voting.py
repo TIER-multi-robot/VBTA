@@ -35,6 +35,21 @@ MIN_POOL_BEFORE_THRESHOLD = 5
 # how often the anytime early termination fires. Inert by default.
 POOL_STATS = None
 
+# Budget-calibration collector (2026-10-25, deterministic-budget change):
+# when set to a list, one dict per anytime-budgeted call records how many
+# candidates were ranked before the wall-clock budget cut the loop. Used
+# once, serially, to calibrate the candidate-count replacement; inert after.
+BUDGET_CALIBRATION = None
+
+# Deterministic urgent budget (2026-10-25): the old 20 ms wall-clock budget
+# made urgent-call results depend on machine load. Calibrated replacement:
+# cap the ranked pool at this many candidates on urgent calls. The value
+# is the MEDIAN ranked-candidate count measured over 20,303 urgent calls
+# in a serial 1-rep run of the v9 pilot config (lak102d [10,20]x[10,20],
+# 6 voting rules, 4 scenarios, 5 mask conditions): median 3 (p25 1, p75 8,
+# p95 17, mean 5.6). See docs/checkins/2026-10-25-deterministic-budgets.md.
+VOTING_URGENT_CANDIDATE_BUDGET = 3
+
 # Per-rule top-2 tie counter: {rule_name: [calls, top2_ties]}. Accumulated
 # across calls; reset/read by the caller (2.5 reporting). Inert by default.
 TIE_STATS = {}
@@ -368,6 +383,7 @@ def assign_tasks_with_voting(
         voting_method: Callable,
         score_threshold: float = None,
         time_budget_ms: float = None,
+        candidate_budget: int = None,
         generator: Callable = None,
         seed_assignment: List[Tuple[int, int]] = None,
         diversity_threshold: float = 0.8,
@@ -393,6 +409,13 @@ def assign_tasks_with_voting(
             When the flag is off, the old mean-per-pair semantics apply.
         time_budget_ms: If not None, stop generating candidates once wall-clock
             elapsed (from function entry) reaches this many milliseconds.
+            DEPRECATED for the main loop (2026-10-25): wall-clock budgets
+            make results load-dependent; the main loop now passes the
+            deterministic candidate_budget instead. Kept for back-compat.
+        candidate_budget: If not None, rank at most this many candidates
+            from the pool (deterministic anytime budget, calibrated from
+            the old 20 ms budget's behavior; see
+            VOTING_URGENT_CANDIDATE_BUDGET).
         generator: Optional candidate generator with signature
             (num_robots, num_tasks, num_assignments) -> List[candidate]. If
             None, the biased generate_high_suitability_assignments is used
@@ -548,6 +571,8 @@ def assign_tasks_with_voting(
         max_feasible = min(pos_rows, pos_cols)
         min_pool = min(MIN_POOL_BEFORE_THRESHOLD, len(full_pool))
     random_assignments = []
+    budget_fired = False
+    threshold_fired = False
     for one in full_pool:
         random_assignments.append(one)
 
@@ -567,10 +592,15 @@ def assign_tasks_with_voting(
                 else:
                     candidate_score = 0.0
             if candidate_score >= score_threshold:
+                threshold_fired = True
                 break
         if time_budget_ms is not None:
             if (time.perf_counter_ns() - start) / 1e6 >= time_budget_ms:
+                budget_fired = True
                 break
+        if candidate_budget is not None and len(random_assignments) >= candidate_budget:
+            budget_fired = True
+            break
 
     # Priority-weighted view for voting ranking ONLY. Everything else in this
     # function (anytime score_threshold above, best_score reporting) stays
@@ -592,6 +622,14 @@ def assign_tasks_with_voting(
             "ranked": len(random_assignments),
             "threshold": score_threshold,
             "budget_ms": time_budget_ms,
+            "candidate_budget": candidate_budget,
+        })
+    if BUDGET_CALIBRATION is not None and time_budget_ms is not None:
+        BUDGET_CALIBRATION.append({
+            "ranked": len(random_assignments),
+            "full": len(full_pool),
+            "budget_fired": budget_fired,
+            "threshold_fired": threshold_fired,
         })
 
     # Every candidate was zero-pair-filtered before entering the pool, so no
@@ -760,6 +798,7 @@ def reassign_robots_to_tasks(
         inertia_threshold: float = 0.1,
         score_threshold: float = None,
         time_budget_ms: float = None,
+        candidate_budget: int = None,
         generator: Callable = None,
         seed_assignment_ids: List[Tuple[str, str]] = None,
         diversity_threshold: float = 0.8,
@@ -859,6 +898,7 @@ def reassign_robots_to_tasks(
         output, score, length, per_agent_scores = assign_tasks_with_voting(
             urobots, utasks, suitability_matrix, num_candidates, voting_method,
             score_threshold=score_threshold, time_budget_ms=time_budget_ms,
+            candidate_budget=candidate_budget,
             generator=generator, seed_assignment=seed_local,
             diversity_threshold=diversity_threshold,
             extra_candidates=extra_local, top_k_out=local_top_k, top_k=hall_of_fame_k,

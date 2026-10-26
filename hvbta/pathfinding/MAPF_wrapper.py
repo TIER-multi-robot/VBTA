@@ -33,8 +33,11 @@ from hvbta.pathfinding.planner_common import _prepare_agents, _write_paths_back,
 # Per-call planner time budget (seconds). Engines that accept a time limit
 # (LaCAM, CBS) get this passed; a budget hit is a FAILURE classified as
 # "lacam_timeout" (or "engine_unsolved" for engines without limits) - never
-# treated as proof of infeasibility. Configurable.
-PLANNER_TIME_BUDGET_S = 1.0
+# treated as proof of infeasibility. Configurable; env-overridable
+# (HVBTA_LACAM_LIMIT_S) so load tests can retry with a raised limit
+# without code edits.
+import os as _os
+PLANNER_TIME_BUDGET_S = float(_os.environ.get("HVBTA_LACAM_LIMIT_S", "1.0"))
 
 # Registry built lazily so an unimplemented planner module (e.g. lacam) doesn't
 # break importing this file. Each entry: name -> (kind, callable).
@@ -47,6 +50,17 @@ _PLANNER_CACHE = None
 # plus, for the duplicate cases, the agents involved. Pure logging; no
 # decision path reads it.
 LAST_PLAN_FAILURE = None
+
+# Cumulative per-kind failure counter (Phase-4 load diagnostics,
+# 2026-10-25): incremented wherever LAST_PLAN_FAILURE is set. Reset/read
+# by drivers (e.g. the LaCAM timeout-under-load check). Inert otherwise.
+FAILURE_KIND_COUNTS = {}
+
+
+def _count_failure(failure):
+    if failure:
+        kind = failure.get("kind", "unknown")
+        FAILURE_KIND_COUNTS[kind] = FAILURE_KIND_COUNTS.get(kind, 0) + 1
 
 
 def _classify_failure(start_positions, goal_positions, agents, plan_fn):
@@ -151,6 +165,7 @@ def run_native(plan_fn, robots, start_positions, goal_positions, map_dict):
             # genuinely nothing to plan): classify from _prepare_agents,
             # which saw the FULL agent set including idle agents.
             LAST_PLAN_FAILURE = failure or {"kind": "engine_unsolved", "reason": "no_agents"}
+            _count_failure(LAST_PLAN_FAILURE)
             return 0.0, False
         # genuinely nothing to plan (empty start_positions)
         return 0.0, True
@@ -169,6 +184,7 @@ def run_native(plan_fn, robots, start_positions, goal_positions, map_dict):
         print(f"{getattr(plan_fn, '__module__', '?')}.{getattr(plan_fn, '__name__', 'plan')} "
               f"found no plan under current state.")
         LAST_PLAN_FAILURE = _classify_failure(start_positions, goal_positions, agents, plan_fn)
+        _count_failure(LAST_PLAN_FAILURE)
         return 0.0, False
 
     avg_len = _write_paths_back(robots, paths, stationary_ids)
@@ -200,6 +216,7 @@ def run_stepwise(step_fn, robots, start_positions, goal_positions, map_dict,
     if agents is None:
         if failure and start_positions and goal_positions:
             LAST_PLAN_FAILURE = failure
+            _count_failure(LAST_PLAN_FAILURE)
             return 0.0, False
         return 0.0, True
 
