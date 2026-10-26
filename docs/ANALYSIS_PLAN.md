@@ -167,3 +167,23 @@ these fixes and must not be used for collision-sensitive analysis; the
 final ablation arms (pilot_po_P3_collision_v9 = zero_pair on,
 pilot_po_final_v9_zero_pair_off, pilot_po_final_v9_threshold_off) are the
 first fully clean data.
+
+### 2026-10-25: deterministic anytime budget (replaces the 20 ms wall-clock budget)
+
+The urgent-path anytime budget in voting (20 ms wall-clock, in effect since
+the anytime design landed) made every urgent voting call load-dependent:
+candidate pools ranked 1-120 candidates depending on machine speed, so
+voting rows were not bit-reproducible across runs, process counts, or
+parallel load (measured: 42/140 rows differing between two same-code serial
+runs). Replaced by a deterministic candidate-count cap,
+VOTING_URGENT_CANDIDATE_BUDGET = 3, chosen as the MEDIAN ranked-candidate
+count over 20,303 urgent calls measured serially on the v9 pilot config
+(distribution: p25 1, p50 3, p75 8, p95 17, mean 5.6). The score threshold
+(0.7, coverage-normalized) was already deterministic and is unchanged.
+After the change, pool-vs-serial output is bit-identical on all rows
+(voting and Murty's), excluding wall-clock timing columns. LaCAM budget:
+verified ZERO failures of any kind (in particular no lacam_timeout) with 30
+concurrent workers on the largest configs (combat, combat2, den901d at 100
+robots) at the 1 s limit, so the limit stays 1.0 s. All sweeps run under
+this deterministic regime; pre-2026-10-25 voting rows carry anytime-budget
+noise and are not bit-comparable to later rows.
