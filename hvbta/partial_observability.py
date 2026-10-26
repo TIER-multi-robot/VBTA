@@ -438,3 +438,42 @@ class PartialObservabilityState:
             os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+
+# ---------------------------------------------------------------------------
+# 8.1: score-noise experiment (observation noise, sigma_obs - NOT the
+# perturbed-JV baseline's sigma_pjv, which lives in optimizers.py).
+# ---------------------------------------------------------------------------
+def noisy_scorer(base_scorer, sigma, schedule_seed, tick_holder):
+    """
+    Wrap a batch scorer with Gaussian observation noise.
+
+    - Deterministic and shared across methods: the noise for a pair is a
+      pure function of (schedule_seed, robot_id, task_id, tick), drawn
+      from an RNG seeded with zlib.adler32 of that tuple. Every method
+      scoring the same pair on the same tick sees the same noisy value.
+    - Only feasible entries get noise: pairs whose true score is 0
+      (balanced hard-fail) stay exactly 0. Noisy feasible entries are
+      clipped to [0.001, 1.0] so noise can never cross the
+      feasible/infeasible boundary.
+    - tick_holder is a one-element list the caller updates with the
+      current replan tick before each allocation round.
+    - Execution uses true scores (this wrapper is only ever the
+      allocator's suitability_source).
+    """
+    def scorer(robots, tasks, *, map_size=None):
+        m = np.asarray(base_scorer(robots, tasks, map_size=map_size),
+                       dtype=float)
+        if sigma is None or sigma <= 0:
+            return m
+        tick = tick_holder[0]
+        out = m.copy()
+        for i, r in enumerate(robots):
+            for j, t in enumerate(tasks):
+                if m[i, j] > 0:
+                    seed = zlib.adler32(
+                        repr((schedule_seed, r.robot_id, t.task_id,
+                              tick)).encode()) & 0xFFFFFFFF
+                    out[i, j] = min(1.0, max(
+                        0.001, m[i, j] + random.Random(seed).gauss(0, sigma)))
+        return out
+    return scorer

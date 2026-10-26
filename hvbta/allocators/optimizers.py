@@ -12,6 +12,45 @@ from .misc_assignment import extract_submatrix
 def suitability_all_zero(suitability_matrix):
     return all(value == 0 for row in suitability_matrix for value in row)
 
+
+# ---------------------------------------------------------------------------
+# 8.2: perturbed JV baseline. The noise here is the baseline's OWN internal
+# randomness (sigma_pjv), kept strictly separate from the observation-noise
+# sigma_obs of the 8.1 experiment: never shared, never in the same columns.
+# Set by the sweep/driver; None makes perturbed_jv behave exactly like JV.
+# ---------------------------------------------------------------------------
+PERTURBED_JV_SIGMA = None
+
+
+def perturbed_jv_task_allocation(matrix, sigma=None, seed=None):
+    """
+    JV on a noise-perturbed copy of the matrix. Only feasible (positive)
+    entries get noise - hard-fail pairs stay exactly 0 - and noisy values
+    are clipped to [0.001, 1.0] so noise can never make a feasible pair
+    look infeasible or vice versa (the same clipping rule as 8.1).
+    The seed comes from the per-run seed + replan index (caller-supplied);
+    a fresh seed on every retry draws fresh noise.
+    """
+    m = np.asarray(matrix, dtype=float)
+    s = PERTURBED_JV_SIGMA if sigma is None else sigma
+    if s:
+        rng = np.random.default_rng(seed)
+        feas = m > 0
+        out = m.copy()
+        out[feas] = np.clip(m[feas] + rng.normal(0.0, s, m.shape)[feas],
+                            0.001, 1.0)
+        m = out
+    return jv_task_allocation(m)
+
+
+def perturbed_jv_factory(seed):
+    """Bind (sigma, seed) into a 1-arg allocation method so the generic
+    assign_tasks_with_method / reassign_robots_to_tasks_with_method
+    wiring can drive it unchanged."""
+    def bound(matrix):
+        return perturbed_jv_task_allocation(matrix, seed=seed)
+    return bound
+
 def jv_task_allocation(matrix):
     """
     Solves the task allocation problem using the Jonker-Volgenant (JV) algorithm

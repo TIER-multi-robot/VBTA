@@ -407,6 +407,12 @@ def main_simulation(
         #   masks to be reproducible.
         mask_level: str = None,
         mask_policy: str = None,
+        # 8.1 score-noise experiment: Gaussian observation noise (sigma_obs)
+        # on FEASIBLE entries only, deterministic per (schedule_seed,
+        # robot_id, task_id, tick), shared across methods. None = off.
+        # Execution always uses true scores; only the allocator's
+        # suitability_source sees the noisy view.
+        noise_sigma: float = None,
         schedule_seed: int = None,
         # Per-run RNG seed keyed by (group, method): derived by the sweep via
         # _derived_seed(schedule_seed, "run", method). Deliberately does NOT
@@ -451,6 +457,7 @@ def main_simulation(
         O.ilp_task_allocation: "ILP",
         O.jv_task_allocation: "JV",
         O.murtys_task_allocation: "Murty's K-Best",
+        O.perturbed_jv_task_allocation: "Perturbed JV",
     }
     voting_method_name = voting_methods.get(voting_method, "Unknown Method")
     optimization_method_name = optimization_methods.get(voting_method, "Unknown Method")
@@ -583,6 +590,10 @@ def main_simulation(
     }
 
     occupied_positions = set(r.location for r in robots)
+    # suitability_source is set inside the should_replan block; the
+    # replan-on-failure block below can run on path-only replan ticks
+    # (should_replan False), so pre-bind the plain scorer as the default.
+    suitability_source = suitability_method
     # Frozen-cell obstacle set for the timestep's post-movement
     # reconciliation (Phase 3 cascade fix).
     _obstacle_set = frozenset(map_dict.get("obstacles") or [])
@@ -657,6 +668,10 @@ def main_simulation(
     # call at the top of the next tick, before movement, so plans never
     # stay stale after a deviation.
     deviation_replan_pending = False
+    # 8.1 noise experiment: the noisy scorer reads the current replan tick
+    # from this holder so noise is a pure function of (schedule_seed,
+    # robot_id, task_id, tick). Updated at the top of every replan tick.
+    noise_tick_holder = [0]
     for time_step in range(max_time_steps):
         # Per-run wall-clock limit: stop early, flag the row, never drop it.
         if time.perf_counter() - run_wall_start > RUN_WALL_LIMIT_S:
@@ -848,7 +863,15 @@ def main_simulation(
         if should_replan:
             should_replan_paths = True
 
+        # top_k_out_ids is only populated on voting allocation rounds; the
+        # replan-on-failure block below reads it on ANY tick (including
+        # path-only replan ticks where should_replan is False and no
+        # allocation ran), so it must ALWAYS exist.
+        top_k_out_ids = []
+
         if should_replan:
+            # 8.1: noise for this allocation round is keyed to this tick.
+            noise_tick_holder[0] = time_step
             # ---- urgency + pressure snapshot for this replan ----
             # Compute once so voting/optimization/direct-LLM all see the same
             # numbers and downstream analysis can bucket runs by these dimensions.
@@ -895,6 +918,14 @@ def main_simulation(
                     suitability_source = po.masked_scorer(suitability_method)
                 else:
                     suitability_source = suitability_method
+                # 8.1 noise experiment: wrap the (possibly masked) scorer
+                # with observation noise. sigma=0 rows pass through
+                # unchanged, reproducing the no-noise results exactly.
+                if noise_sigma is not None:
+                    from hvbta.partial_observability import noisy_scorer
+                    suitability_source = noisy_scorer(
+                        suitability_source, noise_sigma, schedule_seed,
+                        noise_tick_holder)
 
             # All-zero guard (2.7): when the unassigned x unassigned submatrix
             # is all zero, skip the allocation ENTIRELY - for voting AND
@@ -1007,9 +1038,15 @@ def main_simulation(
                 else:
                     print(f"REASSIGNING WITH OPTIMIZATION METHOD: {optimization_method_name}")
                     total_reassignments += 1
+                    # 8.2: perturbed JV draws fresh noise per replan (the
+                    # replan index IS total_reassignments after increment).
+                    alloc_fn = voting_method
+                    if voting_method is O.perturbed_jv_task_allocation:
+                        alloc_fn = O.perturbed_jv_factory(
+                            _derived_seed(run_seed, "pjv", total_reassignments))
                     _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = O.reassign_robots_to_tasks_with_method(
                         robots, tasks, num_candidates, voting_method, suitability_source,
-                        unassigned_robots, unassigned_tasks, voting_method, start_positions, goal_positions, HYPOTENUSE,
+                        unassigned_robots, unassigned_tasks, alloc_fn, start_positions, goal_positions, HYPOTENUSE,
                     )
                 if reassign_per_agent_scores:
                     reassignment_jains_indices.append(calculate_jains_index(reassign_per_agent_scores))
@@ -1169,11 +1206,19 @@ def main_simulation(
                         import random as _rng
                         _rng.shuffle(unassigned_robots)
                         _rng.shuffle(unassigned_tasks)
+                        # 8.2: each retry draws FRESH perturbed-JV noise
+                        # (the increment below happens first in the normal
+                        # path; here the noise seed must incorporate this
+                        # retry, so derive from the NEXT reassignment index).
+                        total_reassignments += 1
+                        alloc_fn = voting_method
+                        if voting_method is O.perturbed_jv_task_allocation:
+                            alloc_fn = O.perturbed_jv_factory(
+                                _derived_seed(run_seed, "pjv", total_reassignments))
                         _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = O.reassign_robots_to_tasks_with_method(
                             robots, tasks, num_candidates, voting_method, suitability_source,
-                            unassigned_robots, unassigned_tasks, voting_method, start_positions, goal_positions, HYPOTENUSE,
+                            unassigned_robots, unassigned_tasks, alloc_fn, start_positions, goal_positions, HYPOTENUSE,
                         )
-                        total_reassignments += 1
                         total_reassignment_time += reassign_length
                         cumulative_reassignment_quality += reassign_score
                     elif isinstance(alt, list):
@@ -1468,6 +1513,13 @@ def main_simulation(
         po_metrics["recovery_latency_mean"],
         po_metrics["true_assignment_suitability"],
         po_metrics["masked_view_suitability"],
+        # 8.1: Observed_View_Suitability - mean pair score on the
+        # allocator's ACTUAL view (noisy under the score-noise
+        # experiment, masked under PO). Identical to
+        # Masked_View_Suitability by construction; kept as a separate
+        # column so the noise experiment's observed-view metric is never
+        # confused with the PO mask metric. -1 = N/A.
+        (po_metrics["masked_view_suitability"] if noise_sigma is not None else -1.0),
         po_metrics["nav_drop_count"],
         po_metrics["nav_drop_wasted_travel"],
         # Section 15b - PO baseline + invariant diagnostics
@@ -1517,6 +1569,8 @@ def benchmark_simulation(
         event_schedule: list = None,
         mask_level: str = None,
         mask_policy: str = None,
+        # 8.1 score-noise experiment sigma (None = off).
+        noise_sigma: float = None,
         schedule_seed: int = None,
         # Per-run RNG seed keyed by (group, method): derived by the sweep via
         # _derived_seed(schedule_seed, "run", method). Deliberately does NOT
@@ -1549,6 +1603,7 @@ def benchmark_simulation(
         event_schedule=event_schedule,
         mask_level=mask_level,
         mask_policy=mask_policy,
+        noise_sigma=noise_sigma,
         schedule_seed=schedule_seed,
         run_seed=run_seed,
         po_diag_path=po_diag_path,
@@ -1625,7 +1680,11 @@ def _scan_completed_runs(dir_path):
             try:
                 ml = (r[li] or None) if li is not None else None
                 mp = (r[yi] or None) if yi is not None else None
-                key = (map_name, int(r[ri]), int(r[ti]), r[pi], r[ci], r[si], ml, mp, r[mi])
+                # 8.1: the noise sigma is part of the resume key so
+                # noise-mode rows never resume-skip across sigmas.
+                ni = idx.get('Obs_Noise_Sigma')
+                ns = (float(r[ni]) if ni is not None and r[ni] not in ("", None) else None)
+                key = (map_name, int(r[ri]), int(r[ti]), r[pi], r[ci], r[si], ml, mp, ns, r[mi])
             except (ValueError, IndexError):
                 continue
             counts[key] = counts.get(key, 0) + 1
@@ -1644,6 +1703,11 @@ if __name__ == "__main__":
     ABLATION_ZP = os.environ.get("HVBTA_ZERO_PAIR", "1") == "1"
     ABLATION_TH = os.environ.get("HVBTA_THRESHOLD", "1") == "1"
     ABLATION_VOTING_ONLY = os.environ.get("HVBTA_VOTING_ONLY", "0") == "1"
+    # 8.2: the perturbed-JV baseline's own noise sigma. Chosen by the
+    # duplicate-retry rule (see docs/checkins/2026-10-26-step8.md); set
+    # via env so drivers need no file edits. None = JV unperturbed.
+    O.PERTURBED_JV_SIGMA = (float(os.environ["HVBTA_PJV_SIGMA"])
+                            if "HVBTA_PJV_SIGMA" in os.environ else None)
     voting_methods = [
         V.rank_assignments_borda,
         V.rank_assignments_approval,
@@ -1659,6 +1723,8 @@ if __name__ == "__main__":
         # O.ilp_task_allocation,
         # O.jv_task_allocation,
         O.murtys_task_allocation,
+        # 8.2: perturbed JV baseline. Every sweep runs 8 allocators.
+        O.perturbed_jv_task_allocation,
     ]
     optimization_names = [func_name(f) for f in optimization_methods]
     if ABLATION_VOTING_ONLY:
@@ -1769,7 +1835,10 @@ if __name__ == "__main__":
     # conditions (none / low-opt / low-pess / high-opt / high-pess).
     # The mask condition is NOT part of the schedule seed, so all 5
     # conditions replay identical schedules (spec §5).
-    PO_EXPERIMENT = True
+    # HVBTA_PO=0 disables the PO condition axis (single legacy condition,
+    # PO columns get sentinels) - used by e.g. the hyper-constrained PP
+    # pilot, which stresses the planner rather than the masks.
+    PO_EXPERIMENT = os.environ.get("HVBTA_PO", "1") == "1"
     # FINAL ablation pilots on the current code (new scorer + all Phase 2
     # fixes), 3 reps, pilot config. Three flag combinations; Murty's rows
     # must be identical across all three.
@@ -1779,6 +1848,9 @@ if __name__ == "__main__":
     if _sizes:
         _r = int(_sizes)
         PO_SWEEP_CONFIGS = [(r"lak102d.map", [_r], [_r])]
+    # HVBTA_CONFIG=hyper -> the three hyper-constrained maps (PP pilot).
+    if os.environ.get("HVBTA_CONFIG") == "hyper":
+        PO_SWEEP_CONFIGS = HYPER_CONSTRAINED_CONFIGS
     num_repetitions = int(os.environ.get("HVBTA_REPS", "3"))
     # Every run writes to a NEW directory - never an existing one.
     # Fresh dir => the resume scanner finds no completed rows => nothing
@@ -1843,14 +1915,17 @@ if __name__ == "__main__":
     remove_tasks = True
     tasks_to_remove = 1
     # PO runs fix LaCAM (spec §8); everything else keeps the configured planner.
-    PLANNER = ["lacam"] if PO_EXPERIMENT else ["pp"]
+    # HVBTA_PLANNER overrides the planner axis (e.g. the hyper-constrained
+    # PP pilot forces pp to stress replanning under failures).
+    PLANNER = [os.environ.get("HVBTA_PLANNER", "lacam" if PO_EXPERIMENT else "pp")]
     TARGET_EVENT_COUNT_K = 125
     TRANSIENT_FLOOR = 200
 
     # NOTE: every run writes to a fresh PO_OUTPUT_DIRNAME; never an existing
-    # results directory (agent instructions §0.3).
-    dir_path = os.path.join('hvbta', 'io', 'results',
-                            PO_OUTPUT_DIRNAME if PO_EXPERIMENT else 'hyper-constrained')
+    # results directory (agent instructions 0.3). Always honor the
+    # env-driven PO_OUTPUT_DIRNAME (HVBTA_OUTDIR) regardless of PO mode -
+    # it must NEVER silently fall back to a legacy results directory.
+    dir_path = os.path.join('hvbta', 'io', 'results', PO_OUTPUT_DIRNAME)
     po_diag_dir = os.path.join(dir_path, 'po_diagnostics')
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -1921,7 +1996,7 @@ if __name__ == "__main__":
                 'Wasted_Travel_Steps', 'Wasted_Travel_Fraction',
                 'Masked_Starvation_Count', 'Mean_Masked_Wait', 'Reveal_Events',
                 'Mis_Assignment_Recovery_Latency',
-                'True_Assignment_Suitability', 'Masked_View_Suitability',
+                'True_Assignment_Suitability', 'Masked_View_Suitability', 'Observed_View_Suitability',
                 'Nav_Drop_Count', 'Nav_Drop_Wasted_Travel',
                 # PO baseline + invariant diagnostics
                 'Never_Attempted_Count', 'All_Zero_Skip_Ticks', 'Stuck_Assigned_Robot_Ticks',
@@ -1939,6 +2014,7 @@ if __name__ == "__main__":
                 'Robot_Arrival_Rate', 'Robot_Departure_Rate',
                 # Partial-observability config covariates (spec §7)
                 'Mask_Level', 'Mask_Count', 'Mask_Policy',
+                'Obs_Noise_Sigma', 'Noise_Experiment',
                 # Map size
                 'Map Size',
             ])
@@ -2068,14 +2144,30 @@ if __name__ == "__main__":
                                     # (mask level/policy are not in the schedule seed).
                                     # When PO_EXPERIMENT is off there is a single legacy
                                     # condition and the PO machinery stays disabled.
-                                    for mask_level, mask_policy in (PO_CONDITIONS if PO_EXPERIMENT else ((None, None),)):
+                                    # NOISE_EXPERIMENT (8.1): the condition axis
+                                    # becomes sigma_obs in {0, 0.05, 0.1, 0.2,
+                                    # 0.3} with masks off (none/none). sigma is
+                                    # not in any seed, so every condition
+                                    # replays the identical schedule and the
+                                    # sigma=0 rows reproduce the no-noise
+                                    # results exactly.
+                                    NOISE_EXPERIMENT = os.environ.get("HVBTA_NOISE", "0") == "1"
+                                    NOISE_SIGMAS = [0.0, 0.05, 0.1, 0.2, 0.3]
+                                    if NOISE_EXPERIMENT:
+                                        noise_conditions = (("none", "none", s) for s in NOISE_SIGMAS)
+                                    elif PO_EXPERIMENT:
+                                        noise_conditions = ((ml, mp, None) for ml, mp in PO_CONDITIONS)
+                                    else:
+                                        noise_conditions = ((None, None, None),)
+                                    for mask_level, mask_policy, noise_sigma in noise_conditions:
                                         # Resume: skip the whole condition (initial matrix +
                                         # assignments + all method runs) when every method for
                                         # this rep is already on disk.
                                         if resume_counts and all(
                                             resume_counts.get(
                                                 (os.path.basename(map_file), num_robots, num_tasks,
-                                                 algo, scenario_name, sm_name, mask_level, mask_policy, _n), 0) > rep
+                                                 algo, scenario_name, sm_name, mask_level, mask_policy,
+                                                 noise_sigma, _n), 0) > rep
                                             for _n in (voting_names + optimization_names + direct_names)
                                         ):
                                             continue
@@ -2088,6 +2180,12 @@ if __name__ == "__main__":
                                         _suit_collector["active"] = (mask_level == "none" or mask_level is None)
                                         _suit_collector["scenario"] = scenario_name
                                         sm_for_matrix = po_cond.masked_scorer(_collecting_sm) if po_cond is not None else _collecting_sm
+                                        # 8.1: the initial allocation also sees the
+                                        # noisy view (tick 0).
+                                        if noise_sigma is not None:
+                                            from hvbta.partial_observability import noisy_scorer as _noisy
+                                            sm_for_matrix = _noisy(sm_for_matrix, noise_sigma,
+                                                                   schedule_seed, [0])
 
                                         voting_outputs = []
                                         assignment_infos = []
@@ -2160,7 +2258,15 @@ if __name__ == "__main__":
                                             opt_outputs = []
                                             for opt_fn, opt_name in zip(optimization_methods, optimization_names):
                                                 _seed_rngs(_derived_seed(schedule_seed, "initial", opt_name))
-                                                out, score, length, per_agent = O.assign_tasks_with_method(opt_fn, suitability_matrix)
+                                                init_fn = opt_fn
+                                                if opt_fn is O.perturbed_jv_task_allocation:
+                                                    # 8.2: initial solve draws the baseline's
+                                                    # own noise from the per-run seed at
+                                                    # replan index "initial".
+                                                    init_fn = O.perturbed_jv_factory(
+                                                        _derived_seed(schedule_seed, "run", opt_name,
+                                                                      "pjv", "initial"))
+                                                out, score, length, per_agent = O.assign_tasks_with_method(init_fn, suitability_matrix)
                                                 initial_jains = _record_initial(Run_ID, opt_name, out, score, length, per_agent)
                                                 opt_outputs.append((out, initial_jains))
                                             outputs = voting_outputs + opt_outputs + direct_outputs
@@ -2211,6 +2317,7 @@ if __name__ == "__main__":
                                                 event_schedule=event_schedule,
                                                 mask_level=mask_level,
                                                 mask_policy=mask_policy,
+                                                noise_sigma=noise_sigma,
                                                 schedule_seed=schedule_seed,
                                                 run_seed=_derived_seed(schedule_seed, "run", method_pretty[meth]),
                                                 po_diag_path=po_diag_path,
@@ -2231,6 +2338,10 @@ if __name__ == "__main__":
                                                 mask_level if PO_EXPERIMENT else "",
                                                 MASK_COUNTS.get(mask_level, -1) if PO_EXPERIMENT else -1,
                                                 mask_policy if PO_EXPERIMENT else "",
+                                                # 8.1 provenance: sigma_obs (blank when the
+                                                # noise experiment is off) + flag.
+                                                (noise_sigma if noise_sigma is not None else ""),
+                                                (1 if noise_sigma is not None else 0),
                                             ]
                                             writer.writerow(row_prefix + list(output_tuple) + config_suffix + [map_size])
                                             # Flush per row so an interrupted sweep keeps every

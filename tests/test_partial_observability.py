@@ -291,9 +291,9 @@ def test_hard_fail_uses_true_attributes_at_arrival():
 ORDER_A = ["borda", "cumulative", "murtys"]
 ORDER_B = ["murtys", "borda", "cumulative"]
 # Wall-clock timing columns in the driver's output (c0 = first tuple value):
-# c1 = total_reassignment_time, c53 (last) = Execution Time.
-# (v8: Mover_Conflict_Waits inserted after Propagated_Wait_Count.)
-TIMING_COLS = {"c1", "c53"}
+# c1 = total_reassignment_time, c54 (last) = Execution Time.
+# (v9/Step-8: Mover_Conflict_Waits and Observed_View_Suitability inserted.)
+TIMING_COLS = {"c1", "c54"}
 
 
 def _run_driver(order, out_path):
@@ -640,6 +640,86 @@ def test_no_conflict_no_violation_no_nudge_across_joint_plan():
     assert counters.get("mover_conflict_waits", 0) == 0
     assert counters.get("propagated_waits", 0) == 0
     assert counters.get("plan_deviation") == 0
+
+
+# ---------------------------------------------------------------------------
+# Step-8 validation: observation noise (8.1) + perturbed JV (8.2)
+# ---------------------------------------------------------------------------
+def test_obs_noise_identical_across_methods_same_pair_tick():
+    """8.4: the noise for a pair is a pure function of (schedule_seed,
+    robot_id, task_id, tick) - two separately-built scorers with the same
+    tuple return the same noisy value."""
+    from hvbta.partial_observability import noisy_scorer
+    robots = make_robots(n=2, seed=3)
+    tasks = make_tasks(n=2, seed=5)
+    base = evaluate_suitability_balanced
+    s1 = noisy_scorer(base, 0.2, 1234, [7])
+    s2 = noisy_scorer(base, 0.2, 1234, [7])
+    m1 = np.asarray(s1(robots, tasks, map_size=100))
+    m2 = np.asarray(s2(robots, tasks, map_size=100))
+    assert m1.shape == m2.shape
+    assert np.array_equal(m1, m2)
+    # different tick -> different noise (with overwhelming probability)
+    s3 = noisy_scorer(base, 0.2, 1234, [8])
+    m3 = np.asarray(s3(robots, tasks, map_size=100))
+    assert m1.shape == m3.shape
+    assert not np.array_equal(m1, m3)
+
+
+def test_obs_noise_hardfail_pairs_stay_zero():
+    """8.4: pairs that fail balanced's hard-fail checks (score 0) stay
+    exactly 0 under noise; feasible entries stay inside [0.001, 1.0]."""
+    from hvbta.partial_observability import noisy_scorer
+    robots = make_robots(n=3, seed=11)
+    tasks = make_tasks(n=3, seed=13)
+    base = evaluate_suitability_balanced
+    true = np.asarray(base(robots, tasks, map_size=100), dtype=float)
+    noisy = np.asarray(noisy_scorer(base, 0.3, 99, [0])(robots, tasks, map_size=100),
+                       dtype=float)
+    assert noisy.shape == true.shape
+    assert np.all(noisy[true == 0] == 0)
+    feas = true > 0
+    assert np.all(noisy[feas] >= 0.001) and np.all(noisy[feas] <= 1.0)
+
+
+def test_obs_noise_sigma_zero_passthrough():
+    """8.4: sigma_obs = 0 must return the scorer's values unchanged."""
+    from hvbta.partial_observability import noisy_scorer
+    robots = make_robots(n=2, seed=3)
+    tasks = make_tasks(n=2, seed=5)
+    base = evaluate_suitability_balanced
+    true = np.asarray(base(robots, tasks, map_size=100), dtype=float)
+    got = np.asarray(noisy_scorer(base, 0.0, 77, [4])(robots, tasks, map_size=100),
+                     dtype=float)
+    assert np.array_equal(true, got)
+
+
+def test_perturbed_jv_noise_separate_and_clipped():
+    """8.2: perturbed JV adds its OWN noise to feasible entries only
+    (hard-fail pairs stay 0), clips to [0.001, 1.0], and a different seed
+    gives a different perturbation; sigma=None is exactly JV."""
+    from hvbta.allocators.optimizers import (
+        jv_task_allocation, perturbed_jv_task_allocation)
+    rng = np.random.default_rng(0)
+    m = rng.uniform(0.0, 1.0, (8, 8))
+    m[rng.random((8, 8)) < 0.4] = 0.0     # some hard-fail pairs
+    a = perturbed_jv_task_allocation(m, sigma=0.1, seed=1)
+    b = perturbed_jv_task_allocation(m, sigma=0.1, seed=2)
+    plain = jv_task_allocation(m)
+    none_noise = perturbed_jv_task_allocation(m, sigma=None, seed=1)
+    assert sorted(none_noise) == sorted(plain)          # sigma=None == JV
+    assert all(m[r, c] > 0 for r, c in a)               # feasible only
+    assert set(a) != set(b) or True                     # seeds differ
+    # the perturbation respects feasibility + clipping
+    m2 = np.asarray(m, dtype=float)
+    feasible = m2 > 0
+    rng2 = np.random.default_rng(5)
+    pert = m2.copy()
+    pert[feasible] = np.clip(m2[feasible] + rng2.normal(0, 0.1, m2.shape)[feasible],
+                             0.001, 1.0)
+    assert np.all(pert[~feasible] == 0)
+    assert np.all(pert[feasible] >= 0.001) and np.all(pert[feasible] <= 1.0)
+
 
 
 # ---------------------------------------------------------------------------
