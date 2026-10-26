@@ -187,3 +187,17 @@ concurrent workers on the largest configs (combat, combat2, den901d at 100
 robots) at the 1 s limit, so the limit stays 1.0 s. All sweeps run under
 this deterministic regime; pre-2026-10-25 voting rows carry anytime-budget
 noise and are not bit-comparable to later rows.
+
+### 2026-10-26: perturbed JV baseline's sigma_pjv = 0.05 (chosen by the duplicate-retry rule)
+
+Step 8.2 requires choosing sigma_pjv before seeing any completion results,
+as the smallest candidate in {0.02, 0.05, 0.1, 0.2} whose duplicate-retry
+rate is below 10%. Measured on the pilot map (lak102d, 16 group matrices:
+[10,20]x[10,20] x 4 scenarios, rep 0): for each matrix, two independent
+noise draws were solved with JV; a retry is a duplicate when both draws
+yield the identical assignment. Rates: sigma 0.02 -> 4/16 = 25.0%,
+sigma 0.05 -> 1/16 = 6.2%, sigma 0.1 -> 1/16 = 6.2%, sigma 0.2 -> 0/16 =
+0.0%. CHOSEN: sigma_pjv = 0.05 (smallest below 10%). No completion
+numbers were read for this choice. sigma_pjv is the baseline's own
+internal randomness, seeded per (run seed, replan index) with fresh draws
+on every retry; it is never mixed with sigma_obs in code or columns.
