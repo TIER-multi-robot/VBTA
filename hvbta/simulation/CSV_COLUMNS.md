@@ -3,8 +3,8 @@
 Every row in a simulation-results CSV corresponds to a single
 `(map, num_robots, num_tasks, num_candidates, suitability_method, planner,
 scenario, rep, method, mask_condition)` run. This document describes the
-76-column CSV that `main_simulation.py` produces (v7: 51 legacy + 20
-partial-observability/pool-diagnostic columns + 5 collision/limit columns).
+77-column CSV that `main_simulation.py` produces (v8: 51 legacy + 20
+partial-observability/pool-diagnostic columns + 6 collision/limit columns).
 
 For each metric we note: **what it measures**, **whether high or low is
 better**, and **what claim it backs** (see `CLAIMS_AND_EVIDENCE.md`).
@@ -19,10 +19,10 @@ The row is assembled as:
 | Component | Items | Source |
 |---|---|---|
 | `row_prefix` | 14 | `_record_assignment` (13 items: identity + initial quality + initial fairness) with `Planner` injected at position 4 |
-| `output_tuple` | 53 | `benchmark_simulation` = `main_simulation` return (52: 48 pre-collision + 4 collision/limit incl. `Propagated_Wait_Count`) + `execution_time` (1) |
+| `output_tuple` | 54 | `benchmark_simulation` = `main_simulation` return (53: 48 pre-collision + 5 collision/limit incl. `Propagated_Wait_Count` and `Mover_Conflict_Waits`) + `execution_time` (1) |
 | `config_suffix` | 8 | Scenario + 4 raw rates + 3 PO config columns, appended at the writer callsite |
 | `map_size` | 1 | Appended at the writer callsite |
-| **Total** | **76** | |
+| **Total** | **77** | |
 
 ---
 
@@ -199,7 +199,8 @@ event is raised through `pending_event_steps`.
 | 51 | `Reveal_Events` | Number of masks removed | Contextual | Arrivals at still-masked tasks |
 | 52 | `Mis_Assignment_Recovery_Latency` | Mean ticks from a mis-assignment to the task's next reassignment | **Lower** = recovers faster | H-PO3; -1 when no mis-assignments |
 | 53 | `True_Assignment_Suitability` | Mean balanced suitability of executed assignments on TRUE attributes | **Higher** = better | How soft-field masking degrades quality (H-PO1) |
-| 54 | `Masked_View_Suitability` | Same assignments scored on the masked view | Contextual | Gap vs column 53 shows how much the policy misjudged |
+| 54 | `Masked_View_Suitability` | Same assignments scored on the masked view |
+| 54b | `Observed_View_Suitability` | Same assignments scored on the allocator's ACTUAL view (noisy under the 8.1 score-noise experiment) | Contextual | Gap vs column 53 shows how much the policy misjudged |
 | 55 | `Nav_Drop_Count` | Unassignments from the pre-existing navigation runtime check | Contextual | §6.5; counted at `none` too (pre-existing baseline) |
 | 56 | `Nav_Drop_Wasted_Travel` | Travel steps spent on pairings dropped by the nav check | Contextual | Kept separate from mis-assignment waste |
 
@@ -220,7 +221,7 @@ the per-run JSON in `<results_dir>/po_diagnostics/`, not this CSV.
 | 58 | `All_Zero_Skip_Ticks` | Ticks where allocation was skipped because the unassigned × unassigned (masked) submatrix was all zero | Contextual | The no-bounce guard: no random fallback, no zero-suitability pairs executed; infeasible-for-all tasks starve instead |
 | 59 | `Stuck_Assigned_Robot_Ticks` | Ticks (after a SUCCESSFUL plan call) where some robot had an assigned task but an EMPTY `current_path` (can neither move nor work) | **Must be 0** | Invariant per spec §1c. Ticks following planner FAILURES are excluded: the documented accept-stale-paths behavior legitimately leaves newly-assigned robots pathless until the next successful plan (verified: no stuck robot survives a successful plan call) |
 
-## 12c-2. Collision handling diagnostics (v7, 4 columns)
+## 12c-2. Collision handling diagnostics (v8, 5 columns)
 
 Emitted by the two-phase timestep (`timestep.py`); counts are per-run totals.
 Column numbers below are the v7 CSV positions; sections 12d/13 shift accordingly
@@ -229,10 +230,11 @@ renumbering pass).
 
 | # | Column | What it measures | Direction | Notes |
 |---|---|---|---|---|
-| 60 | `Planned_Conflict_Count` | Vertex + swap conflicts in the tick's intended next-position set (after transitive waiting) | **Must be ~0** | With jointly planned paths this is 0; a nonzero value marks a mixed-vintage plan bug |
+| 60 | `Planned_Conflict_Count` | Vertex + swap conflicts in the tick's intended next-position set (after mover-mover resolution and transitive waiting) | **Must be 0** | With jointly planned paths this is 0; a nonzero value marks an unpatched plan bug |
 | 61 | `Safety_Nudge_Count` | Safety-net fires: a parked robot sharing a cell was nudged to a free neighbor | **Must be 0** | Last resort; each fire also leaves `occupied_locations` stale |
 | 62 | `Collision_Violation_Count` | End-of-tick invariant breaches (co-located robots or same-tick swaps) | **Must be 0** | A violation means the nets failed to prevent physical overlap |
 | 63 | `Propagated_Wait_Count` | Forced waits from transitive waiting: robots whose planned next step was blocked by a staying robot (no usable path / mid-route unassign / newly arrived), so they held position | Contextual | The cost of the stale-path design: robots that wait instead of colliding. 0 in runs with no planner failures and no mid-route stops |
+| 64 | `Mover_Conflict_Waits` | Mover-mover conflicts resolved by the deterministic rule (lowest robot ID keeps its move; the other waits): two movers targeting the same cell, or exchanging cells | **Must be ~0** | Nonzero values mark plan desyncs (off-schedule robots); each fire also sets the replan-on-deviation flag |
 
 ## 12d. Anytime pool diagnostics (2 columns)
 
@@ -255,6 +257,8 @@ Constant per run — the raw configuration that produced this row.
 | 68 | `Mask_Level` | `none` / `low` / `high` | Empty string when PO inactive |
 | 69 | `Mask_Count` | Fields masked per task (0 / 2 / 5) | -1 when PO inactive |
 | 70 | `Mask_Policy` | `optimistic` / `pessimistic` / `none` (when level is none) | Empty string when PO inactive |
+| 70b | `Obs_Noise_Sigma` | The 8.1 score-noise sigma_obs of the run (0/0.05/0.1/0.2/0.3); empty when the noise experiment is off | sigma is not in any seed |
+| 70c | `Noise_Experiment` | 1 = run belongs to the 8.1 score-noise experiment | 0 otherwise |
 
 Mask conditions combine into 5 groups: `none`, `low-opt`, `low-pess`,
 `high-opt`, `high-pess`. Masks are a pure function of
