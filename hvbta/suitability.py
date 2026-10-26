@@ -185,23 +185,25 @@ def bfs_distances(grid, source):
     cell reachable from it. grid[r][c] == 0 is free, 1 is blocked.
 
     Computed ONCE per task at creation and attached as
-    task.distance_map = {(row, col): steps}; the scorer then answers any
-    "how far is this robot from this task" question with a dict lookup.
+    task.distance_map: a full-grid NumPy int32 array (H x W), -1 =
+    unreachable/obstacle. A NumPy array, not a dict, so a worker's
+    distance maps for a 197x197 map with ~100 tasks cost a few MB
+    total instead of hundreds of MB of Python dict entries.
     """
-    from collections import deque
+    import numpy as _np
     rows, cols = len(grid), len(grid[0])
-    dist_map = {source: 0}
+    dist_arr = _np.full((rows, cols), -1, dtype=_np.int32)
+    from collections import deque
+    dist_arr[source[0], source[1]] = 0
     queue = deque([source])
     while queue:
         r, c = queue.popleft()
-        d = dist_map[(r, c)]
+        d = dist_arr[r, c]
         for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
-            if 0 <= nr < rows and 0 <= nc < cols and grid[nr][nc] == 0:
-                cell = (nr, nc)
-                if cell not in dist_map:
-                    dist_map[cell] = d + 1
-                    queue.append(cell)
-    return dist_map
+            if 0 <= nr < rows and 0 <= nc < cols and grid[nr][nc] == 0 and dist_arr[nr, nc] < 0:
+                dist_arr[nr, nc] = d + 1
+                queue.append((nr, nc))
+    return dist_arr
 
 
 def dist(robot: CapabilityProfile, task: TaskDescription):
@@ -218,7 +220,11 @@ def dist(robot: CapabilityProfile, task: TaskDescription):
     dm = getattr(task, "distance_map", None)
     if dm is None:
         return None
-    return dm.get(robot.location)
+    r, c = robot.location
+    if r < 0 or c < 0 or r >= dm.shape[0] or c >= dm.shape[1]:
+        return None
+    v = dm[r, c]
+    return None if v < 0 else int(v)
 
 def evaluate_suitability_balanced(
         robots: list[CapabilityProfile], 

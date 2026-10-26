@@ -513,7 +513,8 @@ def main_simulation(
     # Phase 3v2 collision accounting: safety-net fires (swap/nudge) and
     # end-of-tick invariant violations, counted by the timestep.
     collision_counters = {"swap": 0, "nudge": 0, "violations": 0, "planned_conflicts": 0,
-                          "propagated_waits": 0}
+                          "propagated_waits": 0, "mover_conflict_waits": 0,
+                          "plan_deviation": 0}
     # Phase 3 cascade diagnostics: one entry per failed planner call,
     # {tick, kind, ...} (kind = duplicate_start / duplicate_goal /
     # lacam_no_solution / lacam_timeout / engine_unsolved). Goes into the
@@ -650,6 +651,12 @@ def main_simulation(
     # movement. No robot moves on a plan made stale by an event in the
     # same tick.
     completed_prev_timestep = 0
+    # v8 replan-on-deviation: set by the timestep when any robot's
+    # movement deviates from its plan (off-plan wait, mover-conflict
+    # wait, or an assigned robot with no usable path). Forces a planner
+    # call at the top of the next tick, before movement, so plans never
+    # stay stale after a deviation.
+    deviation_replan_pending = False
     for time_step in range(max_time_steps):
         # Per-run wall-clock limit: stop early, flag the row, never drop it.
         if time.perf_counter() - run_wall_start > RUN_WALL_LIMIT_S:
@@ -666,6 +673,11 @@ def main_simulation(
         # No robot moves on a plan made stale by an event in the same tick.
         events["completed_tasks"] += completed_prev_timestep
         should_replan_paths = completed_prev_timestep > 0
+        # Replan on deviation (v8): the previous tick's timestep flagged
+        # that some robot ended off-plan; replan before any movement.
+        if deviation_replan_pending:
+            should_replan_paths = True
+            deviation_replan_pending = False
 
         # Snapshot pool sizes so we can measure add/remove churn from the dynamic
         # block below. Combined with completions, this feeds the adaptive
@@ -1260,6 +1272,10 @@ def main_simulation(
             collision_counters=collision_counters,
         )
         completed_prev_timestep = completed_this_step
+        # Replan-on-deviation: the timestep flagged an off-plan wait or
+        # a plan-less assigned robot; the top of the next tick replans.
+        if collision_counters.get("plan_deviation"):
+            deviation_replan_pending = True
 
         # Per-step throughput signal (used for mean + variance at end).
         completed_per_step.append(completed_this_step)
@@ -1458,6 +1474,7 @@ def main_simulation(
         collision_counters["nudge"],
         collision_counters["violations"],
         collision_counters.get("propagated_waits", 0),
+        collision_counters.get("mover_conflict_waits", 0),
         # Run-level wall-clock limit flag (1 = hit the limit, stopped early)
         1 if run_timed_out else 0,
         # Section 15c - anytime pool diagnostics (2.8)
@@ -1612,6 +1629,16 @@ def _scan_completed_runs(dir_path):
 
 
 if __name__ == "__main__":
+    # Ablation controls (env-driven so parallel runs need no file edits):
+    #   HVBTA_ZERO_PAIR  ("1"/"0") -> V.VOTING_ZERO_PAIR_FILTER
+    #   HVBTA_THRESHOLD   ("1"/"0") -> V.VOTING_COVERAGE_THRESHOLD
+    #   HVBTA_VOTING_ONLY ("1"/"0") -> drop optimization methods (Murty's
+    #     rows are invariant across the flag pair, verified in v9; voting
+    #     rows are the ablation's subject)
+    #   HVBTA_OUTDIR      -> PO_OUTPUT_DIRNAME
+    ABLATION_ZP = os.environ.get("HVBTA_ZERO_PAIR", "1") == "1"
+    ABLATION_TH = os.environ.get("HVBTA_THRESHOLD", "1") == "1"
+    ABLATION_VOTING_ONLY = os.environ.get("HVBTA_VOTING_ONLY", "0") == "1"
     voting_methods = [
         V.rank_assignments_borda,
         V.rank_assignments_approval,
@@ -1629,6 +1656,9 @@ if __name__ == "__main__":
         O.murtys_task_allocation,
     ]
     optimization_names = [func_name(f) for f in optimization_methods]
+    if ABLATION_VOTING_ONLY:
+        optimization_methods = []
+        optimization_names = []
     # Direct-assignment methods: the LLM returns (robot_id, task_id) pairs straight up,
     # bypassing the suitability-matrix + voting/optimization stack. Slot here so it
     # benchmarks alongside the others.
@@ -1739,14 +1769,20 @@ if __name__ == "__main__":
     # fixes), 3 reps, pilot config. Three flag combinations; Murty's rows
     # must be identical across all three.
     PO_SWEEP_CONFIGS = [(r"lak102d.map", [10, 20], [10, 20])]
+    # Small-config override for verification runs (parallel==serial check).
+    _sizes = os.environ.get("HVBTA_SIZES")
+    if _sizes:
+        _r = int(_sizes)
+        PO_SWEEP_CONFIGS = [(r"lak102d.map", [_r], [_r])]
+    num_repetitions = int(os.environ.get("HVBTA_REPS", "3"))
     # Every run writes to a NEW directory - never an existing one.
     # Fresh dir => the resume scanner finds no completed rows => nothing
     # is skipped, every config re-runs (per agent instructions §0.4).
-    PO_OUTPUT_DIRNAME = "pilot_po_P3_collision_v7"
+    PO_OUTPUT_DIRNAME = os.environ.get("HVBTA_OUTDIR", "pilot_po_P3_collision_v9_smoke_nudge_off2")
     # Phase 3v3: idle agents + step-aside goals + 1s planner budget +
     # 10-min run limit. The v2 dir holds the interrupted 18-hour partial.
-    V.VOTING_ZERO_PAIR_FILTER = True
-    V.VOTING_COVERAGE_THRESHOLD = True
+    V.VOTING_ZERO_PAIR_FILTER = ABLATION_ZP
+    V.VOTING_COVERAGE_THRESHOLD = ABLATION_TH
     from hvbta.partial_observability import PO_CONDITIONS, MASK_COUNTS
 
     # Report A collector (Phase 2 addition): record every positive balanced-
@@ -1791,7 +1827,6 @@ if __name__ == "__main__":
 
     map_dir = r"MAPF_benchmark_maps"
 
-    num_repetitions = 3
     add_tasks = True
     add_robots = True
     remove_robots = True
@@ -1887,7 +1922,7 @@ if __name__ == "__main__":
                 'Never_Attempted_Count', 'All_Zero_Skip_Ticks', 'Stuck_Assigned_Robot_Ticks',
                 # Collision handling diagnostics (Phase 3v6: two-phase timestep)
                 'Planned_Conflict_Count', 'Safety_Nudge_Count', 'Collision_Violation_Count',
-                'Propagated_Wait_Count',
+                'Propagated_Wait_Count', 'Mover_Conflict_Waits',
                 # Run wall-clock limit flag (1 = hit the limit, stopped early)
                 'Run_Timed_Out',
                 # Anytime pool diagnostics (2.8)
