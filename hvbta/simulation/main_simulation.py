@@ -555,6 +555,10 @@ def main_simulation(
     # so the per-run delta can be added to Planner_Cap_Hits.
     planner_failed_calls = 0
     planner_cap_hits = 0
+    # First tick at which planner_failed_calls reached
+    # PLANNER_FAILED_CALL_BUDGET (planner-dead mode begins; reported as
+    # the Planner_Dead_Tick column, -1 = never). Deterministic.
+    planner_dead_tick = -1
     _pp_cap_hits_start = _PP.PP_EXPANSION_CAP_HITS
     # Ticks where allocation was skipped because the unassigned x unassigned
     # submatrix was all zero (2.7 guard; applies to every method and PO and
@@ -669,6 +673,8 @@ def main_simulation(
     if not _initial_planner_okay:
         plan_failure_count += 1
         planner_failed_calls += 1
+        if planner_dead_tick < 0 and planner_failed_calls >= PLANNER_FAILED_CALL_BUDGET:
+            planner_dead_tick = 0
         _entry = {"tick": 0, "phase": "initial"}
         _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
         plan_failure_log.append(_entry)
@@ -1190,6 +1196,8 @@ def main_simulation(
                 if not planner_okay:
                     plan_failure_count += 1
                     planner_failed_calls += 1
+                    if planner_dead_tick < 0 and planner_failed_calls >= PLANNER_FAILED_CALL_BUDGET:
+                        planner_dead_tick = time_step
                     _entry = {"tick": time_step}
                     _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
                     plan_failure_log.append(_entry)
@@ -1342,6 +1350,8 @@ def main_simulation(
                         if not planner_okay:
                             plan_failure_count += 1
                             planner_failed_calls += 1
+                            if planner_dead_tick < 0 and planner_failed_calls >= PLANNER_FAILED_CALL_BUDGET:
+                                planner_dead_tick = time_step
                             _entry = {"tick": time_step}
                             _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
                             plan_failure_log.append(_entry)
@@ -1621,6 +1631,10 @@ def main_simulation(
         planner_timing["calls"],
         planner_timing["ns"] / 1e6,
         planner_cap_hits + (_PP.PP_EXPANSION_CAP_HITS - _pp_cap_hits_start),
+        # First tick at which the run went planner-dead (the per-run
+        # failed-call budget was exhausted); -1 = never went dead.
+        # Deterministic; reported per method by sweep_report.py.
+        planner_dead_tick,
     )
 
 
@@ -2119,6 +2133,7 @@ if __name__ == "__main__":
                 'Threshold_Fire_Rate', 'Mean_Pool_Size_At_Rank',
                 # Planner-call accounting (PP-pilot diagnostics)
                 'Planner_Call_Count', 'Planner_Total_ms', 'Planner_Cap_Hits',
+                'Planner_Dead_Tick',
                 # Overhead
                 'Execution Time',
                 # Config covariates (constant per run)

@@ -4,8 +4,9 @@ all 8 methods, one small group each (lak102d 10x10, 4 scenarios, rep 0).
 Runs phase4_sweep.run_group in-process for sweep=noise and sweep=po and
 compares every output-tuple field against the serial __main__ CSVs,
 excluding wall-clock timing columns (output idx 1 total_reassignment_time,
-55 Planner_Total_ms, 57 exec time). Planner_Call_Count (54) and
-Planner_Cap_Hits (56) are deterministic and ARE compared.
+55 Planner_Total_ms, 58 exec time). Planner_Call_Count (54),
+Planner_Cap_Hits (56) and Planner_Dead_Tick (57) are deterministic and
+ARE compared.
 """
 import csv
 import glob
@@ -18,8 +19,8 @@ os.chdir(os.path.abspath(os.path.dirname(__file__)))
 import phase4_sweep as P
 
 SCENARIOS = ["calm", "task_churn", "fleet_churn", "overload"]
-TIMING_IDX = {1, 55, 57}   # 0-based within the 58-item output tuple
-N_OUT = 58                 # 57 main + exec
+TIMING_IDX = {1, 55, 58}   # 0-based within the 59-item output tuple
+N_OUT = 59                 # 58 main + exec
 
 
 def load_serial(dir_path, mode):
@@ -41,8 +42,8 @@ def load_serial(dir_path, mode):
 def main():
     ok = True
     for mode, sweep, serial_dir in [
-            ("noise", "noise", "verify_serial_noise_v3"),
-            ("po", "po", "verify_serial_po_v3")]:
+            ("noise", "noise", "verify_serial_noise_v4"),
+            ("po", "po", "verify_serial_po_v4")]:
         serial = load_serial(os.path.join("hvbta", "io", "results", serial_dir), mode)
         print(f"\n=== {mode.upper()} path: {len(serial)} serial rows loaded ===")
         checked = mismatches = 0

@@ -7,7 +7,9 @@ Standing report run after EVERY sweep (user requirement, 2026-10-26):
     PP-stress sweep), Stuck_Assigned_Robot_Ticks all 0;
     Mis_Assignment_Count 0 at mask none AND under pessimistic policies;
     Run_Timed_Out 0 (the 600 s safety stop must never fire);
-    Planner_Cap_Hits summary (deterministic planner-work cap firings).
+    Planner_Cap_Hits summary (deterministic planner-work cap firings);
+    planner-dead runs per method (PLANNER_FAILED_CALL_BUDGET exhausted:
+    count, dead tick mean/median, mean completion dead vs other runs).
   - Planning_Time_us per allocation call by method:
     (initial alloc time + total_reassignment_time) / (1 + reassignments).
 
@@ -31,7 +33,9 @@ OUT_IDX = {
     "failures": 28, "alts": 29, "mis": 30,
     "stuck": 45, "conflicts": 46, "nudge": 47, "violations": 48,
     "prop": 49, "mover": 50, "timedout": 51,
-    "plcalls": 54, "plms": 55, "cap_hits": 56, "exec": 57,
+    "plcalls": 54, "plms": 55, "cap_hits": 56,
+    # dead_tick (57) and exec (58) handled explicitly below: pre-2026-10-27
+    # CSVs have a 58-item tuple (no Planner_Dead_Tick) and must still load.
 }
 
 
@@ -61,6 +65,10 @@ def load_rows(dir_path):
                     "mask_level": r.get("Mask_Level") or "none",
                     "mask_policy": r.get("Mask_Policy") or "none",
                     "init_alloc_us": float(r.get("Init_Alloc_us") or 0.0),
+                    # 59-item tuple (2026-10-27+): dead_tick = o[57], exec =
+                    # o[58]. Legacy 58-item tuple: no Planner_Dead_Tick.
+                    "dead_tick": (int(o[57]) if len(o) >= 59 else None),
+                    "exec": float(o[-1]),
                     **{k: o[i] for k, i in OUT_IDX.items()},
                 })
         return rows, "phase4"
@@ -92,6 +100,8 @@ def load_rows(dir_path):
                     "plcalls": int(r["Planner_Call_Count"]),
                     "plms": float(r["Planner_Total_ms"]),
                     "cap_hits": int(r["Planner_Cap_Hits"]),
+                    "dead_tick": (int(r["Planner_Dead_Tick"])
+                                  if r.get("Planner_Dead_Tick") else None),
                     "exec": float(r["Execution Time"]),
                     "mask_ok": (r.get("Mask_Level") or "") in ("", "none"),
                 })
@@ -164,6 +174,41 @@ def report(dir_path, pp_stress=False):
         mc = np.mean([r["plms"] / max(1, r["plcalls"]) for r in g])
         print(f"  {m:40s} calls/run={np.mean([r['plcalls'] for r in g]):6.0f} "
               f"ms/call={mc:8.1f} fails/run={np.mean([r['failures'] for r in g]):6.1f}")
+
+    # ---- planner-dead runs (PLANNER_FAILED_CALL_BUDGET exhausted) ----
+    # Per method: how many runs went planner-dead, the tick it happened
+    # (mean / median over dead runs), and mean completion for dead vs
+    # other runs.
+    print("\n--- planner-dead runs (failed-call budget exhausted) ---")
+    unknown = sum(1 for r in rows if r.get("dead_tick") is None)
+    if unknown == len(rows):
+        print("  n/a: these CSVs predate the Planner_Dead_Tick column")
+    else:
+        if unknown:
+            print(f"  note: {unknown} legacy rows without Planner_Dead_Tick"
+                  " are counted as not dead")
+        any_dead = any((r.get("dead_tick") or -1) >= 0 for r in rows)
+        if not any_dead:
+            print("  none: no run exhausted PLANNER_FAILED_CALL_BUDGET")
+        else:
+            print(f"  {'method':40s} {'dead':>5s} {'/runs':>6s} "
+                  f"{'tick mean':>9s} {'tick p50':>9s} "
+                  f"{'compl dead':>10s} {'compl other':>11s}")
+            for m in sorted({r["method"] for r in rows}):
+                g = [r for r in rows if r["method"] == m]
+                dead = [r for r in g if (r.get("dead_tick") or -1) >= 0]
+                other = [r for r in g if (r.get("dead_tick") or -1) < 0]
+                if dead:
+                    ticks = [r["dead_tick"] for r in dead]
+                    cd = float(np.mean([r["completion"] for r in dead]))
+                    tm = float(np.mean(ticks))
+                    tp = float(np.percentile(ticks, 50))
+                else:
+                    ticks, cd, tm, tp = [], float("nan"), float("nan"), float("nan")
+                co = (float(np.mean([r["completion"] for r in other]))
+                      if other else float("nan"))
+                print(f"  {m:40s} {len(dead):5d} {len(g):6d} "
+                      f"{tm:9.1f} {tp:9.1f} {cd:10.3f} {co:11.3f}")
 
     print(f"\nOVERALL: {'ALL INVARIANTS PASS' if ok else 'INVARIANT VIOLATIONS PRESENT'}")
     return ok

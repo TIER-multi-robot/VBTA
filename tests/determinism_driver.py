@@ -91,7 +91,7 @@ def main():
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["method"] + [f"c{i}" for i in range(58)])
+        w.writerow(["method"] + [f"c{i}" for i in range(59)])
         for name in order:
             meth = METHODS[name]
             # Per-method initial-assignment RNG isolation (same scheme as the

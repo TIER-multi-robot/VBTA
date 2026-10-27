@@ -20,10 +20,10 @@ The row is assembled as:
 | Component | Items | Source |
 |---|---|---|
 | `row_prefix` | 14 | `_record_assignment` (13 items: identity + initial quality + initial fairness) with `Planner` injected at position 4 |
-| `output_tuple` | 57 | `benchmark_simulation` = `main_simulation` return (56: 48 pre-collision + 5 collision/limit incl. `Propagated_Wait_Count` and `Mover_Conflict_Waits` + 3 planner-call accounting) + `execution_time` (1) |
+| `output_tuple` | 58 | `benchmark_simulation` = `main_simulation` return (57: 48 pre-collision + 5 collision/limit incl. `Propagated_Wait_Count` and `Mover_Conflict_Waits` + 4 planner-call accounting) + `execution_time` (1) |
 | `config_suffix` | 8 | Scenario + 4 raw rates + 3 PO config columns, appended at the writer callsite |
 | `map_size` | 1 | Appended at the writer callsite |
-| **Total** | **80** | |
+| **Total** | **81** | |
 
 ---
 
@@ -244,7 +244,7 @@ renumbering pass).
 | 60 | `Threshold_Fire_Rate` | Share of threshold-active voting calls where the anytime early termination cut the pool short of its full size | Contextual | -1 when the run made no voting allocations (e.g. Murty's rows). Under the coverage threshold (2.8) a healthy value means the anytime path is exploring at least `MIN_POOL_BEFORE_THRESHOLD` candidates before stopping |
 | 61 | `Mean_Pool_Size_At_Rank` | Mean ranked-pool size across ALL voting calls in the run | **Higher** = more exploration | -1 when no voting calls. Pools of ~1 indicate degenerate anytime behavior (pre-2.8 bug where the first candidate always cleared the mean-per-pair threshold) |
 
-## 12e. Planner-call accounting (3 columns)
+## 12e. Planner-call accounting (4 columns)
 
 Per-run planner-work accounting (`MAPF_wrapper.PLANNER_TIMING` + the
 deterministic planner-work caps, reset at run start).
@@ -254,6 +254,7 @@ deterministic planner-work caps, reset at run start).
 | 62 | `Planner_Call_Count` | Total `run_planner` invocations this run: the initial call + every replan call + every replan-on-failure alternative retry | Contextual | Deterministic count (independent of machine load); the denominator for per-call planner cost and the quantity the deterministic per-tick planner-call cap bounds |
 | 63 | `Planner_Total_ms` | Total wall-clock milliseconds spent inside `run_planner` this run | Contextual | Wall-clock: exclude from cross-run equality checks. `Planner_Total_ms / Planner_Call_Count` = mean ms per planner call |
 | 64 | `Planner_Cap_Hits` | Every firing of a deterministic planner-work cap: the per-tick planner-call cap (`PLANNER_CALLS_PER_TICK = 4`), the per-run failed-call budget (`PLANNER_FAILED_CALL_BUDGET = 150`; after it the run is planner-dead — no further planner calls), and PP's per-call A* expansion budget (`PP_MAX_EXPANSIONS = 400,000`) | **0 in normal runs** | The caps are count-based and identical for every method; they keep hyper-constrained PP runs far below the 600 s wall safety stop. Nonzero values mark runs whose planner work was truncated — analyze with the truncation in mind |
+| 65 | `Planner_Dead_Tick` | The tick at which the run first entered planner-dead mode (the failed-call budget was reached by a failing call); -1 = the run never went planner-dead | Contextual | Added 2026-10-27. Deterministic. `sweep_report.py` reports, per method: dead-run count, dead tick mean/median, and mean completion for dead vs other runs |
 
 **Derivable: allocation time per call (per-sweep reporting).**
 `Alloc_us_per_call = (Planning_Time_us + total_reassignment_time) / (1 + total_reassignments)`
