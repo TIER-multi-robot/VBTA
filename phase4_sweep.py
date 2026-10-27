@@ -61,7 +61,7 @@ SWEEP_CONFIGS = {
 
 SCENARIOS = ["calm", "task_churn", "fleet_churn", "overload"]
 REPS = 3
-N_METHODS = 7
+N_METHODS = 8
 
 # Largest-config per-run mean seconds, from the 2026-10-25 timing run
 # (one 7-method rep of each map's largest config, v9 code).
@@ -174,6 +174,7 @@ def run_group(job):
 
     import hvbta.allocators.voting as _V
     import hvbta.allocators.optimizers as _O
+    _O.PERTURBED_JV_SIGMA = 0.05
     methods = [
         ("rank_assignments_borda", _V.rank_assignments_borda),
         ("rank_assignments_approval", _V.rank_assignments_approval),
@@ -182,13 +183,17 @@ def run_group(job):
         ("rank_assignments_condorcet_method", _V.rank_assignments_condorcet_method),
         ("rank_assignments_range", _V.rank_assignments_range),
         ("murtys_task_allocation", _O.murtys_task_allocation),
+        ("perturbed_jv", _O.perturbed_jv_task_allocation),
     ]
 
     rows = []
     for pretty, method in methods:
-        mod = _O if pretty == "murtys_task_allocation" else _V
+        mod = (_O if pretty in ("murtys_task_allocation", "perturbed_jv") else _V)
         _seed_rngs(_derived_seed(schedule_seed, "initial", pretty))
         if mod is _O:
+            if pretty == "perturbed_jv":
+                method = _O.perturbed_jv_factory(
+                    _derived_seed(schedule_seed, "run", "perturbed_jv", "pjv", "initial"))
             out, score, length, per = _O.assign_tasks_with_method(method, matrix)
         else:
             out, score, length, per = _V.assign_tasks_with_voting(
