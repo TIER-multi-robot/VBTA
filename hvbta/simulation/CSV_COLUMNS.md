@@ -20,10 +20,16 @@ The row is assembled as:
 | Component | Items | Source |
 |---|---|---|
 | `row_prefix` | 14 | `_record_assignment` (13 items: identity + initial quality + initial fairness) with `Planner` injected at position 4 |
-| `output_tuple` | 58 | `benchmark_simulation` = `main_simulation` return (57: 48 pre-collision + 5 collision/limit incl. `Propagated_Wait_Count` and `Mover_Conflict_Waits` + 4 planner-call accounting) + `execution_time` (1) |
-| `config_suffix` | 8 | Scenario + 4 raw rates + 3 PO config columns, appended at the writer callsite |
-| `map_size` | 1 | Appended at the writer callsite |
-| **Total** | **81** | |
+| `output_tuple` | 59 | `benchmark_simulation` = `main_simulation` return (58: 48 pre-collision + 5 collision/limit incl. `Propagated_Wait_Count` and `Mover_Conflict_Waits` + 4 planner-call accounting incl. `Planner_Dead_Tick`) + `execution_time` (1) |
+| `config_suffix` | 10 | Scenario + 4 raw rates + 5 PO/noise config columns (`Mask_Level`, `Mask_Count`, `Mask_Policy`, `Obs_Noise_Sigma`, `Noise_Experiment`), appended at the writer callsite |
+| `map_size` | 1 | Appended at the writer callsite (size class "Small"/"Medium"/"Large" from the map diagonal) |
+| **Total** | **84** | |
+
+The pool driver's parallel CSV (`phase4_simulation.csv`) packs the 59-item
+output tuple into one stringified `Output` column plus group identity
+(12 columns total); `expand_results.py` converts it to this schema
+(plus `Map` / `Rep` columns and a deterministic per-group Run ID) and
+regenerates the profiles CSV from the seeds.
 
 ---
 
@@ -253,7 +259,7 @@ deterministic planner-work caps, reset at run start).
 |---|---|---|---|---|
 | 62 | `Planner_Call_Count` | Total `run_planner` invocations this run: the initial call + every replan call + every replan-on-failure alternative retry | Contextual | Deterministic count (independent of machine load); the denominator for per-call planner cost and the quantity the deterministic per-tick planner-call cap bounds |
 | 63 | `Planner_Total_ms` | Total wall-clock milliseconds spent inside `run_planner` this run | Contextual | Wall-clock: exclude from cross-run equality checks. `Planner_Total_ms / Planner_Call_Count` = mean ms per planner call |
-| 64 | `Planner_Cap_Hits` | Every firing of a deterministic planner-work cap: the per-tick planner-call cap (`PLANNER_CALLS_PER_TICK = 4`), the per-run failed-call budget (`PLANNER_FAILED_CALL_BUDGET = 150`; after it the run is planner-dead — no further planner calls), and PP's per-call A* expansion budget (`PP_MAX_EXPANSIONS = 400,000`) | **0 in normal runs** | The caps are count-based and identical for every method; they keep hyper-constrained PP runs far below the 600 s wall safety stop. Nonzero values mark runs whose planner work was truncated — analyze with the truncation in mind |
+| 64 | `Planner_Cap_Hits` | Every firing of a deterministic planner-work cap: the per-tick planner-call cap (`PLANNER_CALLS_PER_TICK = 4`), the per-run failed-call budget (`PLANNER_FAILED_CALL_BUDGET = 150`; after it the run is planner-dead — no further planner calls), and PP's per-call A* expansion budget (`PP_MAX_EXPANSIONS = 250,000`) | **0 in normal runs** | The caps are count-based and identical for every method; they keep hyper-constrained PP runs far below the 600 s wall safety stop. Nonzero values mark runs whose planner work was truncated — analyze with the truncation in mind |
 | 65 | `Planner_Dead_Tick` | The tick at which the run first entered planner-dead mode (the failed-call budget was reached by a failing call); -1 = the run never went planner-dead | Contextual | Added 2026-10-27. Deterministic. `sweep_report.py` reports, per method: dead-run count, dead tick mean/median, and mean completion for dead vs other runs |
 
 **Derivable: allocation time per call (per-sweep reporting).**
