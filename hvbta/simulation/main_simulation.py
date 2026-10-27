@@ -986,20 +986,28 @@ def main_simulation(
                 # the first good-enough candidate.
                 urgent_pressure = (percentage_urgent > 0.0) or (robot_pressure > 0.0) # NOTE: here I can take out robot pressure
                 # 4a (2026-10-26): the urgent candidate cap is OFF in the
-                # main configuration - under urgency voting stops via the
-                # good-enough threshold (with the MIN_POOL_BEFORE_THRESHOLD
-                # floor) or pool exhaustion. HVBTA_URGENT_CAP=1 re-enables
-                # the capped arm for the cap ablation (VOTING_URGENT_CANDIDATE_
-                # BUDGET=3, the 2026-10-25 deterministic replacement for the
-                # old 20 ms wall-clock cap).
+                # main configuration - HVBTA_URGENT_CAP=1 re-enables it for
+                # the cap ablation (VOTING_URGENT_CANDIDATE_BUDGET=3).
                 _urgent_cap_arm = os.environ.get("HVBTA_URGENT_CAP", "0") == "1"
                 voting_candidate_budget = (V.VOTING_URGENT_CANDIDATE_BUDGET
                                           if (urgent_pressure and _urgent_cap_arm) else None)
-                # 4d: the threshold value the voting layer applies is f * UB
-                # when V.VOTING_UB_THRESHOLD_F is set (HVBTA_UB_F; chosen by
-                # the user from the 4c calibration report); until then the
-                # legacy fixed 0.7 applies.
-                voting_score_threshold = 0.7 if urgent_pressure else None
+                # Anytime stopping rule (2026-10-27; final scope): under
+                # urgency, voting ranks candidates in pool order and stops
+                # once the best-so-far candidate (by coverage-normalized
+                # quality) has not improved for k =
+                # V.VOTING_URGENT_STALL_K = 5 consecutive candidates - but
+                # only after at least MIN_POOL_BEFORE_THRESHOLD = 5
+                # candidates - or when the pool is exhausted. Replaces the
+                # f*UB threshold (tiered f rejected: too many fitted
+                # constants with thin support in large calls; the UB code
+                # stays in place but is unused by the main config).
+                # HVBTA_STALL=0 disables the rule (the anytime ablation
+                # arm: full pool on urgent calls). Non-urgent calls always
+                # use the full pool.
+                _stall_enabled = os.environ.get("HVBTA_STALL", "1") == "1"
+                voting_stall_k = (V.VOTING_URGENT_STALL_K
+                                  if (urgent_pressure and _stall_enabled) else None)
+                voting_score_threshold = None
 
                 # Adaptive candidate count: recent churn shrinks the pool so
                 # voting responds fast under stress and explores broadly when
@@ -1012,7 +1020,7 @@ def main_simulation(
                 top_k_out_ids = []
 
                 print(f"REASSIGNING WITH VOTING METHOD: {voting_method_name}"
-                      f"{f' (URGENT: pct_urgent={percentage_urgent:.0%}, robot_pressure={int(robot_pressure)}, threshold={voting_score_threshold})' if urgent_pressure else ''}"
+                      f"{f' (URGENT: pct_urgent={percentage_urgent:.0%}, robot_pressure={int(robot_pressure)}, stall_k={voting_stall_k})' if urgent_pressure else ''}"
                       f"{f' [warm-start seed: {len(previous_best_id_pairs)} pairs]' if previous_best_id_pairs else ''}"
                       f" [candidates: {effective_candidates}/{num_candidates}, recent_events={recent_event_count}]"
                       f"{f' [hall-of-fame: {len(candidate_cache)} cached]' if candidate_cache else ''}")
@@ -1025,6 +1033,7 @@ def main_simulation(
                     unassigned_robots, unassigned_tasks, start_positions, goal_positions, HYPOTENUSE,
                     candidate_budget=voting_candidate_budget,
                     score_threshold=voting_score_threshold,
+                    stall_k=voting_stall_k,
                     seed_assignment_ids=previous_best_id_pairs,
                     cached_candidate_ids=(candidate_cache or None),
                     top_k_out_ids=top_k_out_ids,
@@ -1518,18 +1527,25 @@ def main_simulation(
     never_attempted_count = total_tasks - len(tasks_ever_assigned)
 
     # Pool diagnostics (2.8): aggregate V.POOL_STATS into the two CSV columns.
-    # Threshold_Fire_Rate = share of threshold-active calls where the anytime
-    # early termination cut the pool short; Mean_Pool_Size_At_Rank = mean
-    # ranked-pool size across all voting calls this run. -1 marks N/A (no
-    # calls - e.g. Murty's rows, or runs with no voting allocation).
+    # Threshold_Fire_Rate = share of anytime-active calls (legacy threshold
+    # OR the 2026-10-27 stall rule) where early termination cut the pool
+    # short of its full size; Mean_Pool_Size_At_Rank = mean ranked-pool size
+    # across all voting calls this run. -1 marks N/A (no voting calls -
+    # e.g. Murty's rows, or runs with no voting allocation).
     if V.POOL_STATS:
-        _th_calls = [s for s in V.POOL_STATS if s["threshold"] is not None]
+        _th_calls = [s for s in V.POOL_STATS
+                     if s["threshold"] is not None or s.get("stall_k") is not None]
         _fired = sum(1 for s in _th_calls if s["ranked"] < s["full"])
         threshold_fire_rate = (_fired / len(_th_calls)) if _th_calls else -1.0
         mean_pool_size_at_rank = float(np.mean([s["ranked"] for s in V.POOL_STATS]))
     else:
         threshold_fire_rate = -1.0
         mean_pool_size_at_rank = -1.0
+    # Diagnostic archive hook: hand this run's per-call pool stats to the
+    # sink before clearing them (stall-rule report driver only; inert in
+    # sweeps).
+    if V.POOL_STATS and getattr(V, "POOL_STATS_SINK", None) is not None:
+        V.POOL_STATS_SINK.extend(V.POOL_STATS)
     V.POOL_STATS = None
 
     return (
@@ -1778,9 +1794,12 @@ if __name__ == "__main__":
         V.VOTING_UB_THRESHOLD_F = float(os.environ["HVBTA_UB_F"])
     # 8.2: the perturbed-JV baseline's own noise sigma. Chosen by the
     # duplicate-retry rule (see docs/checkins/2026-10-26-step8.md); set
-    # via env so drivers need no file edits. None = JV unperturbed.
+    # via env so drivers need no file edits. Default 0.05 per the
+    # analysis-plan amendment — the pool driver (phase4_sweep.run_group)
+    # hard-sets 0.05, and the serial default of None made serial runs JV
+    # unperturbed (a driver mismatch, fixed 2026-10-27).
     O.PERTURBED_JV_SIGMA = (float(os.environ["HVBTA_PJV_SIGMA"])
-                            if "HVBTA_PJV_SIGMA" in os.environ else None)
+                             if "HVBTA_PJV_SIGMA" in os.environ else 0.05)
     voting_methods = [
         V.rank_assignments_borda,
         V.rank_assignments_approval,
@@ -2245,7 +2264,13 @@ if __name__ == "__main__":
                                     # sigma=0 rows reproduce the no-noise
                                     # results exactly. (NOISE_EXPERIMENT is
                                     # read once at __main__ entry.)
-                                    NOISE_SIGMAS = [0.0, 0.05, 0.1, 0.2, 0.3]
+                                    # HVBTA_NOISE_SIGMAS overrides the
+                                    # sigma list (comma-separated) - used by
+                                    # the anytime ablation's sigma=0-only
+                                    # serial arm.
+                                    NOISE_SIGMAS = [float(x) for x in
+                                                    os.environ.get("HVBTA_NOISE_SIGMAS",
+                                                                   "0,0.05,0.1,0.2,0.3").split(",")]
                                     if NOISE_EXPERIMENT:
                                         noise_conditions = (("none", "none", s) for s in NOISE_SIGMAS)
                                     elif PO_EXPERIMENT:

@@ -83,10 +83,14 @@ SWEEP_CONFIGS = {
 
 # Condition axis per sweep: each condition is (mask_level, mask_policy,
 # noise_sigma). "po" -> the 5 mask conditions (sigma None); "noise" -> the
-# 5 sigma_obs levels with masks at the none control condition; everything
+# sigma_obs levels with masks at the none control condition; everything
 # else -> the single none/none control with no noise. Hyper (PP) keeps the
 # PO machinery fully OFF (mask_level None), matching the pilot config.
-NOISE_SIGMAS = [0.0, 0.05, 0.1, 0.2, 0.3]
+# HVBTA_NOISE_SIGMAS overrides the sigma list (comma-separated) for the
+# anytime ablation (sigma=0-only arm).
+NOISE_SIGMAS = [float(x) for x in
+                os.environ.get("HVBTA_NOISE_SIGMAS", "0,0.05,0.1,0.2,0.3")
+                .split(",")]
 
 
 def sweep_conditions(sweep):

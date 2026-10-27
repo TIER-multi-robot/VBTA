@@ -266,3 +266,50 @@ sweeps, in two steps:
    until f is set.
 Every sweep's report includes mean allocation time per call by method:
 (Planning_Time_us + total_reassignment_time) / (1 + total_reassignments).
+
+### 2026-10-27: anytime stopping rule finalized as a stall rule (k = 5); tiered f * UB rejected
+
+This closes part 2 of the 2026-10-26 stopping-rule amendment. The f * UB
+good-enough threshold is NOT adopted. The 4c calibration showed the
+coverage-normalized winner/UB ratio is ~1.0 (median) for small calls but
+0.4-0.6 for large calls, so any f that matters would have to be tiered by
+call size — several fitted constants with thin calibration support in the
+large-call regime (few large calls per sweep, and the calibration for them
+came from a single den901d 100x100 rep). The tiered f is rejected as
+over-fitted.
+
+INSTEAD, the main configuration's urgent stopping rule is a STALL rule:
+under urgency, voting ranks candidates in pool order and stops once the
+best-so-far coverage-normalized candidate quality has not improved for
+k = 5 consecutive candidates, but never before MIN_POOL_BEFORE_THRESHOLD
+= 5 candidates have been ranked (k equals the existing minimum-pool
+floor — one constant, no fitting), or when the pool is exhausted,
+whichever comes first. Non-urgent calls are unchanged (full pool). The
+UB/f * UB code remains in the codebase but unused by the main
+configuration. HVBTA_STALL=0 disables the rule (the anytime-ablation
+arm, item 5 of the final scope: full pool on urgent calls).
+
+Also in this amendment:
+
+1. Planner-dead behavior (documenting what the 2026-10-26 bounds do after
+   PLANNER_FAILED_CALL_BUDGET = 150 failed planner calls is exhausted):
+   the run becomes planner-dead — every further planner invocation (the
+   tick's replan call AND all replan-on-failure alternative retries) is
+   skipped and counted in Planner_Cap_Hits. Allocation is NOT skipped:
+   robots keep being (re)assigned every tick as usual. Robots keep moving
+   along the stale paths from the last successful plan (they do not stop
+   and are not teleported); robots with no path stay put. Work still
+   requires physical presence at the task location, so robots whose
+   stale path reaches their assigned task still complete it. The run ends
+   only at the tick horizon or when all tasks complete, as in every other
+   run.
+
+2. Driver-consistency bug fix (justified as a bug): the serial __main__
+   driver defaulted PERTURBED_JV_SIGMA to None (JV unperturbed) unless
+   HVBTA_PJV_SIGMA was set, while the pool driver (phase4_sweep.run_group)
+   hard-sets 0.05 per the 2026-10-26 sigma_pjv amendment. The serial
+   default is now 0.05, matching the pool driver and the amendment; the
+   env override remains. (Found by the item-2 pool-vs-serial check: all
+   perturbed_jv rows mismatched with the old default; after the fix all
+   160 rows x 2 paths match bit-for-bit, excluding timing columns.)
+

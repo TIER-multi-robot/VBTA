@@ -60,7 +60,30 @@ VOTING_URGENT_CANDIDATE_BUDGET = 3
 # single float or a callable (num_robots, num_tasks) -> float. None (until
 # the user sets it, via HVBTA_UB_F) keeps the legacy fixed threshold
 # (0.7) that the main loop passes via score_threshold.
+# 2026-10-27: UNUSED BY THE MAIN CONFIGURATION - the anytime stopping rule
+# under urgency is now the stall rule below. The machinery stays in place
+# for potential ablations; it is inert unless a caller passes
+# score_threshold (the main loop no longer does).
 VOTING_UB_THRESHOLD_F = None
+
+# Anytime stall rule (2026-10-27; replaces the f*UB threshold in the main
+# configuration): under urgency, voting ranks candidates in pool order and
+# stops once the best candidate so far has not improved for k consecutive
+# candidates - but only after at least MIN_POOL_BEFORE_THRESHOLD candidates
+# have been ranked - or when the pool is exhausted. k = 5, equal to the
+# min-pool floor (no new fitted constant; a tiered f was rejected as too
+# many fitted constants with thin support in large calls - the calibration
+# showed median winner/UB = 1.0 in small calls but 0.4-0.6 in large
+# balanced calls, where per-bin sample sizes are thin). Non-urgent calls
+# keep the full pool. HVBTA_STALL=0 disables the rule (the anytime
+# ablation arm: full pool on urgent calls).
+VOTING_URGENT_STALL_K = 5
+
+# Optional archive for per-call pool statistics: when set to a list,
+# main_simulation appends every run's POOL_STATS records to it just
+# before clearing them at run end (diagnostic drivers only; inert by
+# default).
+POOL_STATS_SINK = None
 
 # 4c calibration collector (2026-10-26): when set to a list, one dict per
 # assign_tasks_with_voting call records the call's dimensions, the upper
@@ -430,6 +453,7 @@ def assign_tasks_with_voting(
         score_threshold: float = None,
         time_budget_ms: float = None,
         candidate_budget: int = None,
+        stall_k: int = None,
         generator: Callable = None,
         seed_assignment: List[Tuple[int, int]] = None,
         diversity_threshold: float = 0.8,
@@ -453,6 +477,9 @@ def assign_tasks_with_voting(
             score / max_feasible) reaches this value, and only after at
             least MIN_POOL_BEFORE_THRESHOLD candidates (or the whole pool).
             When the flag is off, the old mean-per-pair semantics apply.
+            2026-10-27: the main loop no longer passes a threshold under
+            urgency (the stall rule below replaced it); this parameter is
+            kept for ablations of the old semantics.
         time_budget_ms: If not None, stop generating candidates once wall-clock
             elapsed (from function entry) reaches this many milliseconds.
             DEPRECATED for the main loop (2026-10-25): wall-clock budgets
@@ -462,6 +489,14 @@ def assign_tasks_with_voting(
             from the pool (deterministic anytime budget, calibrated from
             the old 20 ms budget's behavior; see
             VOTING_URGENT_CANDIDATE_BUDGET).
+        stall_k: If not None (2026-10-27, the anytime stopping rule for
+            urgent calls), rank candidates in pool order and stop once the
+            best candidate so far (by coverage-normalized quality) has not
+            improved for stall_k consecutive candidates - but only after
+            at least MIN_POOL_BEFORE_THRESHOLD candidates have been ranked
+            - or when the pool is exhausted. Deterministic; no fitted
+            constants beyond k = VOTING_URGENT_STALL_K = 5, equal to the
+            min-pool floor.
         generator: Optional candidate generator with signature
             (num_robots, num_tasks, num_assignments) -> List[candidate]. If
             None, the biased generate_high_suitability_assignments is used
@@ -614,6 +649,11 @@ def assign_tasks_with_voting(
     # scores the allocator sees; 4d: when VOTING_UB_THRESHOLD_F is set, the
     # effective threshold is f * UB (f a float or a function of the call's
     # robot/task counts) instead of the fixed score_threshold.
+    # Stall rule (2026-10-27, replaces the threshold in the main config):
+    # with stall_k set, candidates are ranked in pool order and the loop
+    # stops once the best coverage-normalized quality so far has not
+    # improved for stall_k consecutive candidates (after the min-pool
+    # floor), or when the pool is exhausted.
     ub_robot, ub_task, ub_max_feasible = _upper_bounds(suitability_matrix)
     ub = min(ub_robot, ub_task) if ub_robot is not None else None
     effective_threshold = score_threshold
@@ -622,15 +662,30 @@ def assign_tasks_with_voting(
         if callable(_f):
             _f = _f(num_robots, num_tasks)
         effective_threshold = (_f * ub) if (ub is not None and ub > 0) else None
+    min_pool = min(MIN_POOL_BEFORE_THRESHOLD, len(full_pool))
     if VOTING_COVERAGE_THRESHOLD:
         max_feasible = ub_max_feasible
-        min_pool = min(MIN_POOL_BEFORE_THRESHOLD, len(full_pool))
     random_assignments = []
     budget_fired = False
     threshold_fired = False
+    stall_fired = False
+    best_quality = -1.0          # best coverage-normalized quality seen
+    candidates_since_improvement = 0
     for one in full_pool:
         random_assignments.append(one)
 
+        if stall_k is not None:
+            _q = (sum(suitability_matrix[r][t] for r, t in one[0]) / ub_max_feasible
+                  if ub_max_feasible > 0 else 0.0)
+            if _q > best_quality:
+                best_quality = _q
+                candidates_since_improvement = 0
+            else:
+                candidates_since_improvement += 1
+            if (len(random_assignments) >= min_pool
+                    and candidates_since_improvement >= stall_k):
+                stall_fired = True
+                break
         if effective_threshold is not None:
             if VOTING_COVERAGE_THRESHOLD:
                 if max_feasible > 0 and len(random_assignments) >= min_pool:
@@ -678,6 +733,13 @@ def assign_tasks_with_voting(
             "threshold": effective_threshold,
             "budget_ms": time_budget_ms,
             "candidate_budget": candidate_budget,
+            # Stall-rule diagnostics (2026-10-27): n_robots / n_tasks are
+            # the call's dimensions = the CURRENT unassigned counts.
+            "stall_k": stall_k,
+            "stall_fired": stall_fired,
+            "budget_fired": budget_fired,
+            "n_robots": num_robots,
+            "n_tasks": num_tasks,
         })
     if BUDGET_CALIBRATION is not None and time_budget_ms is not None:
         BUDGET_CALIBRATION.append({
@@ -717,7 +779,7 @@ def assign_tasks_with_voting(
         _m = np.asarray(suitability_matrix)
         UB_CALIBRATION.append({
             "rule": getattr(voting_method, "__name__", str(voting_method)),
-            "urgent": score_threshold is not None,
+            "urgent": (score_threshold is not None) or (stall_k is not None),
             "full": len(full_pool),
             "ranked": len(random_assignments),
             "budget_fired": budget_fired,
@@ -880,6 +942,7 @@ def reassign_robots_to_tasks(
         score_threshold: float = None,
         time_budget_ms: float = None,
         candidate_budget: int = None,
+        stall_k: int = None,
         generator: Callable = None,
         seed_assignment_ids: List[Tuple[str, str]] = None,
         diversity_threshold: float = 0.8,
@@ -980,6 +1043,7 @@ def reassign_robots_to_tasks(
             urobots, utasks, suitability_matrix, num_candidates, voting_method,
             score_threshold=score_threshold, time_budget_ms=time_budget_ms,
             candidate_budget=candidate_budget,
+            stall_k=stall_k,
             generator=generator, seed_assignment=seed_local,
             diversity_threshold=diversity_threshold,
             extra_candidates=extra_local, top_k_out=local_top_k, top_k=hall_of_fame_k,

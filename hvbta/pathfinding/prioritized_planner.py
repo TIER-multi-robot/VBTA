@@ -21,6 +21,7 @@ exhausted), which the wrapper reports as (0.0, False)).
 """
 
 import heapq
+import os as _os
 import random as _random
 
 # Deterministic per-call work budget (2026-10-26): total A* expansions
@@ -36,8 +37,10 @@ import random as _random
 # under 30k expansions total on the sweep maps. None disables the budget.
 # Value (2026-10-26, hyper-PP pilot measurement): 1.4x the largest expansion
 # count observed for a SUCCESSFUL call (178k, lak108c 10x15); failing calls
-# were observed at up to 3.3M expansions (~8 s each).
-PP_MAX_EXPANSIONS = 250_000
+# were observed at up to 3.3M expansions (~8 s each). Env-overridable
+# (HVBTA_PP_MAX_EXPANSIONS) so the cap-sensitivity re-run (500k arm) uses
+# identical code.
+PP_MAX_EXPANSIONS = int(_os.environ.get("HVBTA_PP_MAX_EXPANSIONS", "250000"))
 
 # Per-RUN expansion budget (2026-10-26): total A* expansions allowed across
 # ALL plan() calls of one simulation run. The per-call budget above cannot
@@ -48,8 +51,10 @@ PP_MAX_EXPANSIONS = 250_000
 # immediately. Sized from the pilot re-run: normal heavy hyper runs use
 # ~15-25M expansions (63-failure Murty's run: 25M at the 400k per-call cap,
 # ~16M at 250k); only the >350 s tail (~1% of runs) exceeds 35M. Reset per
-# run by MAPF_wrapper.reset_planner_timing.
-PP_RUN_MAX_EXPANSIONS = 35_000_000
+# run by MAPF_wrapper.reset_planner_timing. Env-overridable
+# (HVBTA_PP_RUN_MAX_EXPANSIONS).
+PP_RUN_MAX_EXPANSIONS = int(_os.environ.get("HVBTA_PP_RUN_MAX_EXPANSIONS",
+                                           "35000000"))
 PP_RUN_EXPANSIONS_USED = 0
 
 # Optional per-call diagnostics (calibration driver only): when set to a

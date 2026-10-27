@@ -452,6 +452,51 @@ def test_coverage_threshold_requires_min_pool():
         _V.POOL_STATS = None
 
 
+def test_urgent_stall_rule_stops_after_k_non_improvements():
+    """2026-10-27 stall rule: with stall_k set, candidates are ranked in
+    pool order and accumulation stops once the best-so-far
+    coverage-normalized quality has not improved for stall_k consecutive
+    candidates (after the MIN_POOL floor). Fixed generator -> exact pool
+    order -> exact ranked count."""
+    from hvbta.allocators.voting import assign_tasks_with_voting, rank_assignments_range
+    import hvbta.allocators.voting as _V
+    robots, tasks = make_robots(n=4, seed=3), make_tasks(n=4, seed=4)
+    M = np.full((4, 4), 0.5)
+    # Pool order (via a fixed generator, no seed / extra candidates):
+    # cand 1 uniquely best; cands 2..10 worse. The stall rule must stop
+    # at 6 ranked (floor 5 satisfied + 5 consecutive non-improvements
+    # after cand 1); without stall_k the full pool of 10 is ranked.
+    pool = []
+    pool.append(([(0, 0), (1, 1)], [2, 3], [2, 3]))            # best (1.0 pair scores)
+    # 9 distinct worse candidates (all pairs 0.5, pair-sets pairwise
+    # overlap <= 1/2 so the diversity filter keeps them all)
+    worse_pair_sets = [
+        [(0, 2), (1, 3)], [(0, 3), (1, 2)], [(2, 0), (3, 1)],
+        [(2, 1), (3, 0)], [(0, 2), (3, 1)], [(0, 3), (2, 1)],
+        [(1, 2), (3, 0)], [(1, 3), (2, 0)], [(2, 3), (0, 1)],
+    ]
+    for ps in worse_pair_sets:
+        pool.append((ps, [], []))
+    M[0, 0] = M[1, 1] = 1.0
+    gen = lambda nr, nt, k: [c for c in pool[:k]]
+    _V.POOL_STATS = []
+    try:
+        assign_tasks_with_voting(robots, tasks, M, 10, rank_assignments_range,
+                                 stall_k=5, generator=gen)
+        stats = _V.POOL_STATS[-1]
+        assert stats["stall_k"] == 5 and stats["stall_fired"] is True
+        assert stats["ranked"] == 6, f"ranked {stats['ranked']} != 6"
+        assert stats["full"] == 10
+        # control: no stall rule -> full pool ranked
+        assign_tasks_with_voting(robots, tasks, M, 10, rank_assignments_range,
+                                 generator=gen)
+        stats = _V.POOL_STATS[-1]
+        assert stats["stall_k"] is None and stats["stall_fired"] is False
+        assert stats["ranked"] == 10 == stats["full"]
+    finally:
+        _V.POOL_STATS = None
+
+
 def test_upper_bounds_definition():
     """4b: UB_robot / UB_task = mean of the top max_feasible values among
     each side's best feasible scores; (None, None, 0) when infeasible."""

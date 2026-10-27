@@ -37,7 +37,7 @@ The row is assembled as:
 | 4 | `Planner` | MAPF planner for this run | — | cbs / pp / pibt — config axis |
 | 5 | `Num Robots` | Initial robot count | — | Swept axis |
 | 6 | `Num Tasks` | Initial task count | — | Swept axis |
-| 7 | `Num Candidates` | Candidate pool size for voting | — | `max(robots, tasks) * 5` |
+| 7 | `Num Candidates` | Candidate pool size for voting | — | `max(robots, tasks) * 6` |
 
 ## 2. Initial allocation quality (3 columns)
 
