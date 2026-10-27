@@ -2,9 +2,13 @@
 
 One shared process pool across all maps and configs (not one process per
 map). Work unit = one (map, robots, tasks, scenario, rep) group; the
-worker runs all 7 methods for the group and returns the rows to the
+worker runs all 8 methods for the group and returns the rows to the
 parent, which alone writes the CSV (no concurrent appends). Resume-skip
 is keyed by run config within the output directory.
+
+Per-sweep overrides: "hyper" runs the PP planner with the PO machinery
+off and 5 reps (PHASE4_REPS=<n> overrides the rep count globally - used
+for the 2-rep hyper-PP pilot re-run).
 
 Usage:
   python phase4_sweep.py plan              # queue + projections, no run
@@ -57,10 +61,57 @@ SWEEP_CONFIGS = {
         (r"lak103c.map", [10, 15], [10, 15]),
         (r"lak108c.map", [10, 15], [10, 15]),
     ],
+    # 2026-10-26 expansion (user-approved): the PO and noise experiments
+    # move to the pool driver (their map sets grew beyond serial
+    # feasibility). Map lists match main_simulation.__main__'s
+    # PO_SWEEP_CONFIGS / NOISE_SWEEP_CONFIGS exactly; seeding and the
+    # condition axes replicate the serial __main__ flow, so rows are
+    # bit-identical to it (RNG isolation is unaffected by pool
+    # scheduling; mask/sigma conditions are not in any seed).
+    "po": [
+        (r"lak102d.map", [10, 20], [10, 20]),
+        (r"arena.map",   [20, 30, 50], [20, 30, 50]),
+        (r"den204d.map", [20, 30, 50], [20, 30, 50]),
+        (r"lak307d.map", [50, 75, 100], [50, 75, 100]),
+    ],
+    "noise": [
+        (r"lak102d.map", [10, 20], [10, 20]),
+        (r"den204d.map", [20, 30, 50], [20, 30, 50]),
+        (r"lak307d.map", [50, 75, 100], [50, 75, 100]),
+    ],
 }
+
+# Condition axis per sweep: each condition is (mask_level, mask_policy,
+# noise_sigma). "po" -> the 5 mask conditions (sigma None); "noise" -> the
+# 5 sigma_obs levels with masks at the none control condition; everything
+# else -> the single none/none control with no noise. Hyper (PP) keeps the
+# PO machinery fully OFF (mask_level None), matching the pilot config.
+NOISE_SIGMAS = [0.0, 0.05, 0.1, 0.2, 0.3]
+
+
+def sweep_conditions(sweep):
+    if sweep == "po":
+        return [("none", "none", None),
+                ("low", "optimistic", None), ("low", "pessimistic", None),
+                ("high", "optimistic", None), ("high", "pessimistic", None)]
+    if sweep == "noise":
+        return [("none", "none", s) for s in NOISE_SIGMAS]
+    if sweep == "hyper":
+        return [(None, None, None)]
+    return [("none", "none", None)]
 
 SCENARIOS = ["calm", "task_churn", "fleet_churn", "overload"]
 REPS = 3
+# Per-sweep overrides (2026-10-26): hyper runs PP (planner-failure stress)
+# with the PO machinery fully off (mask_level=None, matching the
+# pilot_hyper_pp_v9 configuration) and 5 reps (analysis-plan amendment).
+SWEEP_PLANNER = {"hyper": "pp"}
+SWEEP_REPS = {"hyper": 5}
+# PHASE4_REPS overrides the rep count for every sweep (used by the 2-rep
+# hyper-PP pilot re-run on the capped planner-work bounds).
+if os.environ.get("PHASE4_REPS"):
+    REPS = int(os.environ["PHASE4_REPS"])
+    SWEEP_REPS = {}
 N_METHODS = 8
 
 # Largest-config per-run mean seconds, from the 2026-10-25 timing run
@@ -72,7 +123,10 @@ MAP_TIMING = {
     "combat.map": 114.9, "combat2.map": 112.3,
     "lak101d.map": 4.9, "den404d.map": 3.6, "hrt002d.map": 5.8,
     "den009d.map": 6.5, "den101d.map": 12.1,
-    "hrt003d.map": 4.6, "lak103c.map": 6.6, "lak108c.map": 6.8,
+    # Hyper maps: v11 pilot re-run (PP with deterministic planner-work
+    # bounds, 2026-10-26) largest-config means, measured under 30-worker
+    # load (replaces the stale LaCAM-pace estimates).
+    "hrt003d.map": 28.5, "lak103c.map": 46.6, "lak108c.map": 67.0,
 }
 MAP_LARGEST_FLEET = {
     "combat.map": 100, "combat2.map": 100, "lak307d.map": 100,
@@ -85,10 +139,11 @@ MAP_LARGEST_FLEET = {
 
 # Row layout: identity prefix + output tuple; timing columns excluded from
 # equality checks: total_reassignment_time (output col 1) and Execution
-# Time (appended by benchmark_simulation, last col).
+# Time (appended by benchmark_simulation, last output col).
 TIMING_OUTPUT_COLS = {1}          # 0-based within output tuple
 ROW_HEADER = ["Map", "Num Robots", "Num Tasks", "Scenario", "Rep",
-              "Method", "Output", "Map Size"]
+              "Method", "Output", "Map Size", "Init_Alloc_us",
+              "Mask_Level", "Mask_Policy", "Obs_Noise_Sigma"]
 
 
 def _cost(map_name, nr):
@@ -100,16 +155,18 @@ def _cost(map_name, nr):
 def build_queue(sweeps):
     items = []
     for sweep in sweeps:
+        n_cond = len(sweep_conditions(sweep))
         for map_name, r_sizes, t_sizes in SWEEP_CONFIGS[sweep]:
             for nr in r_sizes:
                 for nt in t_sizes:
-                    cost = _cost(map_name, nr)
+                    cost = _cost(map_name, nr) * n_cond
                     for scenario in SCENARIOS:
-                        for rep in range(REPS):
+                        for rep in range(SWEEP_REPS.get(sweep, REPS)):
                             items.append({
                                 "sweep": sweep, "map": map_name, "nr": nr,
                                 "nt": nt, "scenario": scenario, "rep": rep,
                                 "cost": cost,
+                                "planner": SWEEP_PLANNER.get(sweep, "lacam"),
                             })
     items.sort(key=lambda it: -it["cost"])
     return items
@@ -131,6 +188,7 @@ def run_group(job):
     TRANSIENT_FLOOR, TARGET_EVENT_COUNT_K = 200, 125
     map_name, nr, nt, scenario, rep = (job["map"], job["nr"], job["nt"],
                                        job["scenario"], job["rep"])
+    planner = job.get("planner", "lacam")
     grid = load_map(os.path.join("MAPF_benchmark_maps", map_name))
     map_size = len(grid) * len(grid[0])
     HYP = (len(grid) ** 2 + len(grid[0]) ** 2) ** 0.5
@@ -165,52 +223,100 @@ def run_group(job):
     horizon = horizon_for_event_count(schedule, TARGET_EVENT_COUNT_K)
     workload = max(1.0, nt / nr)
     extender = 1.5 if workload > 10 else 1.2 if workload > 5 else 1.0
-    max_steps = max(TRANSIENT_FLOOR, horizon, int(HYP * 1.5 * extender))
+    travel_floor = int(HYP * 1.5 * extender)
+    max_steps = max(TRANSIENT_FLOOR, horizon, travel_floor)
     schedule = schedule[:max_steps]
+    # Provenance fields, identical to the serial sweep's __main__.
+    scheduled_event_count = sum(
+        len(e["add_tasks"]) + len(e["add_robots"])
+        + len(e["remove_robot_ids"]) + len(e["remove_task_ids"])
+        for e in schedule)
+    horizon_binding_term = (
+        "transient" if TRANSIENT_FLOOR >= horizon
+        and TRANSIENT_FLOOR >= travel_floor
+        else "events" if horizon >= travel_floor
+        else "travel"
+    )
 
-    po = PartialObservabilityState(schedule_seed, "none", "none")
     sm = S.evaluate_suitability_balanced
-    matrix = S.calculate_suitability_matrix(robots, tasks, po.masked_scorer(sm), HYP)
+    O.PERTURBED_JV_SIGMA = 0.05
 
-    import hvbta.allocators.voting as _V
-    import hvbta.allocators.optimizers as _O
-    _O.PERTURBED_JV_SIGMA = 0.05
     methods = [
-        ("rank_assignments_borda", _V.rank_assignments_borda),
-        ("rank_assignments_approval", _V.rank_assignments_approval),
-        ("rank_assignments_majority_judgment", _V.rank_assignments_majority_judgment),
-        ("rank_assignments_cumulative_voting", _V.rank_assignments_cumulative_voting),
-        ("rank_assignments_condorcet_method", _V.rank_assignments_condorcet_method),
-        ("rank_assignments_range", _V.rank_assignments_range),
-        ("murtys_task_allocation", _O.murtys_task_allocation),
-        ("perturbed_jv", _O.perturbed_jv_task_allocation),
+        ("rank_assignments_borda", V.rank_assignments_borda),
+        ("rank_assignments_approval", V.rank_assignments_approval),
+        ("rank_assignments_majority_judgment", V.rank_assignments_majority_judgment),
+        ("rank_assignments_cumulative_voting", V.rank_assignments_cumulative_voting),
+        ("rank_assignments_condorcet_method", V.rank_assignments_condorcet_method),
+        ("rank_assignments_range", V.rank_assignments_range),
+        ("murtys_task_allocation", O.murtys_task_allocation),
+        # Pretty name matches the serial sweep's func_name so the
+        # (group, method) seed keys are identical across drivers.
+        ("perturbed_jv_task_allocation", O.perturbed_jv_task_allocation),
     ]
 
+    # Condition axis (2026-10-26): PO sweeps iterate the 5 mask
+    # conditions, noise sweeps the 5 sigma_obs levels (masks at the none
+    # control), hyper keeps the PO machinery fully OFF (mask_level None,
+    # matching pilot_hyper_pp_v9/v11), everything else runs the single
+    # none/none control condition. Conditions are not in any seed, so
+    # they replay identical schedules.
+    sweep = job.get("sweep", "balanced")
+    conditions = sweep_conditions(sweep)
+
     rows = []
-    for pretty, method in methods:
-        mod = (_O if pretty in ("murtys_task_allocation", "perturbed_jv") else _V)
-        _seed_rngs(_derived_seed(schedule_seed, "initial", pretty))
-        if mod is _O:
-            if pretty == "perturbed_jv":
-                method = _O.perturbed_jv_factory(
-                    _derived_seed(schedule_seed, "run", "perturbed_jv", "pjv", "initial"))
-            out, score, length, per = _O.assign_tasks_with_method(method, matrix)
-        else:
-            out, score, length, per = _V.assign_tasks_with_voting(
-                robots, tasks, matrix, nc, method,
-                tie_seed=_derived_seed(schedule_seed, "ties", "initial", pretty))
-        tup = benchmark_simulation(
-            output=out, robots=copy.deepcopy(robots), tasks=copy.deepcopy(tasks),
-            num_candidates=nc, voting_method=method, grid=grid, map_dict=map_dict,
-            suitability_method=sm, suitability_matrix=matrix,
-            max_time_steps=max_steps, add_tasks=True, add_robots=True,
-            remove_robots=True, event_schedule=schedule,
-            mask_level="none", mask_policy="none", schedule_seed=schedule_seed,
-            run_seed=_derived_seed(schedule_seed, "run", pretty),
-            planner="lacam", scenario=scenario, scheduled_event_count=0,
-            horizon_binding_term="",
-        )
-        rows.append([map_name, nr, nt, scenario, rep, pretty, list(tup), map_size])
+    for mask_level, mask_policy, noise_sigma in conditions:
+        po_cond = (PartialObservabilityState(schedule_seed, mask_level, mask_policy)
+                   if mask_level is not None else None)
+        sm_for_matrix = sm
+        if po_cond is not None:
+            sm_for_matrix = po_cond.masked_scorer(sm)
+        if noise_sigma is not None:
+            from hvbta.partial_observability import noisy_scorer as _noisy
+            sm_for_matrix = _noisy(sm_for_matrix, noise_sigma, schedule_seed, [0])
+        matrix = S.calculate_suitability_matrix(robots, tasks, sm_for_matrix, HYP)
+
+        for pretty, method in methods:
+            _seed_rngs(_derived_seed(schedule_seed, "initial", pretty))
+            if pretty == "murtys_task_allocation":
+                out, score, length, per = O.assign_tasks_with_method(method, matrix)
+            elif pretty == "perturbed_jv_task_allocation":
+                # The factory result is used ONLY for the initial solve;
+                # benchmark_simulation must receive the plain function, or the
+                # main loop's method dispatch (dict membership test) never
+                # matches and the run never reallocates (bug found in the
+                # pilot re-run: perturbed_jv completion 0.11 vs 0.72).
+                init_fn = O.perturbed_jv_factory(
+                    _derived_seed(schedule_seed, "run", pretty, "pjv", "initial"))
+                out, score, length, per = O.assign_tasks_with_method(init_fn, matrix)
+            else:
+                out, score, length, per = V.assign_tasks_with_voting(
+                    robots, tasks, matrix, nc, method,
+                    tie_seed=_derived_seed(schedule_seed, "ties", "initial", pretty))
+            tup = benchmark_simulation(
+                output=out, robots=copy.deepcopy(robots), tasks=copy.deepcopy(tasks),
+                num_candidates=nc, voting_method=method, grid=grid, map_dict=map_dict,
+                suitability_method=sm, suitability_matrix=matrix,
+                max_time_steps=max_steps, add_tasks=True, add_robots=True,
+                remove_robots=True, event_schedule=schedule,
+                mask_level=mask_level, mask_policy=mask_policy,
+                noise_sigma=noise_sigma,
+                schedule_seed=schedule_seed,
+                run_seed=_derived_seed(schedule_seed, "run", pretty),
+                planner=planner, scenario=scenario,
+                scheduled_event_count=scheduled_event_count,
+                horizon_binding_term=horizon_binding_term,
+            )
+            # Convert numpy scalars to plain floats so the CSV cells hold
+            # clean numbers (a list's repr would otherwise embed
+            # np.float64(...)). Init_Alloc_us = this method's initial-
+            # assignment wall time, so the per-sweep report can compute
+            # mean allocation time per call:
+            # (Init_Alloc_us + total_reassignment_time)/(1 + reassignments).
+            rows.append([map_name, nr, nt, scenario, rep, pretty,
+                         [x.item() if hasattr(x, "item") else x for x in tup],
+                         map_size, length,
+                         mask_level or "", mask_policy or "",
+                         (noise_sigma if noise_sigma is not None else "")])
     return rows
 
 
@@ -251,13 +357,23 @@ def main():
         sweeps = sweeps or list(SWEEP_CONFIGS)
         items = build_queue(sweeps)
         total = sum(it["cost"] for it in items)
+        n_cond = {s: len(sweep_conditions(s)) for s in sweeps}
         print(f"workers: {N_WORKERS} (logical cores - 2)")
-        print(f"queue: {len(items)} groups x {N_METHODS} methods "
-              f"= {len(items) * N_METHODS} runs over sweeps {sweeps}")
+        print(f"queue: {len(items)} groups x {N_METHODS} methods"
+              f" x (conditions: {n_cond}) = "
+              f"{sum(len(sweep_conditions(it['sweep'])) for it in items) * N_METHODS} runs"
+              f" over sweeps {sweeps}")
         print(f"projected serial wall time: {total/3600:.1f} h")
         print(f"projected wall time at {N_WORKERS} workers: "
               f"{total / N_WORKERS / 3600:.1f}-{total / N_WORKERS / 3600 * 1.4:.1f} h"
               f" (25-40% straggler overhead on the longest jobs)")
+        for s in sweeps:
+            s_items = [it for it in items if it["sweep"] == s]
+            s_total = sum(it["cost"] for it in s_items)
+            s_runs = sum(len(sweep_conditions(s)) for _ in s_items) * N_METHODS
+            print(f"  {s:12s} {len(s_items):4d} groups {s_runs:6d} runs "
+                  f"~{s_total/3600:7.1f} h serial "
+                  f"(~{s_total/N_WORKERS/3600:5.1f}-{s_total/N_WORKERS/3600*1.4:5.1f} h @30)")
         print("first 10 queue entries (longest expected first):")
         for it in items[:10]:
             print("  %-10s %-12s %3dx%-3d %-12s rep%d ~%.0fs"

@@ -126,11 +126,24 @@ def run_planner(planner, robots, start_positions, goal_positions, map_dict, **kw
     _t0 = _time.perf_counter_ns()
     try:
         if kind == "native":
-            return run_native(fn, robots, start_positions, goal_positions, map_dict)
-        return run_stepwise(fn, robots, start_positions, goal_positions, map_dict, **kw)
+            result = run_native(fn, robots, start_positions, goal_positions, map_dict)
+        else:
+            result = run_stepwise(fn, robots, start_positions, goal_positions, map_dict, **kw)
     finally:
-        PLANNER_TIMING["ns"] += _time.perf_counter_ns() - _t0
+        _ns = _time.perf_counter_ns() - _t0
+        PLANNER_TIMING["ns"] += _ns
         PLANNER_TIMING["calls"] += 1
+        if PER_CALL_LOG is not None:
+            PER_CALL_LOG.append({"planner": planner, "ms": _ns / 1e6,
+                                 "ok": bool(result[1])})
+    return result
+
+
+# Optional per-call planner timing log (PP-pilot diagnostics, 2026-10-26):
+# when set to a list, run_planner appends one dict per call (planner name,
+# wall ms, success flag). Inert (None) by default - only the measurement
+# driver enables it; sweeps never do.
+PER_CALL_LOG = None
 
 
 # Per-run planner-call wall-time accounting (Phase 3v2: planning idle
@@ -144,6 +157,20 @@ def reset_planner_timing():
     PLANNER_TIMING["calls"] = 0
     PLANNER_TIMING["ns"] = 0
     PLANNER_TIMING["agents_sum"] = 0
+    # Per-run PP expansion accounting: reset the cumulative run budget
+    # counter (the per-call budget's parent bound).
+    global _planner_modules
+    if _planner_modules is None:
+        try:
+            from hvbta.pathfinding import prioritized_planner as _pp
+            _planner_modules = (_pp,)
+        except ImportError:
+            _planner_modules = ()
+    for _mod in _planner_modules:
+        _mod.PP_RUN_EXPANSIONS_USED = 0
+
+
+_planner_modules = None
 
 
 # ===========================================================================

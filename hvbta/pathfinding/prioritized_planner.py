@@ -23,9 +23,47 @@ exhausted), which the wrapper reports as (0.0, False)).
 import heapq
 import random as _random
 
+# Deterministic per-call work budget (2026-10-26): total A* expansions
+# allowed per plan() call, SHARED across every priority order and every
+# agent search in that call. PP has no wall-clock limit by design (the
+# wrapper threads time limits only to LaCAM); its pathological case is the
+# exhaustive failing search - a single doomed call on a hyper-constrained
+# map burns up to ~10 s (millions of expansions) before returning None.
+# The budget converts that into a count-bounded early give-up: when the
+# budget is exhausted, remaining searches fail immediately. Deterministic
+# (same seeds, same orders, same truncation); it can only turn a would-be
+# slow failure into a fast one - observed successful plan() calls use well
+# under 30k expansions total on the sweep maps. None disables the budget.
+# Value (2026-10-26, hyper-PP pilot measurement): 1.4x the largest expansion
+# count observed for a SUCCESSFUL call (178k, lak108c 10x15); failing calls
+# were observed at up to 3.3M expansions (~8 s each).
+PP_MAX_EXPANSIONS = 250_000
+
+# Per-RUN expansion budget (2026-10-26): total A* expansions allowed across
+# ALL plan() calls of one simulation run. The per-call budget above cannot
+# alone bound a run's wall time under pool load (30 workers slow pure-Python
+# search ~3x to ~100k expansions/s, so 150 failed calls x 400k expansions
+# still reached the 600 s cap in the first pilot re-run). This budget is the
+# hard count-based bound: once exhausted, every further plan() call fails
+# immediately. Sized from the pilot re-run: normal heavy hyper runs use
+# ~15-25M expansions (63-failure Murty's run: 25M at the 400k per-call cap,
+# ~16M at 250k); only the >350 s tail (~1% of runs) exceeds 35M. Reset per
+# run by MAPF_wrapper.reset_planner_timing.
+PP_RUN_MAX_EXPANSIONS = 35_000_000
+PP_RUN_EXPANSIONS_USED = 0
+
+# Optional per-call diagnostics (calibration driver only): when set to a
+# list, plan() appends one dict per call (total expansions, agent count,
+# success flag, budget-hit flag). Inert by default.
+PP_CALL_LOG = None
+
+# Cumulative count of plan() calls whose expansion budget was exhausted
+# (work truncated). Reset/read by the caller alongside PLANNER_TIMING.
+PP_EXPANSION_CAP_HITS = 0
+
 
 def _space_time_astar(start, goal, rows, cols, obstacles,
-                      vertex_res, edge_res, parked, H):
+                      vertex_res, edge_res, parked, H, budget=None):
     """
     Time-expanded A* over states (t, (r, c)).
 
@@ -35,6 +73,9 @@ def _space_time_astar(start, goal, rows, cols, obstacles,
     parked     : dict cell -> earliest_t blocked for all t >= earliest_t
                  (stationary blockers + arrived movers staying at goal).
     H          : time horizon; agent must reach a parkable goal state by t <= H.
+    budget     : optional one-element list [remaining_expansions]; when it
+                 reaches 0 the search gives up (returns None). Shared across
+                 all searches of one plan() call.
 
     Returns a list of cells [(r,c), ...] start..goal, or None.
     """
@@ -72,6 +113,10 @@ def _space_time_astar(start, goal, rows, cols, obstacles,
             return path
         if t >= H:
             continue
+        if budget is not None:
+            if budget[0] <= 0:
+                return None
+            budget[0] -= 1
         for dr, dc in moves:
             nr, nc = cell[0] + dr, cell[1] + dc
             ncell = (nr, nc)
@@ -99,7 +144,8 @@ def _space_time_astar(start, goal, rows, cols, obstacles,
     return None
 
 
-def _try_order(movers, blocker_paths, blocker_parked, obstacles, rows, cols, H):
+def _try_order(movers, blocker_paths, blocker_parked, obstacles, rows, cols, H,
+               budget=None):
     """Plan all movers in the given order. Returns {id: path} or None."""
     paths = dict(blocker_paths)
     vertex_res = set()
@@ -109,7 +155,7 @@ def _try_order(movers, blocker_paths, blocker_parked, obstacles, rows, cols, H):
     for a in movers:
         start, goal = a["start"], a["goal"]
         path = _space_time_astar(start, goal, rows, cols, obstacles,
-                                 vertex_res, edge_res, parked, H)
+                                 vertex_res, edge_res, parked, H, budget)
         if path is None:
             return None
         for t, cell in enumerate(path):
@@ -161,9 +207,44 @@ def plan(agents, map_dict):
         rng.shuffle(shuffled)
         orders.append(shuffled)
 
+    # Shared per-call work budget. When PP_MAX_EXPANSIONS is None the budget
+    # is unlimited (the sentinel is finite but astronomically large so the
+    # counter still measures real work for PP_CALL_LOG). The per-call budget
+    # is capped by the run budget's remaining allowance.
+    global PP_EXPANSION_CAP_HITS, PP_RUN_EXPANSIONS_USED
+    remaining_run = (PP_RUN_MAX_EXPANSIONS - PP_RUN_EXPANSIONS_USED
+                     if PP_RUN_MAX_EXPANSIONS is not None else 10 ** 18)
+    if PP_MAX_EXPANSIONS is not None:
+        budget = [max(0, min(int(PP_MAX_EXPANSIONS), remaining_run))]
+    else:
+        budget = [max(0, remaining_run)]
+    _start_budget = budget[0]
+    if remaining_run <= 0:
+        # Run budget exhausted: this call fails instantly (searches never
+        # start). Counted as a cap hit like any truncation.
+        PP_EXPANSION_CAP_HITS += 1
+        if PP_CALL_LOG is not None:
+            PP_CALL_LOG.append({"expansions": 0, "agents": len(agents),
+                                "movers": len(movers), "ok": False,
+                                "budget_hit": True})
+        return None
+
     for order in orders:
         result = _try_order(order, blocker_paths, blocker_parked,
-                           obstacles, rows, cols, H)
+                           obstacles, rows, cols, H, budget)
         if result is not None:
+            PP_RUN_EXPANSIONS_USED += _start_budget - budget[0]
+            if PP_CALL_LOG is not None:
+                PP_CALL_LOG.append({"expansions": _start_budget - budget[0],
+                                    "agents": len(agents), "movers": len(movers),
+                                    "ok": True, "budget_hit": budget[0] <= 0})
             return result
+    budget_hit = budget[0] <= 0
+    PP_RUN_EXPANSIONS_USED += _start_budget - budget[0]
+    if budget_hit:
+        PP_EXPANSION_CAP_HITS += 1
+    if PP_CALL_LOG is not None:
+        PP_CALL_LOG.append({"expansions": _start_budget - budget[0],
+                            "agents": len(agents), "movers": len(movers),
+                            "ok": False, "budget_hit": budget_hit})
     return None

@@ -48,7 +48,53 @@ BUDGET_CALIBRATION = None
 # in a serial 1-rep run of the v9 pilot config (lak102d [10,20]x[10,20],
 # 6 voting rules, 4 scenarios, 5 mask conditions): median 3 (p25 1, p75 8,
 # p95 17, mean 5.6). See docs/checkins/2026-10-25-deterministic-budgets.md.
+# 4a (2026-10-26): OFF in the main configuration - under urgency voting
+# stops via the good-enough threshold (with the MIN_POOL_BEFORE_THRESHOLD
+# floor) or pool exhaustion. Re-enabled only for the cap-ablation arm
+# (HVBTA_URGENT_CAP=1).
 VOTING_URGENT_CANDIDATE_BUDGET = 3
+
+# 4d (2026-10-26): the urgent good-enough threshold as a fraction of the
+# call's upper bound UB = min(UB_robot, UB_task) (see _upper_bounds): stop
+# when a candidate's coverage-normalized quality >= f * UB. f is either a
+# single float or a callable (num_robots, num_tasks) -> float. None (until
+# the user sets it, via HVBTA_UB_F) keeps the legacy fixed threshold
+# (0.7) that the main loop passes via score_threshold.
+VOTING_UB_THRESHOLD_F = None
+
+# 4c calibration collector (2026-10-26): when set to a list, one dict per
+# assign_tasks_with_voting call records the call's dimensions, the upper
+# bounds, the winner's coverage-normalized quality, and the positive pair
+# scores the allocator saw (the call's actual view). Used by the
+# calibration driver only; sweeps never enable it.
+UB_CALIBRATION = None
+
+
+def _upper_bounds(suitability_matrix):
+    """Per-call upper bounds on achievable total score (4b, 2026-10-26),
+    computed from the scores the allocator sees.
+
+    max_feasible = min(#robots with >=1 positive task, #tasks with >=1
+    positive robot) - the maximum number of simultaneously-assignable
+    positive pairs. UB_robot = mean of the top max_feasible values among
+    each robot's best feasible score; UB_task likewise over tasks. Each is
+    an upper bound on the mean per-pair score any assignment could achieve
+    at that coverage; a total-score interpretation is max_feasible * UB.
+
+    Returns (ub_robot, ub_task, max_feasible); (None, None, 0) when
+    nothing is feasible.
+    """
+    _m = np.asarray(suitability_matrix)
+    pos_rows = int(np.sum(np.any(_m > 0, axis=1)))
+    pos_cols = int(np.sum(np.any(_m > 0, axis=0)))
+    max_feasible = min(pos_rows, pos_cols)
+    if max_feasible <= 0:
+        return None, None, 0
+    row_best = _m.max(axis=1)  # each robot's best feasible score (0 rows sort last)
+    col_best = _m.max(axis=0)  # each task's best feasible score
+    ub_robot = float(np.mean(np.sort(row_best)[-max_feasible:]))
+    ub_task = float(np.mean(np.sort(col_best)[-max_feasible:]))
+    return ub_robot, ub_task, max_feasible
 
 # Per-rule top-2 tie counter: {rule_name: [calls, top2_ties]}. Accumulated
 # across calls; reset/read by the caller (2.5 reporting). Inert by default.
@@ -564,11 +610,20 @@ def assign_tasks_with_voting(
     # divided by max_feasible = min(#robots with >=1 positive task,
     # #tasks with >=1 positive robot), and the threshold may only fire after
     # MIN_POOL_BEFORE_THRESHOLD candidates (or the whole pool if smaller).
+    # 4b (2026-10-26): the call's upper bounds are computed from the same
+    # scores the allocator sees; 4d: when VOTING_UB_THRESHOLD_F is set, the
+    # effective threshold is f * UB (f a float or a function of the call's
+    # robot/task counts) instead of the fixed score_threshold.
+    ub_robot, ub_task, ub_max_feasible = _upper_bounds(suitability_matrix)
+    ub = min(ub_robot, ub_task) if ub_robot is not None else None
+    effective_threshold = score_threshold
+    if score_threshold is not None and VOTING_UB_THRESHOLD_F is not None:
+        _f = VOTING_UB_THRESHOLD_F
+        if callable(_f):
+            _f = _f(num_robots, num_tasks)
+        effective_threshold = (_f * ub) if (ub is not None and ub > 0) else None
     if VOTING_COVERAGE_THRESHOLD:
-        _m = np.asarray(suitability_matrix)
-        pos_rows = int(np.sum(np.any(_m > 0, axis=1)))
-        pos_cols = int(np.sum(np.any(_m > 0, axis=0)))
-        max_feasible = min(pos_rows, pos_cols)
+        max_feasible = ub_max_feasible
         min_pool = min(MIN_POOL_BEFORE_THRESHOLD, len(full_pool))
     random_assignments = []
     budget_fired = False
@@ -576,7 +631,7 @@ def assign_tasks_with_voting(
     for one in full_pool:
         random_assignments.append(one)
 
-        if score_threshold is not None:
+        if effective_threshold is not None:
             if VOTING_COVERAGE_THRESHOLD:
                 if max_feasible > 0 and len(random_assignments) >= min_pool:
                     candidate_score = sum(
@@ -591,7 +646,7 @@ def assign_tasks_with_voting(
                     candidate_score = sum(suitability_matrix[r][t] for r, t in pairs) / len(pairs)
                 else:
                     candidate_score = 0.0
-            if candidate_score >= score_threshold:
+            if candidate_score >= effective_threshold:
                 threshold_fired = True
                 break
         if time_budget_ms is not None:
@@ -620,7 +675,7 @@ def assign_tasks_with_voting(
             "rule": getattr(voting_method, "__name__", str(voting_method)),
             "full": len(full_pool),
             "ranked": len(random_assignments),
-            "threshold": score_threshold,
+            "threshold": effective_threshold,
             "budget_ms": time_budget_ms,
             "candidate_budget": candidate_budget,
         })
@@ -647,6 +702,32 @@ def assign_tasks_with_voting(
         cell[0] += 1
         if total_scores[assignment_ranking[0]] == total_scores[assignment_ranking[1]]:
             cell[1] += 1
+
+    # 4c calibration collector: one record per call with the call's
+    # dimensions, upper bounds, winner quality, and the positive pair
+    # scores the allocator saw. Winner quality uses the same
+    # coverage-normalized semantics as the anytime threshold (winner =
+    # assignment_ranking[0], the executed candidate under the zero-pair
+    # filter - the collector assumes the flag-on main configuration).
+    if UB_CALIBRATION is not None:
+        _winner = random_assignments[assignment_ranking[0]]
+        _winner_quality = (
+            sum(suitability_matrix[r][t] for r, t in _winner[0]) / ub_max_feasible
+            if ub_max_feasible > 0 else 0.0)
+        _m = np.asarray(suitability_matrix)
+        UB_CALIBRATION.append({
+            "rule": getattr(voting_method, "__name__", str(voting_method)),
+            "urgent": score_threshold is not None,
+            "full": len(full_pool),
+            "ranked": len(random_assignments),
+            "budget_fired": budget_fired,
+            "threshold_fired": threshold_fired,
+            "n_robots": num_robots, "n_tasks": num_tasks,
+            "max_feasible": ub_max_feasible,
+            "ub_robot": ub_robot, "ub_task": ub_task, "ub": ub,
+            "winner_quality": float(_winner_quality),
+            "pairs": _m[_m > 0].tolist(),
+        })
     end = time.perf_counter_ns()
     length = (end - start) / 1000.0
 

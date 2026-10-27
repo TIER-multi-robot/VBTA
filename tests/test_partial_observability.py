@@ -291,9 +291,13 @@ def test_hard_fail_uses_true_attributes_at_arrival():
 ORDER_A = ["borda", "cumulative", "murtys"]
 ORDER_B = ["murtys", "borda", "cumulative"]
 # Wall-clock timing columns in the driver's output (c0 = first tuple value):
-# c1 = total_reassignment_time, c54 (last) = Execution Time.
-# (v9/Step-8: Mover_Conflict_Waits and Observed_View_Suitability inserted.)
-TIMING_COLS = {"c1", "c54"}
+# c1 = total_reassignment_time, c55 = Planner_Total_ms, c57 (last) =
+# Execution Time. (v9/Step-8: Mover_Conflict_Waits and
+# Observed_View_Suitability inserted; 2026-10-26: planner-call accounting
+# columns appended - Planner_Call_Count (c54) and Planner_Cap_Hits (c56)
+# are deterministic and stay in the equality check, Planner_Total_ms (c55)
+# is wall-clock.)
+TIMING_COLS = {"c1", "c55", "c57"}
 
 
 def _run_driver(order, out_path):
@@ -445,6 +449,54 @@ def test_coverage_threshold_requires_min_pool():
         assert stats[-1]["ranked"] >= min_pool, (
             f"threshold fired with pool {stats[-1]['ranked']} < min {min_pool}")
     finally:
+        _V.POOL_STATS = None
+
+
+def test_upper_bounds_definition():
+    """4b: UB_robot / UB_task = mean of the top max_feasible values among
+    each side's best feasible scores; (None, None, 0) when infeasible."""
+    from hvbta.allocators.voting import _upper_bounds
+    # 3 robots x 3 tasks; robot 2 and task 2 are infeasible (all zeros)
+    M = np.array([
+        [0.8, 0.4, 0.0],
+        [0.6, 0.9, 0.0],
+        [0.0, 0.0, 0.0],
+    ])
+    ub_r, ub_t, mf = _upper_bounds(M)
+    assert mf == 2  # 2 robots with a positive task, 2 tasks with a positive robot
+    # robot bests: [0.8, 0.9, 0.0] -> top 2 mean = 0.85
+    assert abs(ub_r - 0.85) < 1e-12
+    # task bests: [0.8, 0.9, 0.0] -> top 2 mean = 0.85
+    assert abs(ub_t - 0.85) < 1e-12
+    # fully infeasible
+    assert _upper_bounds(np.zeros((2, 2))) == (None, None, 0)
+
+
+def test_ub_threshold_fires_at_f_times_ub():
+    """4d: with VOTING_UB_THRESHOLD_F set, the effective threshold is
+    f * UB; a candidate whose coverage-normalized quality reaches it stops
+    the pool (recorded via POOL_STATS with the scaled threshold)."""
+    from hvbta.allocators.voting import (
+        assign_tasks_with_voting, rank_assignments_range, _upper_bounds,
+    )
+    import hvbta.allocators.voting as _V
+    robots, tasks = make_robots(n=4, seed=3), make_tasks(n=4, seed=4)
+    M = evaluate_suitability_balanced(robots, tasks, map_size=100)
+    M = np.clip(M + 0.35, 0.0, 1.0)
+    ub_r, ub_t, mf = _upper_bounds(M)
+    ub = min(ub_r, ub_t)
+    assert ub > 0
+    _V.POOL_STATS = []
+    _V.VOTING_UB_THRESHOLD_F = 0.95
+    try:
+        assign_tasks_with_voting(
+            robots, tasks, M, 20, rank_assignments_range,
+            score_threshold=0.7)  # 0.7 replaced by 0.95 * UB
+        stats = _V.POOL_STATS[-1]
+        assert abs(stats["threshold"] - 0.95 * ub) < 1e-9, (
+            f"threshold {stats['threshold']} != 0.95*{ub}")
+    finally:
+        _V.VOTING_UB_THRESHOLD_F = None
         _V.POOL_STATS = None
 
 

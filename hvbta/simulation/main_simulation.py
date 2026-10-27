@@ -25,6 +25,7 @@ from hvbta.metrics import (
 from hvbta.pathfinding.CBS_helper import load_map, create_obstacle_list
 from hvbta.pathfinding.MAPF_wrapper import run_planner
 import hvbta.pathfinding.MAPF_wrapper as MW
+from hvbta.pathfinding import prioritized_planner as _PP
 from hvbta.allocators.misc_assignment import (
     add_new_tasks, add_new_robots, remove_random_robots, remove_random_tasks,
     remove_task_by_id, remove_robot_by_id, unassign_task_from_robot,
@@ -89,6 +90,23 @@ def func_name(f):
 # written as a row with Run_Timed_Out = 1 (metrics computed over the ticks
 # executed), never dropped. Configurable.
 RUN_WALL_LIMIT_S = 600
+
+# Deterministic planner-work bounds (2026-10-26, hyper-PP pilot fix): count-
+# based caps that bound per-run planner work independently of machine load,
+# applied identically to every allocation method (they live in the planner /
+# replan layer, not the allocator). The 600 s wall cap above stays as a
+# SAFETY STOP only - with these bounds no run should ever reach it.
+#   PLANNER_CALLS_PER_TICK   - max run_planner invocations per tick (the
+#       replan call + replan-on-failure alternative retries).
+#   PLANNER_FAILED_CALL_BUDGET - max FAILED planner calls per run; once
+#       exhausted the run goes planner-dead (further planner calls are
+#       skipped, stale paths accepted) instead of burning the wall clock.
+#       Normal runs fail 0-2 calls; the hyper-PP pilot's 600 s-capped runs
+#       failed 100-1000+.
+# Every cap firing is counted per run in the Planner_Cap_Hits column
+# (together with PP's per-call expansion-budget hits).
+PLANNER_CALLS_PER_TICK = 4
+PLANNER_FAILED_CALL_BUDGET = 150
 
 
 def _derived_seed(*parts) -> int:
@@ -531,6 +549,13 @@ def main_simulation(
     # planning idle agents as stay-put agents costs time, so measure it).
     MW.reset_planner_timing()
     planner_timing = MW.PLANNER_TIMING
+    # Deterministic planner-work bound state: failed-call budget + cap-hit
+    # counter (see PLANNER_CALLS_PER_TICK / PLANNER_FAILED_CALL_BUDGET).
+    # _pp_cap_hits_start snapshots PP's cumulative expansion-budget counter
+    # so the per-run delta can be added to Planner_Cap_Hits.
+    planner_failed_calls = 0
+    planner_cap_hits = 0
+    _pp_cap_hits_start = _PP.PP_EXPANSION_CAP_HITS
     # Ticks where allocation was skipped because the unassigned x unassigned
     # submatrix was all zero (2.7 guard; applies to every method and PO and
     # non-PO runs alike).
@@ -643,6 +668,7 @@ def main_simulation(
     # analyses. Count it like any other failed call.
     if not _initial_planner_okay:
         plan_failure_count += 1
+        planner_failed_calls += 1
         _entry = {"tick": 0, "phase": "initial"}
         _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
         plan_failure_log.append(_entry)
@@ -959,12 +985,20 @@ def main_simulation(
                 # event this tick triggers a tight budget so voting bails on
                 # the first good-enough candidate.
                 urgent_pressure = (percentage_urgent > 0.0) or (robot_pressure > 0.0) # NOTE: here I can take out robot pressure
-                # Deterministic urgent budget (2026-10-25): the old 20 ms
-                # wall-clock cap made results load-dependent; the candidate-
-                # count cap reproduces its MEDIAN behavior (see
-                # VOTING_URGENT_CANDIDATE_BUDGET).
+                # 4a (2026-10-26): the urgent candidate cap is OFF in the
+                # main configuration - under urgency voting stops via the
+                # good-enough threshold (with the MIN_POOL_BEFORE_THRESHOLD
+                # floor) or pool exhaustion. HVBTA_URGENT_CAP=1 re-enables
+                # the capped arm for the cap ablation (VOTING_URGENT_CANDIDATE_
+                # BUDGET=3, the 2026-10-25 deterministic replacement for the
+                # old 20 ms wall-clock cap).
+                _urgent_cap_arm = os.environ.get("HVBTA_URGENT_CAP", "0") == "1"
                 voting_candidate_budget = (V.VOTING_URGENT_CANDIDATE_BUDGET
-                                          if urgent_pressure else None)
+                                          if (urgent_pressure and _urgent_cap_arm) else None)
+                # 4d: the threshold value the voting layer applies is f * UB
+                # when V.VOTING_UB_THRESHOLD_F is set (HVBTA_UB_F; chosen by
+                # the user from the 4c calibration report); until then the
+                # legacy fixed 0.7 applies.
                 voting_score_threshold = 0.7 if urgent_pressure else None
 
                 # Adaptive candidate count: recent churn shrinks the pool so
@@ -978,7 +1012,7 @@ def main_simulation(
                 top_k_out_ids = []
 
                 print(f"REASSIGNING WITH VOTING METHOD: {voting_method_name}"
-                      f"{f' (URGENT: pct_urgent={percentage_urgent:.0%}, robot_pressure={int(robot_pressure)}, 20ms budget, 0.7 threshold)' if urgent_pressure else ''}"
+                      f"{f' (URGENT: pct_urgent={percentage_urgent:.0%}, robot_pressure={int(robot_pressure)}, threshold={voting_score_threshold})' if urgent_pressure else ''}"
                       f"{f' [warm-start seed: {len(previous_best_id_pairs)} pairs]' if previous_best_id_pairs else ''}"
                       f" [candidates: {effective_candidates}/{num_candidates}, recent_events={recent_event_count}]"
                       f"{f' [hall-of-fame: {len(candidate_cache)} cached]' if candidate_cache else ''}")
@@ -1119,171 +1153,194 @@ def main_simulation(
         # all fail, accept stale paths (no freeze — the stale paths are from
         # the last successful replan and may have minor collision risk, but
         # freezing would lose progress entirely).
+        # Deterministic planner-work bounds (2026-10-26): the retries are
+        # additionally bounded by PLANNER_CALLS_PER_TICK (calls per tick)
+        # and PLANNER_FAILED_CALL_BUDGET (failed calls per run; after it the
+        # run is planner-dead - no further planner calls). Count-based,
+        # identical for every method, counted in Planner_Cap_Hits.
         MAX_REPLAN_RETRIES = 10
         # None = planner not called this tick; True/False = outcome.
         planner_okay = None
+        # Deterministic per-tick planner-call counter (see
+        # PLANNER_CALLS_PER_TICK): the replan call counts as call #1; every
+        # replan-on-failure retry increments it.
+        planner_calls_this_tick = 0
         if should_replan_paths and start_positions and goal_positions:
-             # Debug: check for duplicate starts/goals before calling planner
-            # start_vals = list(start_positions.values())
-            # goal_vals = list(goal_positions.values())
-            # dup_starts = len(start_vals) - len(set(start_vals))
-            # dup_goals = len(goal_vals) - len(set(goal_vals))
-            # if dup_starts or dup_goals:
-            #     print(f"  [DEBUG] {len(start_positions)} agents, {dup_starts} dup starts, {dup_goals} dup goals")
-            print("\nRERUNNING PLANNER\n")
-            new_len, planner_okay = run_planner(planner, robots, start_positions, goal_positions, map_dict)
-            avg_path_length = new_len or avg_path_length
+            if planner_failed_calls >= PLANNER_FAILED_CALL_BUDGET:
+                # Per-run failed-call budget exhausted: planner-dead mode.
+                # Skip the planner call entirely (stale paths stand) and
+                # count the suppressed call. Deterministic and identical
+                # for every method.
+                planner_cap_hits += 1
+            else:
+                print("\nRERUNNING PLANNER\n")
+                planner_calls_this_tick = 1
+                new_len, planner_okay = run_planner(planner, robots, start_positions, goal_positions, map_dict)
+                avg_path_length = new_len or avg_path_length
 
-            if not planner_okay:
-                plan_failure_count += 1
-                _entry = {"tick": time_step}
-                _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
-                plan_failure_log.append(_entry)
+                if not planner_okay:
+                    plan_failure_count += 1
+                    planner_failed_calls += 1
+                    _entry = {"tick": time_step}
+                    _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
+                    plan_failure_log.append(_entry)
 
-            # ---- Replanning on plan failure ----
-            if not planner_okay:
-                # Collect alternative assignments to try.
-                alternatives = []
-                if voting_method in voting_methods and top_k_out_ids:
-                    # voting: top_k_out_ids has the ranked candidates from
-                    # this round (index 0 = winner, already tried). The rest
-                    # are alternatives.
-                    for cand in top_k_out_ids[1:]:
-                        alternatives.append(cand)
-
-                # Also try the hall-of-fame cache (older candidates that
-                # survived from previous rounds).
-                if voting_method in voting_methods and candidate_cache:
-                    for cand in candidate_cache:
-                        if cand not in alternatives:
+                # ---- Replanning on plan failure ----
+                if not planner_okay:
+                    # Collect alternative assignments to try.
+                    alternatives = []
+                    if voting_method in voting_methods and top_k_out_ids:
+                        # voting: top_k_out_ids has the ranked candidates from
+                        # this round (index 0 = winner, already tried). The rest
+                        # are alternatives.
+                        for cand in top_k_out_ids[1:]:
                             alternatives.append(cand)
 
-                # For Murty's: use the K-best alternatives generated during
-                # the assignment. These are near-optimal perturbations that
-                # differ from the winner by ~1 pair.
-                if voting_method == O.murtys_task_allocation and murtys_alternatives:
-                    for cand in murtys_alternatives:
-                        alternatives.append(cand)
+                    # Also try the hall-of-fame cache (older candidates that
+                    # survived from previous rounds).
+                    if voting_method in voting_methods and candidate_cache:
+                        for cand in candidate_cache:
+                            if cand not in alternatives:
+                                alternatives.append(cand)
 
-                # For standard optimization (CBBA/SSIA/ILP/JV): re-solve with
-                # a shuffled unassigned list (perturbation). These optimizers
-                # are deterministic, so perturbation may produce the same
-                # solution — this is a known limitation documented in the paper.
-                if voting_method in optimization_methods and voting_method != O.murtys_task_allocation:
-                    for _ in range(MAX_REPLAN_RETRIES):
-                        alternatives.append("PERTURB")
+                    # For Murty's: use the K-best alternatives generated during
+                    # the assignment. These are near-optimal perturbations that
+                    # differ from the winner by ~1 pair.
+                    if voting_method == O.murtys_task_allocation and murtys_alternatives:
+                        for cand in murtys_alternatives:
+                            alternatives.append(cand)
 
-                print(f"  {len(alternatives)} alternatives available for replan (cap={MAX_REPLAN_RETRIES})")
+                    # For standard optimization (CBBA/SSIA/ILP/JV): re-solve with
+                    # a shuffled unassigned list (perturbation). These optimizers
+                    # are deterministic, so perturbation may produce the same
+                    # solution — this is a known limitation documented in the paper.
+                    if voting_method in optimization_methods and voting_method != O.murtys_task_allocation:
+                        for _ in range(MAX_REPLAN_RETRIES):
+                            alternatives.append("PERTURB")
 
-                # Try each alternative: unassign current pairs, apply the
-                # alternative, update positions, retry planner.
-                retried = 0
-                while not planner_okay and retried < min(len(alternatives), MAX_REPLAN_RETRIES):
-                    alt = alternatives[retried]
-                    retried += 1
-                    alternatives_tried += 1
-                    print(f"  PLANNER FAILED — trying alternative assignment {retried}/{min(len(alternatives), MAX_REPLAN_RETRIES)}")
+                    print(f"  {len(alternatives)} alternatives available for replan (cap={MAX_REPLAN_RETRIES})")
 
-                    # Unassign all currently-assigned pairs that were set
-                    # by this replan (i.e. all robots that have a task
-                    # assigned). We need to be careful not to unassign
-                    # robots that were already assigned BEFORE this replan
-                    # tick — but in practice, reassign_robots_to_tasks only
-                    # touches unassigned robots, so all current assignments
-                    # were either pre-existing (untouched) or just set.
-                    # We unassign ALL assigned robots that have a task,
-                    # then re-apply the alternative. This is safe because
-                    # the alternative covers the same robots/tasks.
-                    from hvbta.allocators.misc_assignment import unassign_task_from_robot as _unassign
-                    for r in robots:
-                        if r.assigned and r.current_task:
-                            t = r.current_task
-                            _unassign(r, t, unassigned_robots, unassigned_tasks)
+                    # Try each alternative: unassign current pairs, apply the
+                    # alternative, update positions, retry planner.
+                    retried = 0
+                    while not planner_okay and retried < min(len(alternatives), MAX_REPLAN_RETRIES):
+                        # Deterministic planner-work bounds: stop retrying
+                        # when the per-run failed-call budget or the
+                        # per-tick planner-call cap is reached (counted in
+                        # Planner_Cap_Hits; identical for every method).
+                        if planner_failed_calls >= PLANNER_FAILED_CALL_BUDGET:
+                            planner_cap_hits += 1
+                            break
+                        if planner_calls_this_tick >= PLANNER_CALLS_PER_TICK:
+                            planner_cap_hits += 1
+                            break
+                        alt = alternatives[retried]
+                        retried += 1
+                        alternatives_tried += 1
+                        print(f"  PLANNER FAILED — trying alternative assignment {retried}/{min(len(alternatives), MAX_REPLAN_RETRIES)}")
 
-                    # Apply the alternative assignment.
-                    if alt == "PERTURB":
-                        # Re-solve with optimization (shuffled order)
-                        import random as _rng
-                        _rng.shuffle(unassigned_robots)
-                        _rng.shuffle(unassigned_tasks)
-                        # 8.2: each retry draws FRESH perturbed-JV noise
-                        # (the increment below happens first in the normal
-                        # path; here the noise seed must incorporate this
-                        # retry, so derive from the NEXT reassignment index).
-                        total_reassignments += 1
-                        alloc_fn = voting_method
-                        if voting_method is O.perturbed_jv_task_allocation:
-                            alloc_fn = O.perturbed_jv_factory(
-                                _derived_seed(run_seed, "pjv", total_reassignments))
-                        _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = O.reassign_robots_to_tasks_with_method(
-                            robots, tasks, num_candidates, voting_method, suitability_source,
-                            unassigned_robots, unassigned_tasks, alloc_fn, start_positions, goal_positions, HYPOTENUSE,
-                        )
-                        total_reassignment_time += reassign_length
-                        cumulative_reassignment_quality += reassign_score
-                    elif isinstance(alt, list):
-                        # Voting alternative: list of (robot_id, task_id) pairs
-                        for rid, tid in alt:
-                            robot = next((r for r in robots if r.robot_id == rid), None)
-                            task = next((t for t in tasks if t.task_id == tid), None)
-                            if robot and task and not robot.assigned and not task.assigned:
-                                robot.current_task = task
-                                robot.assigned = True
-                                robot.tasks_attempted += 1
-                                task.assigned_robot = robot
-                                task.assigned = True
-                                if rid in unassigned_robots:
-                                    unassigned_robots.remove(rid)
-                                if tid in unassigned_tasks:
-                                    unassigned_tasks.remove(tid)
-                                # Use matrix lookup for suitability
-                                if isinstance(suitability_source, tuple) and len(suitability_source) == 3:
-                                    full_matrix, r_idx_map, t_idx_map = suitability_source
-                                    pair_score = float(full_matrix[r_idx_map[rid], t_idx_map[tid]])
-                                else:
-                                    pair_score = float(suitability_source([robot], [task], map_size=HYPOTENUSE)[0, 0])
-                                robot.current_task_suitability = pair_score
-                                task.current_suitability = pair_score
-
-                    # PO: alternatives are applied without a suitability filter,
-                    # so scrub zero-suitability pairs here too - PO never
-                    # executes a pairing the allocator itself scored 0 (the
-                    # regular post-allocation scrub runs before this replan-
-                    # on-failure section, so it misses these).
-                    if po is not None:
+                        # Unassign all currently-assigned pairs that were set
+                        # by this replan (i.e. all robots that have a task
+                        # assigned). We need to be careful not to unassign
+                        # robots that were already assigned BEFORE this replan
+                        # tick — but in practice, reassign_robots_to_tasks only
+                        # touches unassigned robots, so all current assignments
+                        # were either pre-existing (untouched) or just set.
+                        # We unassign ALL assigned robots that have a task,
+                        # then re-apply the alternative. This is safe because
+                        # the alternative covers the same robots/tasks.
+                        from hvbta.allocators.misc_assignment import unassign_task_from_robot as _unassign
                         for r in robots:
-                            if (r.assigned and r.current_task is not None
-                                    and (r.current_task_suitability is None
-                                         or float(r.current_task_suitability) == 0.0)):
-                                unassign_task_from_robot(
-                                    r, r.current_task,
-                                    unassigned_robots=unassigned_robots,
-                                    unassigned_tasks=unassigned_tasks,
-                                )
+                            if r.assigned and r.current_task:
+                                t = r.current_task
+                                _unassign(r, t, unassigned_robots, unassigned_tasks)
 
-                    # Update positions for the new assignment.
-                    for robot in robots:
-                        if robot.assigned and robot.current_task:
-                            start_positions[robot.robot_id] = tuple(robot.location)
-                            goal_positions[robot.robot_id] = tuple(robot.current_task.location)
-                        else:
-                            start_positions.pop(robot.robot_id, None)
-                            goal_positions.pop(robot.robot_id, None)
+                        # Apply the alternative assignment.
+                        if alt == "PERTURB":
+                            # Re-solve with optimization (shuffled order)
+                            import random as _rng
+                            _rng.shuffle(unassigned_robots)
+                            _rng.shuffle(unassigned_tasks)
+                            # 8.2: each retry draws FRESH perturbed-JV noise
+                            # (the increment below happens first in the normal
+                            # path; here the noise seed must incorporate this
+                            # retry, so derive from the NEXT reassignment index).
+                            total_reassignments += 1
+                            alloc_fn = voting_method
+                            if voting_method is O.perturbed_jv_task_allocation:
+                                alloc_fn = O.perturbed_jv_factory(
+                                    _derived_seed(run_seed, "pjv", total_reassignments))
+                            _, unassigned_robots, unassigned_tasks, reassign_score, reassign_length, reassign_per_agent_scores = O.reassign_robots_to_tasks_with_method(
+                                robots, tasks, num_candidates, voting_method, suitability_source,
+                                unassigned_robots, unassigned_tasks, alloc_fn, start_positions, goal_positions, HYPOTENUSE,
+                            )
+                            total_reassignment_time += reassign_length
+                            cumulative_reassignment_quality += reassign_score
+                        elif isinstance(alt, list):
+                            # Voting alternative: list of (robot_id, task_id) pairs
+                            for rid, tid in alt:
+                                robot = next((r for r in robots if r.robot_id == rid), None)
+                                task = next((t for t in tasks if t.task_id == tid), None)
+                                if robot and task and not robot.assigned and not task.assigned:
+                                    robot.current_task = task
+                                    robot.assigned = True
+                                    robot.tasks_attempted += 1
+                                    task.assigned_robot = robot
+                                    task.assigned = True
+                                    if rid in unassigned_robots:
+                                        unassigned_robots.remove(rid)
+                                    if tid in unassigned_tasks:
+                                        unassigned_tasks.remove(tid)
+                                    # Use matrix lookup for suitability
+                                    if isinstance(suitability_source, tuple) and len(suitability_source) == 3:
+                                        full_matrix, r_idx_map, t_idx_map = suitability_source
+                                        pair_score = float(full_matrix[r_idx_map[rid], t_idx_map[tid]])
+                                    else:
+                                        pair_score = float(suitability_source([robot], [task], map_size=HYPOTENUSE)[0, 0])
+                                    robot.current_task_suitability = pair_score
+                                    task.current_suitability = pair_score
+
+                        # PO: alternatives are applied without a suitability filter,
+                        # so scrub zero-suitability pairs here too - PO never
+                        # executes a pairing the allocator itself scored 0 (the
+                        # regular post-allocation scrub runs before this replan-
+                        # on-failure section, so it misses these).
+                        if po is not None:
+                            for r in robots:
+                                if (r.assigned and r.current_task is not None
+                                        and (r.current_task_suitability is None
+                                             or float(r.current_task_suitability) == 0.0)):
+                                    unassign_task_from_robot(
+                                        r, r.current_task,
+                                        unassigned_robots=unassigned_robots,
+                                        unassigned_tasks=unassigned_tasks,
+                                    )
+
+                        # Update positions for the new assignment.
+                        for robot in robots:
+                            if robot.assigned and robot.current_task:
+                                start_positions[robot.robot_id] = tuple(robot.location)
+                                goal_positions[robot.robot_id] = tuple(robot.current_task.location)
+                            else:
+                                start_positions.pop(robot.robot_id, None)
+                                goal_positions.pop(robot.robot_id, None)
 
                     # Retry planner.
                     if start_positions and goal_positions:
+                        planner_calls_this_tick += 1
                         new_len, planner_okay = run_planner(planner, robots, start_positions, goal_positions, map_dict)
                         avg_path_length = new_len or avg_path_length
                         if not planner_okay:
                             plan_failure_count += 1
+                            planner_failed_calls += 1
                             _entry = {"tick": time_step}
                             _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
                             plan_failure_log.append(_entry)
                         if planner_okay:
                             print(f"  ALTERNATIVE {retried} SUCCEEDED — new plan accepted.")
 
-                if not planner_okay:
-                    print("  ALL ALTERNATIVES FAILED — accepting stale paths.")
+                    if not planner_okay:
+                        print("  ALL ALTERNATIVES FAILED — accepting stale paths.")
 
             if planner_okay and pending_event_steps:
                 # Adaptation latency: elapsed timesteps from each event to this
@@ -1537,6 +1594,17 @@ def main_simulation(
         # Section 15c - anytime pool diagnostics (2.8)
         threshold_fire_rate,
         mean_pool_size_at_rank,
+        # Section 15d - planner-call accounting (PP-pilot diagnostics,
+        # 2026-10-26). Planner_Call_Count is a deterministic per-run count
+        # (initial call + replan calls + replan-on-failure retries);
+        # Planner_Total_ms is wall-clock and excluded from comparisons;
+        # Planner_Cap_Hits counts every deterministic planner-work cap
+        # firing (per-tick planner-call cap, per-run failed-call budget,
+        # PP per-call expansion budget) - must be 0 in runs that stay
+        # within normal planner behavior.
+        planner_timing["calls"],
+        planner_timing["ns"] / 1e6,
+        planner_cap_hits + (_PP.PP_EXPANSION_CAP_HITS - _pp_cap_hits_start),
     )
 
 
@@ -1703,6 +1771,11 @@ if __name__ == "__main__":
     ABLATION_ZP = os.environ.get("HVBTA_ZERO_PAIR", "1") == "1"
     ABLATION_TH = os.environ.get("HVBTA_THRESHOLD", "1") == "1"
     ABLATION_VOTING_ONLY = os.environ.get("HVBTA_VOTING_ONLY", "0") == "1"
+    # 4d (2026-10-26): f for the urgent good-enough threshold (stop when a
+    # candidate's coverage-normalized quality >= f * UB). Chosen by the
+    # user from the 4c calibration report; unset = legacy fixed 0.7.
+    if "HVBTA_UB_F" in os.environ:
+        V.VOTING_UB_THRESHOLD_F = float(os.environ["HVBTA_UB_F"])
     # 8.2: the perturbed-JV baseline's own noise sigma. Chosen by the
     # duplicate-retry rule (see docs/checkins/2026-10-26-step8.md); set
     # via env so drivers need no file edits. None = JV unperturbed.
@@ -1829,25 +1902,42 @@ if __name__ == "__main__":
     ]
 
     # --- PO CONFIG: partially-observable task requirements ---
-    # Spec: partial_observability_experiment.md. Uses the maps_balanced2
-    # configuration (NEW_SWEEP_CONFIGS) with LaCAM fixed, all 6 voting
-    # methods + Murty's K-Best, balanced suitability only, and the 5 mask
-    # conditions (none / low-opt / low-pess / high-opt / high-pess).
-    # The mask condition is NOT part of the schedule seed, so all 5
-    # conditions replay identical schedules (spec §5).
-    # HVBTA_PO=0 disables the PO condition axis (single legacy condition,
-    # PO columns get sentinels) - used by e.g. the hyper-constrained PP
-    # pilot, which stresses the planner rather than the masks.
+    # Spec: partial_observability_experiment.md. LaCAM fixed, all 6 voting
+    # methods + Murty's K-Best + perturbed JV, balanced suitability only,
+    # and the 5 mask conditions (none / low-opt / low-pess / high-opt /
+    # high-pess). The mask condition is NOT part of the schedule seed, so
+    # all 5 conditions replay identical schedules (spec §5).
+    # 2026-10-26 (user-approved expansion): 4 maps spanning the balanced
+    # set's regimes - lak102d (small, 54% obstacles; continuity with every
+    # prior PO pilot + ablation), arena (medium, 14% - the open-regime
+    # medium), den204d (medium, 34% - the structured medium), lak307d
+    # (large, 33%). HVBTA_PO=0 disables the PO condition axis (single
+    # legacy condition, PO columns get sentinels) - used by e.g. the
+    # hyper-constrained PP pilot, which stresses the planner.
     PO_EXPERIMENT = os.environ.get("HVBTA_PO", "1") == "1"
-    # FINAL ablation pilots on the current code (new scorer + all Phase 2
-    # fixes), 3 reps, pilot config. Three flag combinations; Murty's rows
-    # must be identical across all three.
-    PO_SWEEP_CONFIGS = [(r"lak102d.map", [10, 20], [10, 20])]
+    # 8.1 score-noise experiment map set (2026-10-26 expansion): 3 maps
+    # spanning the same regimes - lak102d (small; continuity with the noise
+    # pilot + all ablations), den204d (structured medium), lak307d (large;
+    # the cheapest large map, den001d/den901d add 2-3x cost for the same
+    # call-size coverage). Same 5 sigma levels, 3 reps.
+    NOISE_EXPERIMENT = os.environ.get("HVBTA_NOISE", "0") == "1"
+    PO_SWEEP_CONFIGS = [
+        (r"lak102d.map", [10, 20], [10, 20]),
+        (r"arena.map",   [20, 30, 50], [20, 30, 50]),
+        (r"den204d.map", [20, 30, 50], [20, 30, 50]),
+        (r"lak307d.map", [50, 75, 100], [50, 75, 100]),
+    ]
+    NOISE_SWEEP_CONFIGS = [
+        (r"lak102d.map", [10, 20], [10, 20]),
+        (r"den204d.map", [20, 30, 50], [20, 30, 50]),
+        (r"lak307d.map", [50, 75, 100], [50, 75, 100]),
+    ]
     # Small-config override for verification runs (parallel==serial check).
     _sizes = os.environ.get("HVBTA_SIZES")
     if _sizes:
         _r = int(_sizes)
         PO_SWEEP_CONFIGS = [(r"lak102d.map", [_r], [_r])]
+        NOISE_SWEEP_CONFIGS = PO_SWEEP_CONFIGS
     # HVBTA_CONFIG=hyper -> the three hyper-constrained maps (PP pilot).
     if os.environ.get("HVBTA_CONFIG") == "hyper":
         PO_SWEEP_CONFIGS = HYPER_CONSTRAINED_CONFIGS
@@ -1900,10 +1990,11 @@ if __name__ == "__main__":
     sweep_configs = HYPER_CONSTRAINED_CONFIGS
     if PO_EXPERIMENT:
         sweep_configs = PO_SWEEP_CONFIGS
+    if NOISE_EXPERIMENT:
+        sweep_configs = NOISE_SWEEP_CONFIGS
     # ============================================================
 
     map_dir = r"MAPF_benchmark_maps"
-
     add_tasks = True
     add_robots = True
     remove_robots = True
@@ -2007,6 +2098,8 @@ if __name__ == "__main__":
                 'Run_Timed_Out',
                 # Anytime pool diagnostics (2.8)
                 'Threshold_Fire_Rate', 'Mean_Pool_Size_At_Rank',
+                # Planner-call accounting (PP-pilot diagnostics)
+                'Planner_Call_Count', 'Planner_Total_ms', 'Planner_Cap_Hits',
                 # Overhead
                 'Execution Time',
                 # Config covariates (constant per run)
@@ -2150,8 +2243,8 @@ if __name__ == "__main__":
                                     # not in any seed, so every condition
                                     # replays the identical schedule and the
                                     # sigma=0 rows reproduce the no-noise
-                                    # results exactly.
-                                    NOISE_EXPERIMENT = os.environ.get("HVBTA_NOISE", "0") == "1"
+                                    # results exactly. (NOISE_EXPERIMENT is
+                                    # read once at __main__ entry.)
                                     NOISE_SIGMAS = [0.0, 0.05, 0.1, 0.2, 0.3]
                                     if NOISE_EXPERIMENT:
                                         noise_conditions = (("none", "none", s) for s in NOISE_SIGMAS)
