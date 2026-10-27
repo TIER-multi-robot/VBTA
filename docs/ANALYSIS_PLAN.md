@@ -201,3 +201,68 @@ sigma 0.05 -> 1/16 = 6.2%, sigma 0.1 -> 1/16 = 6.2%, sigma 0.2 -> 0/16 =
 numbers were read for this choice. sigma_pjv is the baseline's own
 internal randomness, seeded per (run seed, replan index) with fresh draws
 on every retry; it is never mixed with sigma_obs in code or columns.
+
+### 2026-10-26: deterministic planner-work bounds for the hyper-constrained PP sweep (replaces wall-clock exposure)
+
+The hyper-constrained PP pilot (pilot_hyper_pp_v9, 768 runs) hit the 600 s
+per-run safety stop on 45 runs (by method: borda 8, MJ 6, approval 5,
+condorcet 6, cumulative 3, range 4, Murty's 4, perturbed JV 9;
+concentrated in overload/task_churn on 15-robot configs). Measurement of
+the capped runs (per-call planner timing + A* expansion instrumentation,
+re-running the capped configs): successful PP plan() calls cost < 25 ms
+and need at most ~178k total A* expansions, while FAILING calls exhaust
+the time-expanded search space - up to 3.3M expansions, 1-10 s each
+(lak103c 15x10: 80 failed calls averaging 7.7 s; hrt003d 15x15: 492
+failures x ~1 s). PP itself has no wall-clock limit (the wrapper threads
+time limits only to LaCAM), so run time was unbounded in both per-call
+work and per-run call count.
+
+Bounds adopted (all COUNT-based, deterministic, applied identically to
+every allocation method; every firing is counted per run in the new
+Planner_Cap_Hits CSV column; Planner_Call_Count and Planner_Total_ms
+columns record per-run planner-call accounting):
+- PP_MAX_EXPANSIONS = 250,000 A* expansions per plan() call, shared
+  across all priority orders and agent searches of that call (1.4x the
+  largest expansion count observed for a successful call, so it only
+  converts slow failures into fast ones);
+- PP_RUN_MAX_EXPANSIONS = 35,000,000 A* expansions per simulation run
+  (the hard bound: at the measured ~100k expansions/s under 30-worker
+  pool load this caps a run's planner time near 350 s; normal heavy
+  hyper runs use ~15-25M);
+- PLANNER_FAILED_CALL_BUDGET = 150 failed planner calls per run, after
+  which the run is planner-dead (further planner calls skipped, stale
+  paths accepted);
+- PLANNER_CALLS_PER_TICK = 4 planner invocations per tick (the replan
+  call plus replan-on-failure alternative retries).
+The 600 s RUN_WALL_LIMIT_S stays as a SAFETY STOP only. Pilot re-run on
+the bounded code (pilot_hyper_pp_v11, same 768-run config): ZERO runs hit
+the wall stop (max 372 s, p99 280 s), all collision invariants 0, and
+the planner-failure stress phenomenon is preserved (15,173 failures,
+mean 19.8/run; completion profile matches the unbounded pilot: Murty's
+0.736, perturbed JV 0.724, voting 0.615-0.645).
+
+### 2026-10-26: urgent-call stopping rule (candidate cap removed; threshold to become f * UB)
+
+The anytime behavior of voting under urgency is changed before the Phase-4
+sweeps, in two steps:
+1. EFFECTIVE NOW: the urgent candidate cap (VOTING_URGENT_CANDIDATE_BUDGET
+   = 3, the 2026-10-25 amendment) is REMOVED from the main configuration.
+   Under urgency, voting stops when the good-enough threshold fires (with
+   the MIN_POOL_BEFORE_THRESHOLD = 5 floor) or when the pool is exhausted.
+   The capped arm remains available for the cap ablation only
+   (HVBTA_URGENT_CAP=1): six voting methods, lak102d, 3 reps,
+   sigma_obs = 0, compared against the main noise sweep's sigma_obs = 0
+   rows (configs identical except the cap).
+2. PENDING USER CHOICE (f): the good-enough threshold becomes
+   stop when a candidate's coverage-normalized quality >= f * UB, where
+   UB = min(UB_robot, UB_task) is computed per allocation call from the
+   scores the allocator sees (UB_robot = mean of the top max_feasible
+   values among each robot's best feasible score; UB_task likewise over
+   tasks; max_feasible = min(#robots with >= 1 positive task, #tasks with
+   >= 1 positive robot)). f is a single value or a function of the call's
+   robot/task counts, chosen from the calibration report (v9 pilot
+   config + one rep of den901d 100x100; NO completion numbers were read
+   for the calibration). f is set via HVBTA_UB_F. No Phase-4 sweep runs
+   until f is set.
+Every sweep's report includes mean allocation time per call by method:
+(Planning_Time_us + total_reassignment_time) / (1 + total_reassignments).
