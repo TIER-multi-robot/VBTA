@@ -30,16 +30,20 @@ import phase4_sweep as P
 
 
 def main():
-    out_dir = os.path.join("hvbta", "io", "results", "ablation_anytime_fullpool")
+    out_dir = os.path.join("hvbta", "io", "results",
+                           os.environ.get("ABL_OUTDIR", "ablation_anytime_fullpool_v2"))
     csv_path = os.path.join(out_dir, "phase4_simulation.csv")
     prof_path = os.path.join(out_dir, "phase4_profiles.csv")
     if os.path.exists(csv_path):
         raise SystemExit(f"{csv_path} already exists - use a fresh directory")
     os.makedirs(out_dir, exist_ok=True)
 
-    jobs = [{"sweep": "noise", "map": "lak102d.map", "nr": n, "nt": n,
+    # Full cross product, matching the noise sweep's lak102d config
+    # (build_queue iterates nr x nt, not matched pairs).
+    jobs = [{"sweep": "noise", "map": "lak102d.map", "nr": nr, "nt": nt,
              "scenario": s, "rep": rep, "cost": 0}
-            for n in (10, 20)
+            for nr in (10, 20)
+            for nt in (10, 20)
             for s in P.SCENARIOS
             for rep in range(3)]
     conds = P.sweep_conditions("noise")

@@ -62,6 +62,7 @@ def _load_named(paths):
                     "scenario": r["Scenario"],
                     "rep": int(r.get("Rep") or -1),
                     "method": r["Method"],
+                    "completion": float(r["Task_Completion_Fraction"]),
                     "planner": (r.get("Planner") or
                                 ("pp" if (got_map or base) in
                                  ("hrt003d.map", "lak103c.map", "lak108c.map")

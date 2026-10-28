@@ -109,7 +109,9 @@ def main():
         ("perturbed_jv_task_allocation", O.perturbed_jv_task_allocation),
     ]
 
-    out_dir = os.path.join("hvbta", "io", "results", "realtime_check_lak307d")
+    out_dir = os.path.join(
+        "hvbta", "io", "results",
+        os.environ.get("RT_OUTDIR", "realtime_check_lak307d"))
     os.makedirs(out_dir, exist_ok=True)
     json_path = os.path.join(out_dir, "realtime_report.json")
 

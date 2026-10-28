@@ -304,12 +304,66 @@ Also in this amendment:
    only at the tick horizon or when all tasks complete, as in every other
    run.
 
-2. Driver-consistency bug fix (justified as a bug): the serial __main__
-   driver defaulted PERTURBED_JV_SIGMA to None (JV unperturbed) unless
-   HVBTA_PJV_SIGMA was set, while the pool driver (phase4_sweep.run_group)
-   hard-sets 0.05 per the 2026-10-26 sigma_pjv amendment. The serial
-   default is now 0.05, matching the pool driver and the amendment; the
-   env override remains. (Found by the item-2 pool-vs-serial check: all
-   perturbed_jv rows mismatched with the old default; after the fix all
-   160 rows x 2 paths match bit-for-bit, excluding timing columns.)
+ 2. Driver-consistency bug fix (justified as a bug): the serial __main__
+    driver defaulted PERTURBED_JV_SIGMA to None (JV unperturbed) unless
+    HVBTA_PJV_SIGMA was set, while the pool driver (phase4_sweep.run_group)
+    hard-sets 0.05 per the 2026-10-26 sigma_pjv amendment. The serial
+    default is now 0.05, matching the pool driver and the amendment; the
+    env override remains. (Found by the item-2 pool-vs-serial check: all
+    perturbed_jv rows mismatched with the old default; after the fix all
+    160 rows x 2 paths match bit-for-bit, excluding timing columns.)
+
+### 2026-10-27: output-schema unification (two entry points wrote different schemas)
+
+Bug fix, justified as a bug: the two sweep entry points wrote different
+schemas. The pool driver (phase4_sweep) packed the whole 59-item output
+tuple into one stringified "Output" column with NO initial-quality
+columns and NO profiles file - the full named schema (84 columns, the
+serial writer's) existed only in the serial path, so pool data always
+needed post-hoc reconstruction. The serial Run ID was additionally an
+on-disk row counter (resume-order dependent, and only the first run of
+each group appeared in the profiles file), making the sim-to-profiles
+join and cross-runner comparisons non-reproducible.
+
+UNIFIED (before the hyper sweep launched; the noise sweep had already
+run on the packed format): both entry points now assemble rows and
+profiles with the same shared builders (main_simulation.build_result_row
+/ build_initial_prefix / _initial_quality_fields / build_profiles_row /
+make_run_id). The pool driver writes the full unpacked 84-column schema
+plus leading Map and Rep columns, plus phase4_profiles.csv, one profiles
+row per group, keyed by the deterministic per-group Run ID
+("{map}_{nr}x{nt}_{scenario}_rep{rep}") used by BOTH runners. The serial
+Run ID counter is replaced by the same deterministic ID (its only other
+consumer, the po_diagnostics JSON filename, now includes the mask /
+policy / sigma condition plus the group ID, so filenames stay unique).
+sweep_report.py reads all three formats (new unified pool, legacy packed
+noise dir, serial stamped files).
+
+Validation (one small config, lak102d 10x10, rep 0, 4 scenarios, all 5
+noise sigmas, 8 methods = 160 rows, run through BOTH runners fresh):
+identical on all 80 shared non-timing columns - including the
+deterministic Run ID - and identical profiles files (all 7 columns,
+4 rows each). Timing columns excluded: Planning_Time_us,
+total_reassignment_time, Planner_Total_ms, Execution Time (all
+wall-clock). Full test suite passes (53/53).
+
+The noise sweep (phase4_final_noise, run pre-unification on the packed
+format; the raw file is kept unchanged): its initial-quality and
+fairness columns (Total Score, Mean_Assignment_Suitability,
+Init_Jains_Index/Gini/Median/IQR) and its profiles were REGENERATED
+FROM SEEDS by expand_results.py, replicating the serial writer's exact
+path - per-method initial-assignment RNG isolation, the PO true-score
+rule (_record_initial), the perturbed-JV initial factory, and the
+Mask_Count / Map Size semantics. Verified two ways:
+  (i) small map: against a fresh serial run (lak102d 10x10, rep 0,
+      4 scenarios, 5 sigmas, 8 methods) - 160 rows x 79 non-timing
+      columns bit-identical, plus per-row assertion that the packed
+      Output tuple has exactly 59 items on all 10,560 rows;
+  (ii) large map: lak307d 50x50, rep 0, all 4 scenarios, sigma_obs = 0
+      only - 32 rows x 82 non-timing columns identical against rows
+      written directly by the unified code, and the 4 profiles rows
+      identical. The reconstruction is therefore verified on both the
+      small and the large map; expand_results.py is retained for
+      phase4_final_noise only - every sweep from hyper onward writes
+      the unpacked schema directly, no reconstruction.
 
