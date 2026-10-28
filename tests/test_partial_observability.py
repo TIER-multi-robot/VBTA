@@ -291,14 +291,14 @@ def test_hard_fail_uses_true_attributes_at_arrival():
 ORDER_A = ["borda", "cumulative", "murtys"]
 ORDER_B = ["murtys", "borda", "cumulative"]
 # Wall-clock timing columns in the driver's output (c0 = first tuple value):
-# c1 = total_reassignment_time, c55 = Planner_Total_ms, c58 (last) =
+# c1 = total_reassignment_time, c55 = Planner_Total_ms, c59 (last) =
 # Execution Time. (v9/Step-8: Mover_Conflict_Waits and
 # Observed_View_Suitability inserted; 2026-10-26: planner-call accounting
 # columns appended - Planner_Call_Count (c54) and Planner_Cap_Hits (c56)
 # are deterministic and stay in the equality check, Planner_Total_ms (c55)
-# is wall-clock. 2026-10-27: Planner_Dead_Tick (c57) appended -
-# deterministic, stays in the check.)
-TIMING_COLS = {"c1", "c55", "c58"}
+# is wall-clock. 2026-10-27: Planner_Dead_Tick (c57) and
+# Planner_Timeout_Count (c58) appended - deterministic, stay in the check.)
+TIMING_COLS = {"c1", "c55", "c59"}
 
 
 def _run_driver(order, out_path):

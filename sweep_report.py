@@ -86,6 +86,7 @@ def _load_named(paths):
                     "plcalls": int(r["Planner_Call_Count"]),
                     "plms": float(r["Planner_Total_ms"]),
                     "cap_hits": int(r["Planner_Cap_Hits"]),
+                    "pltimeout": int(r.get("Planner_Timeout_Count") or 0),
                     "dead_tick": (int(r["Planner_Dead_Tick"])
                                   if r.get("Planner_Dead_Tick") else None),
                     "exec": float(r["Execution Time"]),
@@ -124,8 +125,11 @@ def load_rows(dir_path):
                         "init_alloc_us": float(r.get("Init_Alloc_us") or 0.0),
                         # 59-item tuple (2026-10-27+): dead_tick = o[57],
                         # exec = o[58]. Legacy 58-item tuple: no
-                        # Planner_Dead_Tick.
+                        # Planner_Dead_Tick. Unified 60-item tuple
+                        # (2026-10-27 evening+): o[58] = Planner_Timeout_
+                        # Count, o[59] = exec.
                         "dead_tick": (int(o[57]) if len(o) >= 59 else None),
+                        "pltimeout": (int(o[58]) if len(o) >= 60 else 0),
                         "exec": float(o[-1]),
                         **{k: o[i] for k, i in OUT_IDX.items()},
                     })
@@ -174,6 +178,12 @@ def report(dir_path, pp_stress=False):
     cap_total = sum(r["cap_hits"] for r in rows)
     print(f"  planner cap hits: {cap_total} on {cap_rows} rows "
           f"(deterministic planner-work caps; expected 0 on LaCAM sweeps)")
+    # LaCAM wall-clock budget hits (logging-only column, 2026-10-27;
+    # absent in pre-2026-10-27-evening dirs and reported as 0 there).
+    to_total = sum(r.get("pltimeout") or 0 for r in rows)
+    to_rows = sum(1 for r in rows if (r.get("pltimeout") or 0))
+    print(f"  planner timeout hits (1s budget): {to_total} on {to_rows} rows"
+          f"{'' if 'pltimeout' in rows[0] else '  (n/a: pre-column CSV)'}")
     print(f"  propagated waits: {sum(r['prop'] for r in rows)} total "
           f"(informational)")
 

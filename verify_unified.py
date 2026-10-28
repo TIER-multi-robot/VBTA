@@ -36,7 +36,7 @@ N_ROWS = N_METHODS * N_SIGMAS * N_SCEN   # 160
 
 
 def run_serial():
-    serial_dir = "verify_unified_serial"
+    serial_dir = os.environ.get("VU_SERIAL_DIR", "verify_unified_serial")
     res_dir = os.path.join("hvbta", "io", "results", serial_dir)
     if not os.path.isdir(res_dir):
         env = dict(os.environ)
@@ -72,7 +72,9 @@ def run_serial():
 
 
 def run_pool():
-    pool_dir = os.path.join("hvbta", "io", "results", "verify_unified_pool")
+    pool_dir = os.path.join(
+        "hvbta", "io", "results",
+        os.environ.get("VU_POOL_DIR", "verify_unified_pool"))
     csv_path = os.path.join(pool_dir, "phase4_simulation.csv")
     if os.path.exists(csv_path):
         raise SystemExit(f"{csv_path} already exists - use a fresh directory")
@@ -105,9 +107,9 @@ def main():
 
     print(f"serial rows: {len(s_rows)} (header {len(s_header)} cols); "
           f"pool rows: {len(p_rows)} (header {len(P.ROW_HEADER)} cols)")
-    assert len(s_header) == 84, f"serial header is {len(s_header)} cols, expected 84"
-    assert all(len(r) == 86 for r in p_rows), "pool row width != 86"
-    assert all(len(r) == 84 for r in s_rows), "serial row width != 84"
+    assert len(s_header) == 85, f"serial header is {len(s_header)} cols, expected 85"
+    assert all(len(r) == 87 for r in p_rows), "pool row width != 87"
+    assert all(len(r) == 85 for r in s_rows), "serial row width != 85"
     assert len(s_rows) == len(p_rows) == N_ROWS, (len(s_rows), len(p_rows))
 
     # The pool schema = Map + Rep + the serial 84 columns.

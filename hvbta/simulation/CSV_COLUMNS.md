@@ -20,10 +20,10 @@ The row is assembled as:
 | Component | Items | Source |
 |---|---|---|
 | `row_prefix` | 14 | `_record_assignment` (13 items: identity + initial quality + initial fairness) with `Planner` injected at position 4 |
-| `output_tuple` | 59 | `benchmark_simulation` = `main_simulation` return (58: 48 pre-collision + 5 collision/limit incl. `Propagated_Wait_Count` and `Mover_Conflict_Waits` + 4 planner-call accounting incl. `Planner_Dead_Tick`) + `execution_time` (1) |
+| `output_tuple` | 60 | `benchmark_simulation` = `main_simulation` return (59: 48 pre-collision + 5 collision/limit + 5 planner-call accounting incl. `Planner_Dead_Tick` and `Planner_Timeout_Count`) + `execution_time` (1) |
 | `config_suffix` | 10 | Scenario + 4 raw rates + 5 PO/noise config columns (`Mask_Level`, `Mask_Count`, `Mask_Policy`, `Obs_Noise_Sigma`, `Noise_Experiment`), appended at the writer callsite |
 | `map_size` | 1 | Appended at the writer callsite (size class "Small"/"Medium"/"Large" from the map diagonal) |
-| **Total** | **84** | |
+| **Total** | **85** | |
 
 The pool driver's parallel CSV (`phase4_simulation.csv`) packs the 59-item
 output tuple into one stringified `Output` column plus group identity
@@ -250,7 +250,7 @@ renumbering pass).
 | 60 | `Threshold_Fire_Rate` | Share of threshold-active voting calls where the anytime early termination cut the pool short of its full size | Contextual | -1 when the run made no voting allocations (e.g. Murty's rows). Under the coverage threshold (2.8) a healthy value means the anytime path is exploring at least `MIN_POOL_BEFORE_THRESHOLD` candidates before stopping |
 | 61 | `Mean_Pool_Size_At_Rank` | Mean ranked-pool size across ALL voting calls in the run | **Higher** = more exploration | -1 when no voting calls. Pools of ~1 indicate degenerate anytime behavior (pre-2.8 bug where the first candidate always cleared the mean-per-pair threshold) |
 
-## 12e. Planner-call accounting (4 columns)
+## 12e. Planner-call accounting (5 columns)
 
 Per-run planner-work accounting (`MAPF_wrapper.PLANNER_TIMING` + the
 deterministic planner-work caps, reset at run start).
@@ -261,6 +261,7 @@ deterministic planner-work caps, reset at run start).
 | 63 | `Planner_Total_ms` | Total wall-clock milliseconds spent inside `run_planner` this run | Contextual | Wall-clock: exclude from cross-run equality checks. `Planner_Total_ms / Planner_Call_Count` = mean ms per planner call |
 | 64 | `Planner_Cap_Hits` | Every firing of a deterministic planner-work cap: the per-tick planner-call cap (`PLANNER_CALLS_PER_TICK = 4`), the per-run failed-call budget (`PLANNER_FAILED_CALL_BUDGET = 150`; after it the run is planner-dead — no further planner calls), and PP's per-call A* expansion budget (`PP_MAX_EXPANSIONS = 250,000`) | **0 in normal runs** | The caps are count-based and identical for every method; they keep hyper-constrained PP runs far below the 600 s wall safety stop. Nonzero values mark runs whose planner work was truncated — analyze with the truncation in mind |
 | 65 | `Planner_Dead_Tick` | The tick at which the run first entered planner-dead mode (the failed-call budget was reached by a failing call); -1 = the run never went planner-dead | Contextual | Added 2026-10-27. Deterministic. `sweep_report.py` reports, per method: dead-run count, dead tick mean/median, and mean completion for dead vs other runs |
+| 66 | `Planner_Timeout_Count` | Failed planner calls classified `lacam_timeout` (the call hit the `PLANNER_TIME_BUDGET_S = 1.0 s` wall-clock budget; distinct from `lacam_no_solution` / `engine_unsolved`) | **0 in normal runs** | Logging-only (2026-10-27): distinguishes LaCAM budget hits from no-solution failures per row. The budget is wall-clock, so this count is load-sensitive — nonzero values mark load-affected rows |
 
 **Derivable: allocation time per call (per-sweep reporting).**
 `Alloc_us_per_call = (Planning_Time_us + total_reassignment_time) / (1 + total_reassignments)`

@@ -367,3 +367,25 @@ Mask_Count / Map Size semantics. Verified two ways:
       phase4_final_noise only - every sweep from hyper onward writes
       the unpacked schema directly, no reconstruction.
 
+### 2026-10-28: Planner_Timeout_Count column (logging-only)
+
+Bug fix, justified as a logging gap: MAPF_wrapper classifies every
+planner failure by kind (lacam_timeout = the PLANNER_TIME_BUDGET_S = 1 s
+wall-clock budget was hit; lacam_no_solution; engine_unsolved;
+duplicate_start/goal), but the CSV recorded only the aggregate
+Plan_Failure_Count - a row's failures could not be attributed to LaCAM
+budget hits vs no-solution failures. Added Planner_Timeout_Count (per-run
+count of failed calls with kind == lacam_timeout) as the last column of
+the output tuple, produced by the shared builders so both entry points
+write it (serial schema now 85 columns; pool 87 with the leading Map/Rep).
+Logging-only: no behavioral change, verified by the pool-vs-serial
+identity test (160 rows x 81 shared non-timing columns, profiles
+identical; the new column compared and identical) and the full test suite
+(53/53). Note: the column is itself load-sensitive by construction (the
+budget is wall-clock); nonzero values mark load-affected rows. The
+constrained sweep was launched before this change and therefore lacks the
+column (it has zero failures of any kind, so its LaCAM-budget count is 0
+either way); balanced and full carry it. LaCAM 1 s-budget hit counts in
+the existing sweeps (from Plan_Failure_Count, all-zero): noise 0/10,560
+rows, PO 0/14,880, constrained 0/3,360.
+

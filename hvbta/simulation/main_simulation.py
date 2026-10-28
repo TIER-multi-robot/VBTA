@@ -555,6 +555,12 @@ def main_simulation(
     # so the per-run delta can be added to Planner_Cap_Hits.
     planner_failed_calls = 0
     planner_cap_hits = 0
+    # Per-run count of failed planner calls that hit the wall-clock time
+    # budget (kind == "lacam_timeout"; MAPF_wrapper classifies every
+    # failure). Logging-only column (Planner_Timeout_Count, 2026-10-27):
+    # distinguishes LaCAM budget hits from no-solution failures in the
+    # CSV. Deterministic given the (load-sensitive) planner outcomes.
+    lacam_timeout_count = 0
     # First tick at which planner_failed_calls reached
     # PLANNER_FAILED_CALL_BUDGET (planner-dead mode begins; reported as
     # the Planner_Dead_Tick column, -1 = never). Deterministic.
@@ -677,6 +683,8 @@ def main_simulation(
             planner_dead_tick = 0
         _entry = {"tick": 0, "phase": "initial"}
         _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
+        if _entry.get("kind") == "lacam_timeout":
+            lacam_timeout_count += 1
         plan_failure_log.append(_entry)
 
     # create the initial state
@@ -1200,6 +1208,8 @@ def main_simulation(
                         planner_dead_tick = time_step
                     _entry = {"tick": time_step}
                     _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
+                    if _entry.get("kind") == "lacam_timeout":
+                        lacam_timeout_count += 1
                     plan_failure_log.append(_entry)
 
                 # ---- Replanning on plan failure ----
@@ -1354,6 +1364,8 @@ def main_simulation(
                                 planner_dead_tick = time_step
                             _entry = {"tick": time_step}
                             _entry.update(MW.LAST_PLAN_FAILURE or {"kind": "unknown"})
+                            if _entry.get("kind") == "lacam_timeout":
+                                lacam_timeout_count += 1
                             plan_failure_log.append(_entry)
                         if planner_okay:
                             print(f"  ALTERNATIVE {retried} SUCCEEDED — new plan accepted.")
@@ -1635,6 +1647,10 @@ def main_simulation(
         # failed-call budget was exhausted); -1 = never went dead.
         # Deterministic; reported per method by sweep_report.py.
         planner_dead_tick,
+        # Failed planner calls that hit the wall-clock time budget
+        # (kind == "lacam_timeout"). Logging-only (2026-10-27): lets the
+        # CSV distinguish LaCAM budget hits from no-solution failures.
+        lacam_timeout_count,
     )
 
 
@@ -1764,8 +1780,8 @@ def _initial_quality_fields(po_cond, out, score, per_agent_scores,
 
 def build_result_row(row_prefix, output_tuple, scenario_name, regime,
                      mask_level, mask_count, mask_policy, noise_sigma, map_class):
-    """Assemble the full 84-column result row (serial schema):
-    row_prefix (14, with planner injected) + output_tuple (59) +
+    """Assemble the full 85-column result row (serial schema):
+    row_prefix (14, with planner injected) + output_tuple (60) +
     config suffix (10) + map class (1). Shared by both entry points."""
     return (list(row_prefix) + list(output_tuple) + [
         scenario_name,
@@ -1836,6 +1852,8 @@ RESULT_ROW_OUTPUT_HEADER = [
     # Planner-call accounting
     'Planner_Call_Count', 'Planner_Total_ms', 'Planner_Cap_Hits',
     'Planner_Dead_Tick',
+    # Failed planner calls that hit the wall-clock time budget
+    'Planner_Timeout_Count',
     # Overhead
     'Execution Time',
 ]
@@ -1848,7 +1866,7 @@ RESULT_ROW_SUFFIX_HEADER = [
 ]
 RESULT_ROW_HEADER = (RESULT_ROW_PREFIX_HEADER + RESULT_ROW_OUTPUT_HEADER
                      + RESULT_ROW_SUFFIX_HEADER)
-assert len(RESULT_ROW_HEADER) == 84, len(RESULT_ROW_HEADER)
+assert len(RESULT_ROW_HEADER) == 85, len(RESULT_ROW_HEADER)
 PROFILES_ROW_HEADER = ['Run_ID', 'Map', 'Num Robots', 'Num Tasks',
                        'Suitability Method', 'RobotProfiles', 'TaskProfiles']
 
