@@ -32,6 +32,7 @@ import phase4_sweep as P
 def main():
     out_dir = os.path.join("hvbta", "io", "results", "ablation_anytime_fullpool")
     csv_path = os.path.join(out_dir, "phase4_simulation.csv")
+    prof_path = os.path.join(out_dir, "phase4_profiles.csv")
     if os.path.exists(csv_path):
         raise SystemExit(f"{csv_path} already exists - use a fresh directory")
     os.makedirs(out_dir, exist_ok=True)
@@ -44,14 +45,19 @@ def main():
     conds = P.sweep_conditions("noise")
     assert [c[2] for c in conds] == [0.0], f"expected sigma=0 only, got {conds}"
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    with open(csv_path, "w", newline="", encoding="utf-8") as f, \
+         open(prof_path, "w", newline="", encoding="utf-8") as pf:
         w = csv.writer(f)
+        pw = csv.writer(pf)
         w.writerow(P.ROW_HEADER)
+        pw.writerow(P.PROFILES_HEADER)
         for i, job in enumerate(jobs, 1):
-            rows = P.run_group(job)
+            rows, prof_row = P.run_group(job)
             for r in rows:
                 w.writerow(r)
+            pw.writerow(prof_row)
             f.flush()
+            pf.flush()
             print(f"  {i}/{len(jobs)} groups done "
                   f"({job['map']} {job['nr']}x{job['nt']} "
                   f"{job['scenario']} rep{job['rep']})", flush=True)

@@ -1715,18 +1715,142 @@ def benchmark_simulation(
     return output_tuple + (execution_time,)
 
 
-def _record_assignment(assignment_infos, run_id, method_name, sm_name, num_robots,
-                       num_tasks, nc, score, planning_time_us, per_agent_scores):
-    """Compute initial fairness metrics, derived score fields, and append a row."""
+def build_initial_prefix(run_id, method_name, sm_name, num_robots, num_tasks, nc,
+                         score, planning_time_us, per_agent_scores):
+    """Initial-quality row prefix (13 items, BEFORE planner injection) -
+    the shared builder used by BOTH entry points (serial __main__ and the
+    phase-4 pool driver) so their CSV schemas are identical by
+    construction (schema unification, 2026-10-27)."""
     metrics = compute_all_fairness_metrics(per_agent_scores)
     assigned_count = len(per_agent_scores) if per_agent_scores else 0
     # arithmetic mean suitability across assigned pairs (score / assigned_count).
     mean_assignment_suitability = (score / assigned_count) if assigned_count > 0 else 0.0
+    return [run_id, method_name, sm_name, num_robots, num_tasks, nc, score,
+            mean_assignment_suitability, planning_time_us] + list(metrics)
+
+
+def _record_assignment(assignment_infos, run_id, method_name, sm_name, num_robots,
+                       num_tasks, nc, score, planning_time_us, per_agent_scores):
+    """Compute initial fairness metrics, derived score fields, and append a row."""
     assignment_infos.append(
-        [run_id, method_name, sm_name, num_robots, num_tasks, nc, score,
-         mean_assignment_suitability, planning_time_us] + list(metrics)
-    )
-    return metrics[0]  # initial jains
+        build_initial_prefix(run_id, method_name, sm_name, num_robots, num_tasks,
+                             nc, score, planning_time_us, per_agent_scores))
+    return assignment_infos[-1][9]  # initial jains
+
+
+def make_run_id(map_name, num_robots, num_tasks, scenario, rep):
+    """Deterministic per-group Run ID: same config -> same ID, independent
+    of run order or resume state (the serial writer's old on-disk counter
+    was order-dependent; unified 2026-10-27). Shared by both entry points
+    and the profiles files so (Run ID, Map) joins cleanly."""
+    return f"{map_name}_{num_robots}x{num_tasks}_{scenario}_rep{rep}"
+
+
+def _initial_quality_fields(po_cond, out, score, per_agent_scores,
+                            robots, tasks, hypotenuse):
+    """PO true-score rule (the serial writer's _record_initial): under PO
+    conditions the REPORTED initial quality is computed on TRUE
+    (un-masked / un-noised) pair scores, not the allocator's view.
+    Returns (total_score, per_agent_scores)."""
+    if po_cond is None or not out:
+        return score, per_agent_scores
+    pairs = out[0] if isinstance(out, tuple) else out
+    true_per_agent = [
+        S._balanced_pair(robots[r], tasks[t], map_size=hypotenuse)
+        for r, t in pairs
+    ]
+    return sum(true_per_agent), true_per_agent
+
+
+def build_result_row(row_prefix, output_tuple, scenario_name, regime,
+                     mask_level, mask_count, mask_policy, noise_sigma, map_class):
+    """Assemble the full 84-column result row (serial schema):
+    row_prefix (14, with planner injected) + output_tuple (59) +
+    config suffix (10) + map class (1). Shared by both entry points."""
+    return (list(row_prefix) + list(output_tuple) + [
+        scenario_name,
+        regime["task_arrival_rate"], regime["task_cancellation_rate"],
+        regime["robot_arrival_rate"], regime["robot_departure_rate"],
+        mask_level, mask_count, mask_policy,
+        noise_sigma if noise_sigma is not None else "",
+        1 if noise_sigma is not None else 0,
+    ] + [map_class])
+
+
+def build_profiles_row(run_id, map_name, num_robots, num_tasks, sm_name,
+                       robot_profiles, task_profiles):
+    """Profiles-file row (7 columns), shared by both entry points."""
+    return [run_id, map_name, num_robots, num_tasks, sm_name,
+            robot_profiles, task_profiles]
+
+
+# Canonical result-row header (84 columns; the serial writer's exact
+# schema). Shared with the phase-4 pool driver so both entry points write
+# identical schemas (unification, 2026-10-27).
+RESULT_ROW_PREFIX_HEADER = [
+    'Run ID', 'Method', 'Suitability Method', 'Planner',
+    'Num Robots', 'Num Tasks', 'Num Candidates',
+    'Total Score', 'Mean_Assignment_Suitability', 'Planning_Time_us',
+    'Init_Jains_Index', 'Init_Gini', 'Init_Median', 'Init_IQR',
+]
+RESULT_ROW_OUTPUT_HEADER = [
+    # Aggregate simulation outcome
+    'Task_Completion_Fraction',
+    'total_reassignment_time', 'Cumulative_Reassignment_Quality', 'total_reassignments',
+    'Total Time Steps', 'Avg Reassignment Jains Index',
+    # Lifelong-operation metrics
+    'Attempted_Completion_Rate', 'Tasks_Attempted', 'Tasks_Spawned', 'Completion_Step',
+    # Primary comparative metrics
+    'Throughput_Mean', 'Throughput_Var',
+    'Adaptation_Latency_Mean', 'Adaptation_Latency_Max',
+    'Workload_Variance', 'Attempted_Workload_Variance',
+    # Full-schedule denominators
+    'Full_Schedule_Tasks_Spawned', 'Full_Schedule_Robots_Max',
+    # Urgency + pressure
+    'Percentage_Urgent_Mean', 'Percentage_Urgent_Max', 'Robot_Pressure_Fraction',
+    # Reassignment fairness (Jains already above)
+    'Avg_Reass_Gini', 'Avg_Reass_Median', 'Avg_Reass_IQR',
+    # Empirical regime classification
+    'Mean_Task_Pool_Size', 'Pool_Size_Trend',
+    # Horizon provenance
+    'Scheduled_Event_Count', 'Horizon_Binding_Term',
+    # Planner failures + alternatives
+    'Plan_Failure_Count', 'Alternatives_Tried',
+    # Partial-observability outcome metrics (-1 = N/A)
+    'Mis_Assignment_Count', 'Mis_Assignment_Rate',
+    'Wasted_Travel_Steps', 'Wasted_Travel_Fraction',
+    'Masked_Starvation_Count', 'Mean_Masked_Wait', 'Reveal_Events',
+    'Mis_Assignment_Recovery_Latency',
+    'True_Assignment_Suitability', 'Masked_View_Suitability',
+    'Observed_View_Suitability',
+    'Nav_Drop_Count', 'Nav_Drop_Wasted_Travel',
+    # PO baseline + invariant diagnostics
+    'Never_Attempted_Count', 'All_Zero_Skip_Ticks', 'Stuck_Assigned_Robot_Ticks',
+    # Collision handling diagnostics
+    'Planned_Conflict_Count', 'Safety_Nudge_Count', 'Collision_Violation_Count',
+    'Propagated_Wait_Count', 'Mover_Conflict_Waits',
+    # Run wall-clock limit flag
+    'Run_Timed_Out',
+    # Anytime pool diagnostics
+    'Threshold_Fire_Rate', 'Mean_Pool_Size_At_Rank',
+    # Planner-call accounting
+    'Planner_Call_Count', 'Planner_Total_ms', 'Planner_Cap_Hits',
+    'Planner_Dead_Tick',
+    # Overhead
+    'Execution Time',
+]
+RESULT_ROW_SUFFIX_HEADER = [
+    'Scenario', 'Task_Arrival_Rate', 'Task_Cancellation_Rate',
+    'Robot_Arrival_Rate', 'Robot_Departure_Rate',
+    'Mask_Level', 'Mask_Count', 'Mask_Policy',
+    'Obs_Noise_Sigma', 'Noise_Experiment',
+    'Map Size',
+]
+RESULT_ROW_HEADER = (RESULT_ROW_PREFIX_HEADER + RESULT_ROW_OUTPUT_HEADER
+                     + RESULT_ROW_SUFFIX_HEADER)
+assert len(RESULT_ROW_HEADER) == 84, len(RESULT_ROW_HEADER)
+PROFILES_ROW_HEADER = ['Run_ID', 'Map', 'Num Robots', 'Num Tasks',
+                       'Suitability Method', 'RobotProfiles', 'TaskProfiles']
 
 
 def _scan_completed_runs(dir_path):
@@ -2054,12 +2178,10 @@ if __name__ == "__main__":
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     # Resume support: an interrupted sweep re-launch continues from where it
-    # stopped instead of restarting (rows are matched on the full group key
-    # plus rep count). Run_ID continues past every row already on disk so
-    # IDs never collide across old and new result files. Must run AFTER
-    # dir_path is chosen.
+    # stopped (rows are matched on the full group key plus rep count). Run
+    # IDs are now the deterministic per-group IDs (make_run_id), so no
+    # counter continuation is needed. Must run AFTER dir_path is chosen.
     resume_counts, resume_rows = _scan_completed_runs(dir_path)
-    Run_ID = resume_rows + 1
     if resume_rows:
         print(f"RESUME: {resume_rows} completed run row(s) found in {dir_path} "
               f"across {len(resume_counts)} group key(s) - completed runs will be skipped.")
@@ -2082,73 +2204,8 @@ if __name__ == "__main__":
             writer = csv.writer(file)
             profiles_w = csv.writer(profile_file)
 
-            writer.writerow([
-                # Row identity
-                'Run ID', 'Method', 'Suitability Method', 'Planner',
-                'Num Robots', 'Num Tasks', 'Num Candidates',
-                # Initial allocation quality
-                'Total Score', 'Mean_Assignment_Suitability', 'Planning_Time_us',
-                # Initial fairness (trimmed to 4 canonical values)
-                'Init_Jains_Index', 'Init_Gini', 'Init_Median', 'Init_IQR',
-                # Aggregate simulation outcome
-                'Task_Completion_Fraction',
-                'total_reassignment_time', 'Cumulative_Reassignment_Quality', 'total_reassignments',
-                'Total Time Steps', 'Avg Reassignment Jains Index',
-                # Lifelong-operation metrics
-                'Attempted_Completion_Rate', 'Tasks_Attempted', 'Tasks_Spawned', 'Completion_Step',
-                # Primary comparative metrics
-                'Throughput_Mean', 'Throughput_Var',
-                'Adaptation_Latency_Mean', 'Adaptation_Latency_Max',
-                'Workload_Variance', 'Attempted_Workload_Variance',
-                # Full-schedule denominators, constant across methods in a (rep, sm) group.
-                'Full_Schedule_Tasks_Spawned', 'Full_Schedule_Robots_Max',
-                # Urgency + pressure bucketing keys.
-                'Percentage_Urgent_Mean', 'Percentage_Urgent_Max', 'Robot_Pressure_Fraction',
-                # Reassignment fairness (trimmed to 3 canonical values; Jains already exposed above)
-                'Avg_Reass_Gini', 'Avg_Reass_Median', 'Avg_Reass_IQR',
-                # Empirical regime classification (computed per run from pool-size log)
-                'Mean_Task_Pool_Size', 'Pool_Size_Trend',
-                # Horizon provenance (so the horizon choice is auditable)
-                'Scheduled_Event_Count', 'Horizon_Binding_Term',
-                # Planner failure count (how often the MAPF planner returned ok=False)
-                'Plan_Failure_Count',
-                # Total alternative assignments tried during replan-on-failure
-                'Alternatives_Tried',
-                # Partial-observability outcome metrics (spec §7); -1 marks N/A
-                # (PO machinery inactive or empty denominators)
-                'Mis_Assignment_Count', 'Mis_Assignment_Rate',
-                'Wasted_Travel_Steps', 'Wasted_Travel_Fraction',
-                'Masked_Starvation_Count', 'Mean_Masked_Wait', 'Reveal_Events',
-                'Mis_Assignment_Recovery_Latency',
-                'True_Assignment_Suitability', 'Masked_View_Suitability', 'Observed_View_Suitability',
-                'Nav_Drop_Count', 'Nav_Drop_Wasted_Travel',
-                # PO baseline + invariant diagnostics
-                'Never_Attempted_Count', 'All_Zero_Skip_Ticks', 'Stuck_Assigned_Robot_Ticks',
-                # Collision handling diagnostics (Phase 3v6: two-phase timestep)
-                'Planned_Conflict_Count', 'Safety_Nudge_Count', 'Collision_Violation_Count',
-                'Propagated_Wait_Count', 'Mover_Conflict_Waits',
-                # Run wall-clock limit flag (1 = hit the limit, stopped early)
-                'Run_Timed_Out',
-                # Anytime pool diagnostics (2.8)
-                'Threshold_Fire_Rate', 'Mean_Pool_Size_At_Rank',
-                # Planner-call accounting (PP-pilot diagnostics)
-                'Planner_Call_Count', 'Planner_Total_ms', 'Planner_Cap_Hits',
-                'Planner_Dead_Tick',
-                # Overhead
-                'Execution Time',
-                # Config covariates (constant per run)
-                'Scenario', 'Task_Arrival_Rate', 'Task_Cancellation_Rate',
-                'Robot_Arrival_Rate', 'Robot_Departure_Rate',
-                # Partial-observability config covariates (spec §7)
-                'Mask_Level', 'Mask_Count', 'Mask_Policy',
-                'Obs_Noise_Sigma', 'Noise_Experiment',
-                # Map size
-                'Map Size',
-            ])
-            profiles_w.writerow([
-                'Run_ID', 'Map', 'Num Robots', 'Num Tasks',
-                'Suitability Method', 'RobotProfiles', 'TaskProfiles',
-            ])
+            writer.writerow(RESULT_ROW_HEADER)
+            profiles_w.writerow(PROFILES_ROW_HEADER)
 
             for num_robots in robot_sizes:
                 print(f"\n\n\nSTARTING SIMULATION FOR {num_robots} ROBOTS")
@@ -2189,6 +2246,14 @@ if __name__ == "__main__":
                                     schedule_seed = zlib.adler32(
                                         repr(seed_tuple).encode()
                                     ) & 0xFFFFFFFF
+                                    # Deterministic per-group Run ID (schema
+                                    # unification 2026-10-27: replaces the
+                                    # on-disk row counter, which depended on
+                                    # resume state and made the profiles join
+                                    # and cross-runner comparisons impossible).
+                                    run_id = make_run_id(
+                                        os.path.basename(map_file), num_robots,
+                                        num_tasks, scenario_name, rep)
                                     _seed_rngs(_derived_seed(schedule_seed, "entities"))
 
                                     # Spawn rule: robots may not overlap each other, tasks may not overlap
@@ -2259,11 +2324,11 @@ if __name__ == "__main__":
                                     )
 
                                     if robot_generation_strict and task_generation_strict:
-                                        profiles_w.writerow([
-                                            Run_ID, os.path.basename(map_file),
+                                        profiles_w.writerow(build_profiles_row(
+                                            run_id, os.path.basename(map_file),
                                             num_robots, num_tasks, sm_name,
-                                            json.dumps(robot_profiles), json.dumps(task_profiles),
-                                        ])
+                                            json.dumps(robot_profiles),
+                                            json.dumps(task_profiles)))
 
                                     # Partial-observability conditions (spec §8). The
                                     # condition loop sits INSIDE the rep loop so all 5
@@ -2339,14 +2404,10 @@ if __name__ == "__main__":
                                         # (spec §7 - masked-view scores would inflate quality
                                         # under optimistic masking). Non-PO path unchanged.
                                         def _record_initial(run_id, method_name, out, score, length, per_agent):
-                                            if po_cond is None or not out:
-                                                return _record_assignment(assignment_infos, run_id, method_name, sm_name, num_robots, num_tasks, nc, score, length, per_agent)
-                                            pairs = out[0] if isinstance(out, tuple) else out
-                                            true_per_agent = [
-                                                S._balanced_pair(robots[r], tasks[t], map_size=HYPOTENUSE)
-                                                for r, t in pairs
-                                            ]
-                                            return _record_assignment(assignment_infos, run_id, method_name, sm_name, num_robots, num_tasks, nc, sum(true_per_agent), length, true_per_agent)
+                                            total, per_agent = _initial_quality_fields(
+                                                po_cond, out, score, per_agent,
+                                                robots, tasks, HYPOTENUSE)
+                                            return _record_assignment(assignment_infos, run_id, method_name, sm_name, num_robots, num_tasks, nc, total, length, per_agent)
 
                                         # Direct LLM assignment is independent of the matrix; time it and
                                         # score its chosen pairs against the rule-based matrix for parity
@@ -2361,7 +2422,7 @@ if __name__ == "__main__":
                                             pairs = out[0]
                                             per_agent_direct = [float(suitability_matrix[r][t]) for (r, t) in pairs] if not isinstance(suitability_matrix, tuple) else [0.0] * len(pairs)
                                             d_score = sum(per_agent_direct)
-                                            initial_jains = _record_initial(Run_ID, d_name, out, d_score, d_length, per_agent_direct)
+                                            initial_jains = _record_initial(run_id, d_name, out, d_score, d_length, per_agent_direct)
                                             direct_outputs.append((out, initial_jains))
 
                                         if suitability_all_zero(suitability_matrix):
@@ -2373,7 +2434,7 @@ if __name__ == "__main__":
                                             # Record a proper 13-item assignment row per method
                                             # so the CSV row prefix stays aligned.
                                             for _n in (voting_names + optimization_names + direct_names):
-                                                _record_initial(Run_ID, _n, empty_out, 0.0, 0.0, [])
+                                                _record_initial(run_id, _n, empty_out, 0.0, 0.0, [])
                                             outputs = [(empty_out, 0.0)] * len(all_methods)
                                         else:
                                             # voting - normal. Each method's initial assignment is
@@ -2385,7 +2446,7 @@ if __name__ == "__main__":
                                                 output, score, length, per_agent = V.assign_tasks_with_voting(
                                                     robots, tasks, suitability_matrix, nc, method_fn,
                                                     tie_seed=_derived_seed(schedule_seed, "ties", "initial", method_name))
-                                                initial_jains = _record_initial(Run_ID, method_name, output, score, length, per_agent)
+                                                initial_jains = _record_initial(run_id, method_name, output, score, length, per_agent)
                                                 voting_outputs.append((output, initial_jains))
                                             # optimization - normal
                                             opt_outputs = []
@@ -2400,7 +2461,7 @@ if __name__ == "__main__":
                                                         _derived_seed(schedule_seed, "run", opt_name,
                                                                       "pjv", "initial"))
                                                 out, score, length, per_agent = O.assign_tasks_with_method(init_fn, suitability_matrix)
-                                                initial_jains = _record_initial(Run_ID, opt_name, out, score, length, per_agent)
+                                                initial_jains = _record_initial(run_id, opt_name, out, score, length, per_agent)
                                                 opt_outputs.append((out, initial_jains))
                                             outputs = voting_outputs + opt_outputs + direct_outputs
 
@@ -2418,7 +2479,10 @@ if __name__ == "__main__":
                                                       f"mask={mask_level}/{mask_policy})")
                                                 continue
                                             po_diag_path = (
-                                                os.path.join(po_diag_dir, f"run{Run_ID}_{func_name(meth)}.json")
+                                                os.path.join(po_diag_dir, f"run{run_id}_"
+                                                             f"{mask_level or 'nomask'}-{mask_policy or 'none'}"
+                                                             f"-s{noise_sigma if noise_sigma is not None else 'na'}"
+                                                             f"_{func_name(meth)}.json")
                                                 if PO_EXPERIMENT else None
                                             )
                                             output_tuple = benchmark_simulation(
@@ -2459,28 +2523,22 @@ if __name__ == "__main__":
                                                 scheduled_event_count=scheduled_event_count,
                                                 horizon_binding_term=horizon_binding_term,
                                             )
-                                            row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [Run_ID, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0, 0, 0, 0]
+                                            row_prefix = assignment_infos[idx] if idx < len(assignment_infos) else [run_id, func_name(meth), sm_name, num_robots, num_tasks, nc, 0, 0, 0, 0, 0, 0, 0]
                                             # Inject the planner name at the CSV's 'Planner' column slot
                                             # (after Run ID / Method / Suitability Method, before Num Robots).
                                             row_prefix = [row_prefix[0], row_prefix[1], row_prefix[2], algo] + row_prefix[3:]
                                             # Config covariates + provenance, appended before the map_size suffix.
-                                            config_suffix = [
-                                                scenario_name,
-                                                task_arrival_rate, task_cancellation_rate,
-                                                robot_arrival_rate, robot_departure_rate,
+                                            # Row assembly is shared with the pool driver (build_result_row).
+                                            writer.writerow(build_result_row(
+                                                row_prefix, output_tuple, scenario_name, regime,
                                                 mask_level if PO_EXPERIMENT else "",
                                                 MASK_COUNTS.get(mask_level, -1) if PO_EXPERIMENT else -1,
                                                 mask_policy if PO_EXPERIMENT else "",
-                                                # 8.1 provenance: sigma_obs (blank when the
-                                                # noise experiment is off) + flag.
-                                                (noise_sigma if noise_sigma is not None else ""),
-                                                (1 if noise_sigma is not None else 0),
-                                            ]
-                                            writer.writerow(row_prefix + list(output_tuple) + config_suffix + [map_size])
+                                                noise_sigma,
+                                                map_size))
                                             # Flush per row so an interrupted sweep keeps every
                                             # completed run on disk for the resume scanner.
                                             file.flush()
-                                        Run_ID += 1
 
     # ---- End-of-sweep dumps (outside the CSV writer's `with` block) ----
     # 2.5: per-rule top-2 tie frequencies across the whole sweep.

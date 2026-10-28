@@ -47,42 +47,27 @@ def _parse_output(cell):
                            "np": np, "__builtins__": {}})
 
 
-def load_rows(dir_path):
-    """Returns (rows, format). Each row: dict with identity + named metrics."""
-    # pool format first
-    pool = os.path.join(dir_path, "phase4_simulation.csv")
-    if os.path.exists(pool):
-        rows = []
-        with open(pool, newline="", encoding="utf-8") as f:
-            for r in csv.DictReader(f):
-                o = _parse_output(r["Output"])
-                rows.append({
-                    "map": r["Map"], "nr": int(r["Num Robots"]),
-                    "nt": int(r["Num Tasks"]), "scenario": r["Scenario"],
-                    "rep": int(r["Rep"]), "method": r["Method"],
-                    "planner": "pp" if r["Map"] in
-                               ("hrt003d.map", "lak103c.map", "lak108c.map") else "lacam",
-                    "mask_level": r.get("Mask_Level") or "none",
-                    "mask_policy": r.get("Mask_Policy") or "none",
-                    "init_alloc_us": float(r.get("Init_Alloc_us") or 0.0),
-                    # 59-item tuple (2026-10-27+): dead_tick = o[57], exec =
-                    # o[58]. Legacy 58-item tuple: no Planner_Dead_Tick.
-                    "dead_tick": (int(o[57]) if len(o) >= 59 else None),
-                    "exec": float(o[-1]),
-                    **{k: o[i] for k, i in OUT_IDX.items()},
-                })
-        return rows, "phase4"
+def _load_named(paths):
+    """Named-column format: the serial stamped files AND the unified pool
+    CSV (2026-10-27+; same schema plus Map/Rep columns)."""
     rows = []
-    for path in sorted(glob.glob(os.path.join(dir_path, "*simulation*.csv"))):
+    for path in paths:
+        base = os.path.basename(path)
         with open(path, newline="", encoding="utf-8") as f:
             for r in csv.DictReader(f):
+                got_map = r.get("Map") or ""
                 rows.append({
-                    "map": r.get("Map") or os.path.basename(path),
+                    "map": got_map or base,
                     "nr": int(r["Num Robots"]), "nt": int(r["Num Tasks"]),
-                    "scenario": r["Scenario"], "rep": -1, "method": r["Method"],
-                    "planner": r["Planner"],
-                    "mask_level": r.get("Mask_Level") or "",
-                    "mask_policy": r.get("Mask_Policy") or "",
+                    "scenario": r["Scenario"],
+                    "rep": int(r.get("Rep") or -1),
+                    "method": r["Method"],
+                    "planner": (r.get("Planner") or
+                                ("pp" if (got_map or base) in
+                                 ("hrt003d.map", "lak103c.map", "lak108c.map")
+                                 else "lacam")),
+                    "mask_level": r.get("Mask_Level") or "none",
+                    "mask_policy": r.get("Mask_Policy") or "none",
                     "init_alloc_us": float(r.get("Planning_Time_us") or 0.0),
                     "reassign_time": float(r["total_reassignment_time"]),
                     "reassignments": int(r["total_reassignments"]),
@@ -105,8 +90,50 @@ def load_rows(dir_path):
                     "exec": float(r["Execution Time"]),
                     "mask_ok": (r.get("Mask_Level") or "") in ("", "none"),
                 })
-        return rows, "serial"
-    return [], "none"
+    return rows
+
+
+def load_rows(dir_path):
+    """Returns (rows, format). Each row: dict with identity + named metrics.
+
+    Formats, in detection order:
+      - "phase4": the pool driver's phase4_simulation.csv. Pre-2026-10-27
+        dirs pack the output tuple into one stringified "Output" column;
+        the unified format (2026-10-27+) is the full named-column schema
+        and is loaded via _load_named.
+      - "serial": the serial sweep's stamped per-map files.
+    """
+    pool = os.path.join(dir_path, "phase4_simulation.csv")
+    if os.path.exists(pool):
+        with open(pool, newline="", encoding="utf-8") as f:
+            first = next(csv.reader(f), [])
+        if "Output" in first:
+            rows = []
+            with open(pool, newline="", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    o = _parse_output(r["Output"])
+                    rows.append({
+                        "map": r["Map"], "nr": int(r["Num Robots"]),
+                        "nt": int(r["Num Tasks"]), "scenario": r["Scenario"],
+                        "rep": int(r["Rep"]), "method": r["Method"],
+                        "planner": "pp" if r["Map"] in
+                                   ("hrt003d.map", "lak103c.map", "lak108c.map") else "lacam",
+                        "mask_level": r.get("Mask_Level") or "none",
+                        "mask_policy": r.get("Mask_Policy") or "none",
+                        "init_alloc_us": float(r.get("Init_Alloc_us") or 0.0),
+                        # 59-item tuple (2026-10-27+): dead_tick = o[57],
+                        # exec = o[58]. Legacy 58-item tuple: no
+                        # Planner_Dead_Tick.
+                        "dead_tick": (int(o[57]) if len(o) >= 59 else None),
+                        "exec": float(o[-1]),
+                        **{k: o[i] for k, i in OUT_IDX.items()},
+                    })
+            return rows, "phase4"
+        return _load_named([pool]), "phase4"
+    paths = sorted(glob.glob(os.path.join(dir_path, "*simulation*.csv")))
+    if not paths:
+        return [], "none"
+    return _load_named(paths), "serial"
 
 
 def report(dir_path, pp_stress=False):

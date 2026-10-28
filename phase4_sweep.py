@@ -6,6 +6,13 @@ worker runs all 8 methods for the group and returns the rows to the
 parent, which alone writes the CSV (no concurrent appends). Resume-skip
 is keyed by run config within the output directory.
 
+Output (unified 2026-10-27): phase4_simulation.csv carries the SAME
+unpacked 84-column schema the serial writer produces (plus leading Map
+and Rep columns), and phase4_profiles.csv carries one profiles row per
+group, keyed by the deterministic per-group Run ID - no post-hoc
+reconstruction needed. (Pre-unification dirs like phase4_final_noise have
+the packed "Output" column and are expanded by expand_results.py.)
+
 Per-sweep overrides: "hyper" runs the PP planner with the PO machinery
 off and 5 reps (PHASE4_REPS=<n> overrides the rep count globally - used
 for the 2-rep hyper-PP pilot re-run).
@@ -23,11 +30,17 @@ serial sweep does; RNG isolation is unaffected by pool scheduling.
 """
 import copy
 import csv
+import json
 import os
 import sys
 import time
 import zlib
 import multiprocessing as mp
+
+from hvbta.simulation.main_simulation import (
+    RESULT_ROW_HEADER, make_run_id, build_initial_prefix,
+    _initial_quality_fields, build_result_row, build_profiles_row,
+)
 
 REPO = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, REPO)
@@ -141,13 +154,16 @@ MAP_LARGEST_FLEET = {
     "lak105d.map": 20, "lak102d.map": 20, "lak107d.map": 20,
 }
 
-# Row layout: identity prefix + output tuple; timing columns excluded from
-# equality checks: total_reassignment_time (output col 1) and Execution
-# Time (appended by benchmark_simulation, last output col).
-TIMING_OUTPUT_COLS = {1}          # 0-based within output tuple
-ROW_HEADER = ["Map", "Num Robots", "Num Tasks", "Scenario", "Rep",
-              "Method", "Output", "Map Size", "Init_Alloc_us",
-              "Mask_Level", "Mask_Policy", "Obs_Noise_Sigma"]
+# Unified schema (2026-10-27): the pool rows now carry the SAME unpacked
+# 84-column schema the serial writer produces (no packed Output column, no
+# post-hoc reconstruction). Header = Map + Rep + the serial 84 columns.
+ROW_HEADER = ["Map", "Rep"] + RESULT_ROW_HEADER
+PROFILES_HEADER = ['Run_ID', 'Map', 'Num Robots', 'Num Tasks',
+                   'Suitability Method', 'RobotProfiles', 'TaskProfiles']
+# Timing columns (wall-clock) excluded from pool-vs-serial equality checks.
+_TIMING_COLS = {"Planning_Time_us", "total_reassignment_time",
+                "Planner_Total_ms", "Execution Time"}
+_COL_IDX = {name: i for i, name in enumerate(ROW_HEADER)}
 
 
 def _cost(map_name, nr):
@@ -187,20 +203,24 @@ def run_group(job):
         _derived_seed, _seed_rngs, REGIMES,
     )
     from hvbta.pathfinding.CBS_helper import load_map, create_obstacle_list
-    from hvbta.partial_observability import PartialObservabilityState
+    from hvbta.partial_observability import PartialObservabilityState, MASK_COUNTS
 
     TRANSIENT_FLOOR, TARGET_EVENT_COUNT_K = 200, 125
     map_name, nr, nt, scenario, rep = (job["map"], job["nr"], job["nt"],
                                        job["scenario"], job["rep"])
     planner = job.get("planner", "lacam")
     grid = load_map(os.path.join("MAPF_benchmark_maps", map_name))
-    map_size = len(grid) * len(grid[0])
     HYP = (len(grid) ** 2 + len(grid[0]) ** 2) ** 0.5
     map_dict = {"dimension": (len(grid), len(grid[0])),
                 "obstacles": create_obstacle_list(grid)}
     nc = max(nr, nt) * 6
     seed_tuple = (map_name, nr, nt, nc, "evaluate_suitability_balanced", rep, scenario)
     schedule_seed = zlib.adler32(repr(seed_tuple).encode()) & 0xFFFFFFFF
+    # Unified (2026-10-27): deterministic per-group Run ID + serial-semantics
+    # map size class, so pool rows and profiles join exactly like the
+    # serial writer's.
+    run_id = make_run_id(map_name, nr, nt, scenario, rep)
+    map_class = "Small" if HYP < 55 else "Medium" if HYP < 105 else "Large"
 
     _seed_rngs(_derived_seed(schedule_seed, "entities"))
     robot_locs, robots = set(), []
@@ -211,6 +231,11 @@ def run_group(job):
     for idx in range(nt):
         t = G.generate_random_task_description_strict(f"T{idx+1}", grid, task_locs, [])
         tasks.append(t); task_locs.add(t.location)
+
+    profiles_row = build_profiles_row(
+        run_id, map_name, nr, nt, "evaluate_suitability_balanced",
+        json.dumps([r.strict_profile_name for r in robots]),
+        json.dumps([t.strict_profile_name for t in tasks]))
 
     provisional = max(TRANSIENT_FLOOR, int(HYP * 3))
     regime = REGIMES[scenario]
@@ -278,6 +303,8 @@ def run_group(job):
             from hvbta.partial_observability import noisy_scorer as _noisy
             sm_for_matrix = _noisy(sm_for_matrix, noise_sigma, schedule_seed, [0])
         matrix = S.calculate_suitability_matrix(robots, tasks, sm_for_matrix, HYP)
+        # Serial-semantics Mask_Count.
+        mask_count = (MASK_COUNTS.get(mask_level, -1) if mask_level else -1)
 
         for pretty, method in methods:
             _seed_rngs(_derived_seed(schedule_seed, "initial", pretty))
@@ -296,6 +323,14 @@ def run_group(job):
                 out, score, length, per = V.assign_tasks_with_voting(
                     robots, tasks, matrix, nc, method,
                     tie_seed=_derived_seed(schedule_seed, "ties", "initial", pretty))
+            # Initial-quality prefix, same rule as the serial writer (PO
+            # true scores), same shared builder.
+            total, per_reported = _initial_quality_fields(
+                po_cond, out, score, per, robots, tasks, HYP)
+            prefix13 = build_initial_prefix(
+                run_id, pretty, "evaluate_suitability_balanced",
+                nr, nt, nc, total, length, per_reported)
+            row_prefix = [prefix13[0], prefix13[1], prefix13[2], planner] + prefix13[3:]
             tup = benchmark_simulation(
                 output=out, robots=copy.deepcopy(robots), tasks=copy.deepcopy(tasks),
                 num_candidates=nc, voting_method=method, grid=grid, map_dict=map_dict,
@@ -311,46 +346,42 @@ def run_group(job):
                 horizon_binding_term=horizon_binding_term,
             )
             # Convert numpy scalars to plain floats so the CSV cells hold
-            # clean numbers (a list's repr would otherwise embed
-            # np.float64(...)). Init_Alloc_us = this method's initial-
-            # assignment wall time, so the per-sweep report can compute
-            # mean allocation time per call:
-            # (Init_Alloc_us + total_reassignment_time)/(1 + reassignments).
-            rows.append([map_name, nr, nt, scenario, rep, pretty,
-                         [x.item() if hasattr(x, "item") else x for x in tup],
-                         map_size, length,
-                         mask_level or "", mask_policy or "",
-                         (noise_sigma if noise_sigma is not None else "")])
-    return rows
+            # clean numbers, then assemble the row with the SAME builder
+            # the serial writer uses (unified schema, 2026-10-27).
+            tup_clean = [x.item() if hasattr(x, "item") else x for x in tup]
+            rows.append([map_name, rep] + build_result_row(
+                row_prefix, tup_clean, scenario, regime,
+                mask_level or "", mask_count, mask_policy or "",
+                noise_sigma, map_class))
+    return rows, profiles_row
 
 
 def resume_keys(csv_path):
+    """Group keys of completed rows (new unified named-column format)."""
     done = set()
     if not os.path.exists(csv_path):
         return done
     with open(csv_path, newline="", encoding="utf-8") as f:
-        for row in csv.reader(f):
-            if row and row[0] == "Map":
-                continue
+        for row in csv.DictReader(f):
             try:
-                done.add((row[0], int(row[1]), int(row[2]), row[3], int(row[4])))
-            except (ValueError, IndexError):
+                done.add((row["Map"], int(row["Num Robots"]),
+                          int(row["Num Tasks"]), row["Scenario"],
+                          int(row["Rep"])))
+            except (KeyError, ValueError):
                 continue
     return done
 
 
 def rows_equal(r1, r2):
-    """Full-row equality excluding timing columns of the output tuple."""
-    # row: [map, nr, nt, scenario, rep, method, output(list), map_size]
-    out1, out2 = r1[6], r2[6]
-    if len(out1) != len(out2):
+    """Full-row equality excluding wall-clock timing columns (by name)."""
+    if r1[:6] != r2[:6]:   # Map, Rep, Run ID, Method, SM, Planner
         return False
-    for i, (a, b) in enumerate(zip(out1, out2)):
-        if i in TIMING_OUTPUT_COLS or i == len(out1) - 1:  # timing + exec time
+    for name, i in _COL_IDX.items():
+        if name in _TIMING_COLS:
             continue
-        if str(a) != str(b):
+        if str(r1[i]) != str(r2[i]):
             return False
-    return r1[:6] == r2[:6] and r1[7] == r2[7]
+    return True
 
 
 def main():
@@ -394,21 +425,20 @@ def main():
         for j in jobs:
             key = j["scenario"]
             t0 = time.perf_counter()
-            serial[key] = run_group(j)
+            serial[key] = run_group(j)[0]
             print(f"  serial {key}: {time.perf_counter()-t0:.1f}s", flush=True)
         with mp.Pool(min(N_WORKERS, 4)) as pool:
             par = pool.map(run_group, jobs)
         murty_same, voting_diff = True, 0
-        for j, rows in zip(jobs, par):
+        for j, (rows, _prof) in zip(jobs, par):
             key = j["scenario"]
             for r_par, r_ser in zip(rows, serial[key]):
-                if r_par[5] == "murtys_task_allocation":
+                if r_par[3] == "murtys_task_allocation":
                     murty_same = murty_same and rows_equal(r_par, r_ser)
                 elif not rows_equal(r_par, r_ser):
                     voting_diff += 1
         print(f"murty rows identical (excl. timing): {murty_same}")
-        print(f"voting rows differing vs serial: {voting_diff}/24 "
-              f"(anytime 20ms wall-clock budget noise)")
+        print(f"voting rows differing vs serial: {voting_diff}/24")
 
     if cmd == "memory":
         import psutil
@@ -426,7 +456,7 @@ def main():
         done = [False]
         th = threading.Thread(target=_watch, daemon=True)
         th.start()
-        rows = run_group(job)
+        rows = run_group(job)[0]
         done[0] = True
         th.join(timeout=1)
         print(f"largest map (den901d 100x100) group: "
@@ -437,8 +467,9 @@ def main():
         sweeps = sys.argv[3:] or list(SWEEP_CONFIGS)
         res_dir = os.path.join("hvbta", "io", "results", outdir)
         csv_path = os.path.join(res_dir, "phase4_simulation.csv")
+        prof_path = os.path.join(res_dir, "phase4_profiles.csv")
         if os.path.exists(csv_path):
-            raise SystemExit(f"{csv_path} already exists - use a fresh v2 directory")
+            raise SystemExit(f"{csv_path} already exists - use a fresh directory")
         os.makedirs(res_dir, exist_ok=True)
         items = build_queue(sweeps)
         done = resume_keys(csv_path)
@@ -446,14 +477,19 @@ def main():
                 if (it["map"], it["nr"], it["nt"], it["scenario"], it["rep"]) not in done]
         print(f"{len(items)} groups total, {len(items)-len(todo)} done, "
               f"{len(todo)} to run; workers={N_WORKERS}")
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f, \
+             open(prof_path, "w", newline="", encoding="utf-8") as pf:
             w = csv.writer(f)
+            pw = csv.writer(pf)
             w.writerow(ROW_HEADER)
+            pw.writerow(PROFILES_HEADER)
             t0 = time.perf_counter()
             with mp.Pool(N_WORKERS) as pool:
-                for i, rows in enumerate(pool.imap_unordered(run_group, todo), 1):
+                for i, (rows, prof_row) in enumerate(
+                        pool.imap_unordered(run_group, todo), 1):
                     for r in rows:
                         w.writerow(r)
+                    pw.writerow(prof_row)
                     f.flush()
                     if i % 10 == 0 or i == len(todo):
                         print(f"  {i}/{len(todo)} groups "
