@@ -88,8 +88,10 @@ def func_name(f):
 
 # Per-run wall-clock limit (seconds). A run that hits it stops early and is
 # written as a row with Run_Timed_Out = 1 (metrics computed over the ticks
-# executed), never dropped. Configurable.
-RUN_WALL_LIMIT_S = 600
+# executed), never dropped. Configurable via HVBTA_RUN_WALL_LIMIT_S (unset =
+# 600, the historical value); used by the uncapped re-run of wall-stop
+# truncated groups (2026-10-28 amendment).
+RUN_WALL_LIMIT_S = float(os.environ.get("HVBTA_RUN_WALL_LIMIT_S", "600"))
 
 # Deterministic planner-work bounds (2026-10-26, hyper-PP pilot fix): count-
 # based caps that bound per-run planner work independently of machine load,
