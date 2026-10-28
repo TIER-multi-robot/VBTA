@@ -165,3 +165,64 @@ the next check-in.
    sweep_report after each.
 4. Item 8 (JV-optimum diagnostic on ~2,000 non-urgent noise-sweep calls)
    still pending — driver to be written; runs alongside/after PO.
+
+---
+
+## ADDENDUM (same evening — items 5 and 7 completed; PO launched)
+
+### Load-sensitivity finding (LaCAM wall-clock budget) — important
+
+The ablation v2 (run CONCURRENTLY with the 30-worker hyper-500k sweep)
+produced 95/96 bit-identical optimizer rows: ONE perturbed-JV row
+(lak102d 20x20 overload rep1) diverged with Plan_Failure_Count 0 vs 3 —
+a LaCAM call hit the 1-second WALL-CLOCK budget under the load burst and
+failed, changing the run trajectory. An idle re-run of that group is
+bit-identical to the noise sweep's row, confirming: the code is
+deterministic; the known soft spot is `PLANNER_TIME_BUDGET_S = 1.0 s`
+(wall-clock), which can flip marginal calls under heavy machine load.
+The noise sweep's row is the canonical (idle-outcome) row. Action taken:
+the ablation arm was re-run IDLE (v3); for future sweeps, avoid running
+light single-process arms concurrently with 30-worker sweeps when
+LaCAM-budget marginal calls are possible. (All other rows matched even
+under load; normal runs fail 0-2 calls and lak307d planner p99 is ~60 ms
+- far from the budget.)
+
+### Item 5 — anytime ablation: CLEAN (v3, idle machine)
+
+`ablation_anytime_fullpool_v3/` (48 groups = the full lak102d nr×nt cross
+product, 3 reps, sigma_obs = 0, 8 methods, unified format; 384 rows):
+- config columns match the noise sweep's sigma-0 lak102d rows on all 384
+  rows (including Run ID, nc, rates, sigma);
+- **96/96 optimizer rows bit-identical** (stall rule never touches
+  optimizers — the config-match proof);
+- **0/288 voting rows identical** — every voting row differs, exactly the
+  stopping-rule treatment contrast the ablation needs.
+- Invariants pass (sweep_report.txt in the dir). v2 is kept as the
+  load-flip record; v1 (diagonal pairs only) superseded.
+
+### Item 7 — hyper cap sensitivity (250k vs 500k): 250k stands
+
+`phase4_hyper_500k/` (PP_MAX_EXPANSIONS=500,000, else identical to the
+main hyper sweep; 1,920 rows):
+- Completion by method: unchanged within ±0.01 everywhere
+  (250k: voting 0.545-0.572, optimizers 0.716-0.730;
+  500k: voting 0.537-0.569, optimizers 0.705-0.722).
+- Plan_Failure_Count/run: marginally up (e.g., approval 27.9→29.0).
+- Planner_Cap_Hits/run: marginally DOWN (expansion cap fires less with a
+  2x budget; e.g., condorcet 23.7→19.1) but planner-dead runs UP
+  (85→131/1,920; e.g., approval 14→20) - each failure burns longer before
+  failing, exhausting the 150-failed-call budget in more runs.
+- **One run hit the 600 s wall safety stop** (lak103c 15x15 overload rep1,
+  approval) — the 250k calibration keeps runs far below the wall stop;
+  at 500k the per-call work can double and the count-based bounds no
+  longer guarantee it. sweep_report for the 500k arm flags this row.
+- Conclusion: the 500k expansion cap buys no completion and breaches the
+  wall-stop guarantee; the 250k setting is retained. (The wall-stop row is
+  retained in the data with Run_Timed_Out=1, never dropped.)
+
+### Sweep order status
+
+PO launched (`phase4_final_po`, unified format, detached) — 31 map-config
+cross-product combos x 4 scenarios x 3 reps x 5 mask conditions x 8
+methods; sweep_report + check-in when it finishes. Then: constrained,
+balanced, full. Item 8 driver next.
