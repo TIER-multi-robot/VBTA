@@ -389,3 +389,66 @@ either way); balanced and full carry it. LaCAM 1 s-budget hit counts in
 the existing sweeps (from Plan_Failure_Count, all-zero): noise 0/10,560
 rows, PO 0/14,880, constrained 0/3,360.
 
+### 2026-10-28: uncapped re-run of wall-stop truncated groups; row validity rule; merged analysis files
+
+Finding. 279 of 14,880 PO rows and 38 of 6,336 balanced rows hit the 600 s
+run wall stop (Run_Timed_Out = 1; rows retained, never dropped). Every
+truncated row is a voting row (all 6 rules; zero optimizer rows): PO on
+lak307d (plus 3 arena rows) under pessimistic masks at 50-100 robots;
+balanced on den001d/den901d at (50,75)/(50,100)/(75,100), no masks. The
+600 s stop was designed as a safety stop that never fires; the final
+stopping rule (2026-10-27 stall rule) made large non-urgent full-pool
+rankings slow enough that it fired. Truncation affected only voting, so
+the affected groups are re-run (never dropped) so method pairs stay
+matched.
+
+Mechanism. New env override HVBTA_RUN_WALL_LIMIT_S (default 600; unset =
+the historical value, no behavioral change). The uncapped re-runs and,
+going forward, the full sweep run with HVBTA_RUN_WALL_LIMIT_S = 12000 so
+no run truncates. Identical code and seeds: the single-run re-run driver
+(rerun_targeted.py) replicates phase4_sweep.run_group's setup exactly
+for one (map, size, scenario, rep, condition, method) run; fidelity
+validated by 4 non-truncated balanced control rows reproduced
+bit-identically (all shared non-timing columns) with
+Planner_Timeout_Count = 0.
+
+Row validity rule. A re-run row is valid if and only if
+Planner_Timeout_Count = 0. Justification: the LaCAM 1 s wall-clock
+budget is the only load-dependent code path (the anytime budget is a
+candidate-count cap; seeds and planner-work bounds are count-based;
+lacam0 exits on its FIRST solution - main.cpp's --anytime defaults to
+false and is not passed, and lacam.cpp breaks on the first solution -
+so the -t deadline only bounds the search for the first solution).
+Evidence (from the 28-worker whole-group uncapped re-run, whose
+concentrated all-heavy load caused LaCAM budget flips the original
+mixed-load 30-worker sweep never showed): 1,542 of 1,561 compared rows
+were bit-identical to the source sweep and every one of them has
+Planner_Timeout_Count = 0; all 19 mismatching rows have
+Planner_Timeout_Count > 0 (the 6 written rows each exactly 1; the 13
+discarded rows differ in Plan_Failure_Count, re-run > 0 vs source 0 on
+all 14,880 PO rows - under identical code and seeds a new failure can
+only be a load-induced lacam_timeout).
+
+Analysis files. The PO analysis uses phase4_final_po with the 279
+truncated rows replaced: 255 from phase4_final_po_uncapped (whole-group
+uncapped re-run at 12,000 s; zero rows hit the new stop, max run
+2,805 s; the 255 kept rows all Planner_Timeout_Count = 0) and 24 re-run
+individually in rerun_targeted (their whole-group copies had
+Planner_Timeout_Count > 0 and are invalid under the rule above). The
+balanced analysis uses phase4_final_balanced with its 38 truncated rows
+replaced from rerun_targeted. Targeted re-runs: 8 workers, 66/66 rows
+Planner_Timeout_Count = 0 on the first attempt (24 PO + 38 balanced +
+4 controls), zero hit the stop (max run 1,290 s). The merged files are
+phase4_final_po_merged/ and phase4_final_balanced_merged/ (original
+directories untouched; one Source_Dir provenance column per row;
+original PO rows predate the Planner_Timeout_Count column and carry 0,
+justified by Plan_Failure_Count = 0 on every source row). Merge checks
+(analysis/merge_replacements.py, all pass): every group complete with
+all 8 methods (1,860 PO condition groups, 792 balanced groups); 0 rows
+with Run_Timed_Out = 1; 0 rows with Planner_Timeout_Count > 0.
+
+The same validity rule and targeted re-run procedure apply to the full
+sweep: it launches with HVBTA_RUN_WALL_LIMIT_S = 12000, and any row
+that comes back with Planner_Timeout_Count > 0 is re-run individually at
+lower load until clean.
+
