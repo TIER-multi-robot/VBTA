@@ -452,3 +452,27 @@ sweep: it launches with HVBTA_RUN_WALL_LIMIT_S = 12000, and any row
 that comes back with Planner_Timeout_Count > 0 is re-run individually at
 lower load until clean.
 
+### 2026-10-28: full sweep reduced grid (R2) and calibration launch rule
+
+The full sweep (combat.map + combat2.map) runs the R2 size grid, fixed
+BEFORE any full data exists: (nr, nt) in {(10,10), (20,20), (30,30),
+(50,50), (100,100), (50,100), (100,50)} - the diagonal plus the two
+extreme asymmetric pairs. This drops the other 29 combos of the 10..100
+square grid (the 40-robot interior point and most asymmetric
+fleet/task ratios); the projected cost of the full 36-combo grid sat at
+the ~24 h limit while R2 projects ~8 h at 8 workers (projections from
+the merged balanced data scaled by the only direct combat measurement,
+the 2026-10-25 timing ratio of 1.8x den001d).
+
+Launch rule (fixed now): a calibration probe first - direct combat
+voting single-runs at (50,100), (100,50) and (100,100), calm, rep 0,
+borda, at 8 workers on an idle machine - replacing the 1.8x proxy with
+direct measurement; the R2 wall estimate is recalibrated from the probe
+actuals. If the calibrated estimate at 8 workers is <= 12 h, the sweep
+launches without waiting for further approval; otherwise it stops and
+is reported. Run conditions: HVBTA_RUN_WALL_LIMIT_S = 12000 (no run
+truncates), 8 workers (the LaCAM flip-safe count validated by the
+targeted re-run: 66/66 rows Planner_Timeout_Count = 0 on the first
+attempt), the row validity rule (valid iff Planner_Timeout_Count = 0)
+with targeted re-runs for any invalid row.
+
