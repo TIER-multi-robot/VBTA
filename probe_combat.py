@@ -73,13 +73,14 @@ def main():
           (20, 20): den_scale[(50, 50)] * (20 / 50),
           (10, 10): den_scale[(50, 50)] * (10 / 50)}
     serial = 0.0
+    heaviest = max(r2.values())
     for (nr, nt), vote_s in r2.items():
         group = 6 * vote_s + 2 * (use * 55)
         serial += group * 4 * 3 * 2
     print(f"calibrated R2 serial: {serial/3600:.1f} h; "
           f"wall at 8 workers ~ {serial/8/3600:.1f} h "
-          f"(floor = heaviest group "
-          f"~ {6 * r2[(50, 100)] / 60:.0f} min)", flush=True)
+          f"(floor = heaviest group ~ {6 * heaviest / 60:.0f} min)",
+          flush=True)
     print(f"LAUNCH RULE: {'LAUNCH R2' if serial/8/3600 <= 12 else 'STOP - OVER 12 h'}",
           flush=True)
 

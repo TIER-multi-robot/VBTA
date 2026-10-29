@@ -46,11 +46,20 @@ REPO = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, REPO)
 os.chdir(REPO)
 
-N_WORKERS = max(1, (os.cpu_count() or 4) - 2)
+N_WORKERS = max(1, int(os.environ.get("PHASE4_WORKERS",
+                                     (os.cpu_count() or 4) - 2)))
 
 SWEEP_CONFIGS = {
-    "full": [(r"combat.map", [10, 20, 30, 40, 50, 100], [10, 20, 30, 40, 50, 100]),
-             (r"combat2.map", [10, 20, 30, 40, 50, 100], [10, 20, 30, 40, 50, 100])],
+    # R2 reduced grid (2026-10-28 amendment): the diagonal plus the two
+    # extreme asymmetric pairs, fixed before any full data existed. The
+    # pool driver runs it with HVBTA_RUN_WALL_LIMIT_S=12000 and
+    # PHASE4_WORKERS=8 (the LaCAM flip-safe count).
+    "full": [
+        (r"combat.map", [(10, 10), (20, 20), (30, 30), (50, 50),
+                         (100, 100), (50, 100), (100, 50)], None),
+        (r"combat2.map", [(10, 10), (20, 20), (30, 30), (50, 50),
+                          (100, 100), (50, 100), (100, 50)], None),
+    ],
     "balanced": [
         (r"lak105d.map", [10, 20], [10, 20]),
         (r"lak102d.map", [10, 20], [10, 20]),
@@ -177,17 +186,20 @@ def build_queue(sweeps):
     for sweep in sweeps:
         n_cond = len(sweep_conditions(sweep))
         for map_name, r_sizes, t_sizes in SWEEP_CONFIGS[sweep]:
-            for nr in r_sizes:
-                for nt in t_sizes:
-                    cost = _cost(map_name, nr) * n_cond
-                    for scenario in SCENARIOS:
-                        for rep in range(SWEEP_REPS.get(sweep, REPS)):
-                            items.append({
-                                "sweep": sweep, "map": map_name, "nr": nr,
-                                "nt": nt, "scenario": scenario, "rep": rep,
-                                "cost": cost,
-                                "planner": SWEEP_PLANNER.get(sweep, "lacam"),
-                            })
+            if t_sizes is None:
+                size_pairs = [(int(nr), int(nt)) for nr, nt in r_sizes]
+            else:
+                size_pairs = [(nr, nt) for nr in r_sizes for nt in t_sizes]
+            for nr, nt in size_pairs:
+                cost = _cost(map_name, nr) * n_cond
+                for scenario in SCENARIOS:
+                    for rep in range(SWEEP_REPS.get(sweep, REPS)):
+                        items.append({
+                            "sweep": sweep, "map": map_name, "nr": nr,
+                            "nt": nt, "scenario": scenario, "rep": rep,
+                            "cost": cost,
+                            "planner": SWEEP_PLANNER.get(sweep, "lacam"),
+                        })
     items.sort(key=lambda it: -it["cost"])
     return items
 
