@@ -31,6 +31,7 @@ os.chdir(REPO)
 
 _RECORDS = []
 _CUR = ["", "", "", "", "", ""]   # map, nr, nt, scenario, rep, sigma
+_PLANNER_FAILS = {}               # group tuple -> failed planner calls
 
 
 def _install_wrappers():
@@ -38,7 +39,22 @@ def _install_wrappers():
     import hvbta.suitability as S
     import hvbta.allocators.voting as V
     import hvbta.allocators.optimizers as O
+    import hvbta.pathfinding.MAPF_wrapper as MW
     from hvbta.simulation.main_simulation import REGIMES  # noqa: F401
+    orig_planner = MW.run_planner
+
+    def planner_wrapped(*a, **kw):
+        result = orig_planner(*a, **kw)
+        if result is None and _CUR[0]:
+            key = tuple(_CUR)
+            _PLANNER_FAILS[key] = _PLANNER_FAILS.get(key, 0) + 1
+        return result
+
+    MW.run_planner = planner_wrapped
+    # main_simulation binds run_planner by direct import, so its module
+    # attribute must be wrapped as well (the alloc_breakdown pattern).
+    import hvbta.simulation.main_simulation as _MS
+    _MS.run_planner = planner_wrapped
     orig = V.reassign_robots_to_tasks
 
     def wrapped(robots, tasks, num_candidates, voting_method, suitability_source,
@@ -193,10 +209,35 @@ def main():
     out_dir = os.path.join("hvbta", "io", "results",
                            "jv_optimum_diag" + ("_pilot" if pilot else ""))
     os.makedirs(out_dir, exist_ok=True)
+    contaminated = []
     for i, (m, nr, nt, s, rep, sg) in enumerate(jobs, 1):
+        mark = len(_RECORDS)
         _run_group(m, nr, nt, s, rep, sg, voting)
+        key = tuple(_CUR)
+        if _PLANNER_FAILS.get(key):
+            n = _PLANNER_FAILS.pop(key)
+            print(f"  WARNING: {key} had {n} planner failures - "
+                  f"discarding its records and re-running the group "
+                  f"once (serial)", flush=True)
+            del _RECORDS[mark:]
+            _run_group(m, nr, nt, s, rep, sg, voting)
+            if _PLANNER_FAILS.get(key):
+                n2 = _PLANNER_FAILS.pop(key)
+                print(f"  *** {key} STILL had {n2} planner failures on "
+                      f"the retry - records kept but marked "
+                      f"contaminated", flush=True)
+                contaminated.append(key)
         print(f"  {i}/{len(jobs)} groups done ({m} {nr}x{nt} {s} sigma={sg}); "
               f"records: {len(_RECORDS)}", flush=True)
+    import hvbta.pathfinding.MAPF_wrapper as MW
+    print(f"planner failure-kind counts across the run: "
+          f"{dict(MW.FAILURE_KIND_COUNTS)}", flush=True)
+    if contaminated:
+        print(f"CONTAMINATED GROUPS (planner failures persisted on "
+              f"retry): {contaminated}", flush=True)
+    else:
+        print("validity: zero planner failures on every group "
+              "(Planner_Timeout_Count-equivalent rule clean)", flush=True)
 
     import numpy as np
     bins = [(1, 2), (3, 4), (5, 8), (9, 16), (17, 32), (33, 64)]
