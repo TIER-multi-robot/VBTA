@@ -120,13 +120,12 @@ def hpo1(rows, index):
             for rule in VOTING:
                 diffs = []
                 for d in dgroups:
-                    hi = (d, ("high", pol))
-                    no = (d, ("none", "none"))
+                    hi, no = ("high", pol), ("none", "none")
                     if (d, hi, rule) in by_d_m and (d, no, rule) in by_d_m \
-                            and hi in by_d_mu and no in by_d_mu:
+                            and (d, hi) in by_d_mu and (d, no) in by_d_mu:
                         diffs.append(
-                            (by_d_m[(d, hi, rule)] - by_d_mu[hi])
-                            - (by_d_m[(d, no, rule)] - by_d_mu[no]))
+                            (by_d_m[(d, hi, rule)] - by_d_mu[(d, hi)])
+                            - (by_d_m[(d, no, rule)] - by_d_mu[(d, no)]))
                 r = wilcoxon_result(np.array(diffs),
                                     f"hpo1:{pol}:{rule}")
                 r["label"] = f"D(high-{pol}) - D(none): {LABEL[rule]}"
